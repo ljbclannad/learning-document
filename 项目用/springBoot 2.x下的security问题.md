@@ -1,0 +1,12 @@
+SpringBoot2.X环境下/org/springframework/security/config/http/SessionCreateFactroy初始化报NoDefClassFound错解决方法：
+
+​	SpringBoot1.5环境下可以使用management.endpoint.enabled=false注解取消managementServerPropertis的bean注册
+
+​	SpringBoot2.x环境下由于Security类不再属于managementServerPropertis的内部类，所以在进行初始化的时候需要跳过managementServerPropertis的注册，否则会报managementServerPropertis.security<init>初始化失败
+
+​	endpoint中的additional-spring-configuration-metadata.json中配置了部分配置的默认字段,部分配置字段拥有默认值，所以可以不进行配置，问题中针对下面配置的endpoints.web.exposure.include和security.enabled无需配置，一旦配置则会去初始化managementServerPropertis
+
+
+
+![image-20220221180114589](/Users/lejinbo/Library/Application Support/typora-user-images/image-20220221180114589.png)
+

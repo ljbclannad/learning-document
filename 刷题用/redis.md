@@ -1,0 +1,370 @@
+分布式缓存主要解决的是单机缓存的容量受服务器限制并且无法保存通用信息的问题。因为，本地缓存只在当前服务里有效，比如如果你部署了两个相同的服务，他们两者之间的缓存数据是无法共同的。
+
+
+
+redis是基于Reactor模式开发了网络时间处理器，它是单线程的，所以Redis才叫单线程的模型，采用IO多路复用来同时监听socket，文件时间分派器根据socket分派给事件处理器，每一个socket的事件处理完之后，IO多路复用程序才会将队列中的下一个事件交给处理器处理
+
+
+
+redis客户端的使用选择：
+
+​	redisTemplate: 基于jdkRedis序列化
+
+​	StringRedisTemplate: 基于String序列化
+
+​	两个template存储的数据并不相通
+
+
+
+redis单线程为什么这么快：
+
+1. 基于内存
+
+ 2. IO多路复用
+
+ 2. 单线程避免了多线程的频繁的上下文切换的性能问题
+
+ 3. 使用高效的数据结构
+
+    
+
+redis的value数据结构：
+
+​	String,Hash,List,Set,SortedSet（Set是不可重复无序的，而SortedSet是可重复，有序的接口，可以通过compare排序）
+
+​	Hash:		![image-20220104144310356](/Users/lejinbo/Library/Application Support/typora-user-images/image-20220104144310356.png)
+
+​	List:
+
+​	![image-20220104144602895](/Users/lejinbo/Library/Application Support/typora-user-images/image-20220104144602895.png)
+
+
+
+
+
+Redis满足高并发，高性能
+
+Redis还能用于消息队列：redisTemplate.opsForList()
+
+Redis常用的过期删除策略：
+
+​	**惰性删除** ：只会在取出 key 的时候才对数据进行过期检查。这样对 CPU 最友好，但是可能会造成太多过期 key 没有被删除。
+
+​	**定期删除** ： 每隔一段时间抽取一批 key 执行删除过期 key 操作。并且，Redis 底层会通过限制删除操作执行的时长和频率来减少删除操作对 CPU 时间的影响。
+
+
+
+Redis持久化机制：
+
+​	Redis 的一种持久化方式叫快照（snapshotting，RDB），另一种方式是只追加文件（append-only file, AOF）
+
+​	Redis 可以通过创建快照来获得存储在内存里面的数据在某个时间点上的副本。Redis 创建快照之后，可以对快照进行备份，可以将快照复制到其他服务器从而创建具有相同数据的服务器副本（Redis 主从结构，主要用来提高 Redis 性能），还可以将快照留在原地以便重启服务器的时候使用。
+
+​	开启 AOF 持久化后每执行一条会更改 Redis 中的数据的命令，Redis 就会将该命令写入到内存缓存 `server.aof_buf` 中，然后再根据 `appendfsync` 配置来决定何时将其同步到硬盘中的 AOF 文件。
+
+​	RDB的优势：
+
+​			1). 一旦采用该方式，那么你的整个Redis数据库将只包含一个文件，这对于文件备份而言是非常完美的。比如，你可能打算每个小时归档一次最近24小时的数据，同时还要每天归档一次最近30天的数据。通过这样的备份策略，一旦系统出现灾难性故障，我们可以非常容易的进行恢复。
+
+​			2). 对于灾难恢复而言，RDB是非常不错的选择。因为我们可以非常轻松的将一个单独的文件压缩后再转移到其它存储介质上。
+
+​			3). 性能最大化。对于Redis的服务进程而言，在开始持久化时，它唯一需要做的只是fork出子进程，之后再由子进程完成这些持久化的工作，这样就可以极大的避免服务进程执行IO操作了。
+
+​			4). 相比于AOF机制，如果数据集很大，RDB的启动效率会更高。
+
+​		RDB的劣势：
+
+​			1). 如果你想保证数据的高可用性，即最大限度的避免数据丢失，那么RDB将不是一个很好的选择。因为系统一旦在定时持久化之前出现宕机现象，此前没有来得及写入磁盘的数据都将丢失。
+
+​			2). 由于RDB是通过fork子进程来协助完成数据持久化工作的，因此，如果当数据集较大时，可能会导致整个服务器停止服务几百毫秒，甚至是1秒钟。
+
+​		
+
+​		AOF的优势：
+
+​			1). 该机制可以带来更高的数据安全性，即数据持久性。Redis中提供了3中同步策略，即每秒同步、每修改同步和不同步。事实上，每秒同步也是异步完成的，其效率也是非常高的，所差的是一旦系统出现宕机现象，那么这一秒钟之内修改的数据将会丢失。而每修改同步，我们可以将其视为同步持久化，即每次发生的数据变化都会被立即记录到磁盘中。可以预见，这种方式在效率上是最低的。至于无同步，无需多言，我想大家都能正确的理解它。
+
+​			2). 由于该机制对日志文件的写入操作采用的是append模式，因此在写入过程中即使出现宕机现象，也不会破坏日志文件中已经存在的内容。然而如果我们本次操作只是写入了一半数据就出现了系统崩溃问题，不用担心，在Redis下一次启动之前，我们可以通过redis-check-aof工具来帮助我们解决数据一致性的问题。
+
+​			3). 如果日志过大，Redis可以自动启用rewrite机制。即Redis以append模式不断的将修改数据写入到老的磁盘文件中，同时Redis还会创建一个新的文件用于记录此期间有哪些修改命令被执行。因此在进行rewrite切换时可以更好的保证数据安全性。
+
+​			4). AOF包含一个格式清晰、易于理解的日志文件用于记录所有的修改操作。事实上，我们也可以通过该文件完成数据的重建。
+
+​		AOF的劣势：
+
+​			1). 对于相同数量的数据集而言，AOF文件通常要大于RDB文件。RDB 在恢复大数据集时的速度比 AOF 的恢复速度要快。
+
+​			2). 根据同步策略的不同，AOF在运行效率上往往会慢于RDB。总之，每秒同步策略的效率是比较高的，同步禁用策略的效率和RDB一样高效。
+
+​		
+
+​		配置RDB：
+
+​			修改配置文件的save属性：
+
+​				save 900 1              #在900秒(15分钟)之后，如果至少有1个key发生变化，则dump内存快照。
+
+​				save 300 10            #在300秒(5分钟)之后，如果至少有10个key发生变化，则dump内存快照。
+
+​				save 60 10000        #在60秒(1分钟)之后，如果至少有10000个key发生变化，则dump内存快照。
+
+​		配置AOF：
+
+​			修改配置文件：
+
+​				appendfsync always     #每次有数据修改发生时都会写入AOF文件。
+
+​				appendfsync everysec  #每秒钟同步一次，该策略为AOF的缺省策略。
+
+​				appendfsync no          #从不同步。高效但是数据不会被持久化。
+
+
+
+缓存穿透是访问一个不存在的key，缓存不起作用，请求会穿透到DB，流量大时DB会挂掉。缓存击穿是访问一个存在的key，在缓存过期的一刻，同时有大量的请求，这些请求都会击穿到DB，造成瞬时DB请求量大、压力骤增。
+
+
+
+缓存雪崩：
+
+​	某一时刻大量Key失效，如何预防雪崩，设置过期时间时可以采用部分时间内的随机数，就不会有集体失效的风险
+
+
+
+缓存击穿：
+
+​	比如在某网站在进行双十一或者在搞秒杀等运营活动的时候，那么此时网站流量一般都会很大的，某个一个商品因为促销会成为爆品，流量超级的大，如果这个商品，在这个时候，由于某种原因，在cache内失效了，那么就瞬间这个key的流量都会涌向数据库了，那么db最终挺不住了，down了，后果可想而知啊，正常其他的数据也查询不了。
+
+​	解决方案：
+
+		1. 限流
+		1. 利用分布式锁
+		1. 定时任务更新热点key
+
+
+
+缓存穿透：
+
+​	1.设置NULL或者特殊值：
+
+​		我们可以通过设置null 或者特定的值到redis内，且不过期，那么下次再来的时候，直接从redis 获取这个null 或者 特殊值就可以了
+
+ 2. 布隆过滤器
+
+    把所有可能存在的请求的值都存放在布隆过滤器中，当用户请求过来，先判断用户发来的请求的值是否存在于布隆过滤器中。不存在的话，直接返回请求参数错误信息给客户端，存在的话才会走下面的流程。
+
+     **当一个元素加入布隆过滤器中的时候，会进行如下操作：**
+
+    ​	使用布隆过滤器中的哈希函数对元素值进行计算，得到哈希值（有几个哈希函数得到几个哈希值）。
+
+    ​	根据得到的哈希值，在位数组中把对应下标的值置为 1。
+
+    **当我们需要判断一个元素是否存在于布隆过滤器的时候，会进行如下操作：**
+
+    ​	对给定元素再次进行相同的哈希计算；
+
+    ​	得到值之后判断位数组中的每个元素是否都为 1，如果值都为 1，那么说明这个值在布隆过滤器中，如果存在一个值不为 1，说明该元素不在布隆过滤器中。
+
+
+
+缓存数据库双写不一致：
+
+​	![image-20220104130007486](/Users/lejinbo/Library/Application Support/typora-user-images/image-20220104130007486.png)
+
+先更新数据库，后更新缓存：事务A执行到更新数据库，事务B进来更新了数据库和缓存，事务A再更新缓存，导致缓存中为事务A的结果，而库中为事务B的结果
+
+先更新数据库，后删除缓存：事务A执行到更新数据库，事务B进行了查询，读取了老的缓存中的数据，删除缓存后事务A和事务B结果不一样
+
+先更新缓存，再更新数据库：事务A执行完更新缓存，事务B执行了更新缓存和更新数据库，事务A再更新数据库，导致数据库和缓存不一致
+
+先删除缓存，再更新数据库：事务A删除了缓存，事务B进行查询，发现没有缓存，直接读取数据库中的数据，事务A再更新数据库，结果不一致		
+
+解决方案：
+
+延时双删（删除缓存-》更新数据库-》删除缓存）要保证在事务B进行读操作的时候，事务A的写操作已经完成，但是设置时间存在问题，而且性能较低
+
+内存队列：针对同一个Key的增删改查和缓存操作都在队列中串行化解决
+
+分布式锁：可以将操作转为串行化，性能较低。
+
+在分布式加锁的情况下,针对读多写少的操作进行读写锁操作，在设置key的时候，设置mode为read,write，下一个线程进来的时候redis会判断当前锁是read还是write，如果同样是read就可以继续读，如果是写则就拒绝
+
+​	<img src="/Users/lejinbo/Library/Application Support/typora-user-images/image-20220112195444610.png" alt="image-20220112195444610" style="zoom:50%;" />
+
+
+
+
+
+
+
+更新一致性：
+
+​		读请求：先读缓存，缓存没有的话，就读数据库，然后取出数据后放入缓存，同时返回响应。
+
+​		写请求：先删除缓存，然后再更新数据库(避免大量地写、却又不经常读的数据导致缓存频繁更新)。
+
+
+
+redis主从复制：
+
+​		复制方式：
+
+​			1.当master服务器与slave服务器正常连接时，master服务器会发送数据命令流给slave服务器,将自身数据的改变复制到slave服务器。
+
+​			2.当因为各种原因master服务器与slave服务器断开后，slave服务器在重新连上master服务器时会尝试重新获取断开后未同步的数据即部分同步，或者称为部分复制。
+
+​			3.如果无法部分同步(比如初次同步)，则会请求进行全量同步，这时master服务器会将自己的rdb文件发送给slave服务器进行数据同步，并记录同步期间的其他写入，再发送给slave服务器，以达到完全同步的目的，这种方式称为全量复制。
+
+​		工作原理：
+
+​			master服务器会记录一个replicationId的伪随机字符串，用于标识当前的数据集版本，还会记录一个当数据集的偏移量offset，不管master是否有配置slave服务器，replication Id和offset会一直记录并成对存在，
+
+​			当master与slave正常连接时，slave使用PSYNC命令向master发送自己记录的旧master的replication id和offset，而master会计算与slave之间的数据偏移量，并将缓冲区中的偏移数量同步到slave，此时master和slave的数据一致。
+
+
+
+redis哨兵实现原理：
+
+​		Sentinel 的三个定时监控任务：
+
+​		每隔 10 秒向主节点和从节点发送 info 命令获取最新的拓扑。
+
+​		每隔 2 秒，每个 sentinel 节点会向数据节点的sentinel:hello频道发送该 sentinel 节点对于主节点的判断以及当前 sentinel 节点信息，同时每个 sentinel 节点也会订阅该频道，来了解其他 sentinel 节点以及他们对主节点的判断。
+
+​		每个 1 秒，每个 sentinel 节点会向主节点、从节点、其他 sentinel 节点发送一条 ping 命令做一次心跳检测，判断节点是否存活。
+
+​		主观下线：
+
+​		当节点超过 down-after-milliseconds 没有进行有效回复，就会判定该节点失败，这叫主观下线。
+
+​		客观下线：
+
+​		当Sentinel主观下线的节点是主节点时，该Sentinel节点会通过sentinel is- master-down-by-addr命令向其他Sentinel节点询问对主节点的判断，当超过个数，Sentinel节点认为主节点确实有问题，这时该Sentinel节点会 做出客观下线的决定 。
+
+​		领导者选举：选举的过程非常快，基本上谁先完成客观下线，谁就是领导者。
+
+​		每个在线的Sentinel节点都有资格成为领导者，当它确认主节点主观 下线时候，会向其他Sentinel节点发送sentinel is-master-down-by-addr命令， 要求将自己设置为领导者。
+
+​		收到命令的Sentinel节点，如果没有同意过其他Sentinel节点的sentinel is-master-down-by-addr命令，将同意该请求，否则拒绝。
+
+​		如果该Sentinel节点发现自己的票数已经大于等于max(quorum， num(sentinels)/2+1)，那么它将成为领导者。
+
+​		如果此过程没有选举出领导者，将进入下一次选举。
+
+​		故障转移，在从节点列表中选出一个节点作为新的主节点，选择方法如下：
+
+​		过滤：“不健康”（主观下线、断线）、5秒内没有回复过Sentinel节 点ping响应、与主节点失联超过down-after-milliseconds*10秒。
+
+​		选择slave-priority(从节点优先级)最高的从节点列表，如果存在返回，不存在则继续。
+
+​		选择复制偏移量最大的从节点(复制的最完整)，如果存在则返回，不存在则继续。
+
+​		选择runid最小的从节点。
+
+
+
+Redis分布式锁：
+
+​	setnx key value :如果目前这个key存在，则不进行操作，不存在则设置value
+
+​	先拿**setnx**来争抢锁，抢到之后，再用**expire**给锁加一个过期时间防止锁忘记了释放。
+
+​	SET lock_key random_value NX PX 5000
+
+​	值得注意的是：
+​	random_value 是客户端生成的唯一的字符串。
+​	NX 代表只在键不存在时，才对键进行设置操作。
+​	PX 5000 设置键的过期时间为5000毫秒。
+
+
+
+简单的分布式锁代码：
+
+![image-20220104121237000](/Users/lejinbo/Library/Application Support/typora-user-images/image-20220104121237000.png) 
+
+用clientId的原因：用于比较当前锁是否是当前请求创建的锁，解决了可能删除其他请求锁的问题，比如第一个请求走到delete的时候用了33s，锁已经自动失效，这时候其他请求会进来加锁，但是请求1又过了3S后执行了delete，会把请求2的锁删除，导致请求3能获取锁，这个问题的解决方法就是用客户端ID对应每一个请求。
+
+
+
+存在锁过期的问题，如果代码执行到一半锁过期了，则其他请求会加锁，产生超卖现象
+
+锁续命：
+
+​		当设置的分布式锁有效时间小于业务执行时间（业务执行时间不好预知），锁将提前释放，导致业务逻辑重复执行。如果将有效期设置为永久则服务异常宕机、重启等情况没有执行释放锁逻辑，就会导致锁一直无法释放，从而影响后续业务。RedissonLock实现了可以在业务执行没有完成的时候，自动重置锁的有效期。来解决以上两个问题。
+
+​	
+
+Redisson:	![image-20220104121527739](/Users/lejinbo/Library/Application Support/typora-user-images/image-20220104121527739.png)
+
+![image-20220104122850439](/Users/lejinbo/Library/Application Support/typora-user-images/image-20220104122850439.png)
+
+
+
+看门狗代码：
+
+```java
+private void renewExpiration() {
+    RedissonBaseLock.ExpirationEntry ee = (RedissonBaseLock.ExpirationEntry)EXPIRATION_RENEWAL_MAP.get(this.getEntryName());
+    if (ee != null) {
+        Timeout task = this.commandExecutor.getConnectionManager().newTimeout(new TimerTask() {
+            public void run(Timeout timeout) throws Exception {
+                RedissonBaseLock.ExpirationEntry ent = (RedissonBaseLock.ExpirationEntry)RedissonBaseLock.EXPIRATION_RENEWAL_MAP.get(RedissonBaseLock.this.getEntryName());
+                if (ent != null) {
+                    Long threadId = ent.getFirstThreadId();
+                    if (threadId != null) {
+                        RFuture<Boolean> future = RedissonBaseLock.this.renewExpirationAsync(threadId);
+                        future.onComplete((res, e) -> {
+                            if (e != null) {
+                                RedissonBaseLock.log.error("Can't update lock " + RedissonBaseLock.this.getRawName() + " expiration", e);
+                                RedissonBaseLock.EXPIRATION_RENEWAL_MAP.remove(RedissonBaseLock.this.getEntryName());
+                            } else {
+                                if (res) {
+                                    RedissonBaseLock.this.renewExpiration();
+                                } else {
+                                    RedissonBaseLock.this.cancelExpirationRenewal((Long)null);
+                                }
+
+                            }
+                        });
+                    }
+                }
+            }
+        }, this.internalLockLeaseTime / 3L, TimeUnit.MILLISECONDS);
+        ee.setTimeout(task);
+    }
+}
+```
+
+
+
+redis分布式锁主从架构失效的问题:
+
+​	RedLock: 超过半数redis节点加锁成功才算成功
+
+
+
+redis分布式锁的性能问题：
+
+	1. 减少锁力度，看下方法哪些代码可以优化
+	1. 分段式加锁
+
+
+
+布隆过滤器：
+
+​		当一个元素加入布隆过滤器中的时候，会进行如下操作：
+
+​		使用布隆过滤器中的哈希函数对元素值进行计算，得到哈希值（有几个哈希函数得到几个哈希值）。
+
+​		根据得到的哈希值，在位数组中把对应下标的值置为 1。
+
+​		当我们需要判断一个元素是否存在于布隆过滤器的时候，会进行如下操作：
+
+​		对给定元素再次进行相同的哈希计算；
+
+​		得到值之后判断位数组中的每个元素是否都为 1，如果值都为 1，那么说明这个值在布隆过滤器中，如果存在一个值不为 1，说明该元素不在布隆过滤器中。
+
+
+
+
+
+https://mp.weixin.qq.com/s/Lx_OxQb6bubXhiRjvGHyGQ
