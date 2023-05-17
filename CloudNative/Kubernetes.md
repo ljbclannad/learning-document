@@ -78,6 +78,7 @@
        - 我们从容器这个最基础的概念出发，首先遇到了容器间“紧密协作”关系的难题，于是就扩展到了 Pod；有了 Pod 之后，我们希望能一次启动多个应用的实例，这样就需要 Deployment 这个 Pod 的多实例管理器；而有了这样一组相同的 Pod 后，我们又需要通过一个固定的 IP 地址和端口以负载均衡的方式访问它，于是就有了 Service。
        - 除了应用与应用之间的关系外，应用运行的形态是影响“如何容器化这个应用”的第二个重要因素。为此，Kubernetes 定义了新的、基于 Pod 改进后的对象。比如 Job，用来描述一次性运行的 Pod（比如，大数据任务）；再比如 DaemonSet，用来描述每个宿主机上必须且只能运行一个副本的守护进程服务；又比如 CronJob，则用于描述定时任务等等
        - 首先，通过一个“编排对象”，比如 Pod、Job、CronJob 等，来描述你试图管理的应用；然后，再为它定义一些“服务对象”，比如 Service、Secret、Horizontal Pod Autoscaler（自动水平扩展器）等。这些对象，会负责具体的平台级功能。这种使用方法，就是所谓的“声明式 API”。这种 API 对应的“编排对象”和“服务对象”，都是 Kubernetes 项目中的 API 对象（API Object）。
+       - Kubernetes 把集群里的一切资源都定义为 API 对象，通过 RESTful 接口来管理。描述 API 对象需要使用 YAML 语言，必须的字段是 apiVersion、kind、metadata。
 
 12. Kubeadm：把 kubelet 直接运行在宿主机上，然后使用容器部署其他的 Kubernetes 组件。
 
@@ -95,7 +96,9 @@
 
 14. Pods：这些具有“超亲密关系”容器的典型特征包括但不限于：互相之间会发生直接的文件交换、使用 localhost 或者 Socket 文件进行本地通信、会发生非常频繁的远程调用、需要共享某些 Linux Namespace（比如，一个容器要加入另一个容器的 Network Namespace）等等。将超亲密关系容器放在同一个pod中。
 
-15. 容器设计模式：
+15. 可以把 Pod 看作是介于容器之上的一层抽象，之所以需要这一层抽象是因为容器与容器之间有着不确定的关系，有的容器需要与彼此隔离，而有的容器却需要彼此交互。当容器规模增大，容器之间的作用关系就会变得极其复杂，难于管理。Pod 的出现就是为了解决容器管理的问题，让大规模应用下的容器编排变得更加清晰有序，易于维护
+
+16. 容器设计模式：
 
     1. Pod 里的所有容器，共享的是同一个 Network Namespace，并且可以声明共享同一个 Volume。
 
@@ -114,13 +117,15 @@
        - 有了这个设计之后，共享 Volume 就简单多了：Kubernetes 项目只要把所有 Volume 的定义都设计在 Pod 层级即可。这样，一个 Volume 对应的宿主机目录对于 Pod 来说就只有一个，Pod 里的容器只要声明挂载这个 Volume，就一定可以共享这个 Volume 对应的宿主机目录。
 
     4. 把pod看成传统环境里的”机器“、把容器看作是运行在这个”机器“里的“用户程序”
-    
-    5. Pod.yaml配置文件中spec.container相关属性的含义：
-    
+
+    5. Pod.yaml配置文件中的labels可以为Pod附上一些标签
+
+    6. Pod.yaml配置文件中spec.container相关属性的含义：
+
        - ImagePullPolicy：定义了镜像拉取的策略，Always：每次创建Pod都会重新拉取一次镜像，IfNotPresent：Pod永远不会主动拉取这个镜像，或者只有在宿主机上不存在时才会拉取这个镜像。
-    
+
        - Lifecycle字段：
-    
+
          ```yaml
          spec:
            containers:
@@ -136,7 +141,7 @@
                  exec:
                    command: ["/usr/sbin/nginx","-s","quit"]
          ```
-    
+
        - 涉及到Pod生命周期的属性：status
          - pod.status.phase:
            - Pending：yaml文件已经提交给Kubernetes，Api对象已经创建在etcd，但是这个容器因为某种原因不能顺利启动
@@ -144,7 +149,126 @@
            - Succeeded：Pod 里的所有容器都正常运行完毕，并且已经退出了。这种情况在运行一次性任务时最为常见。
            - Failed：这个状态下，Pod 里至少有一个容器以不正常的状态（非 0 的返回码）退出。这个状态的出现，意味着你得想办法 Debug 这个容器的应用，比如查看 Pod 的 Events 和日志。
            - Unknown。这是一个异常状态，意味着 Pod 的状态不能持续地被 kubelet 汇报给 kube-apiserver，这很有可能是主从节点（Master 和 Kubelet）间的通信出现了问题。
-    
-    6. Projected Volumn：它们存在的意义不是为了存放容器里的数据，也不是用来进行容器和宿主机之间的数据交换。这些特殊 Volume 的作用，是为容器提供预先定义好的数据。所以，从容器的角度来看，这些 Volume 里的信息就是仿佛是被 Kubernetes“投射”（Project）进入容器当中的。
-    
-       - Secret：
+
+    7. Projected Volumn：它们存在的意义不是为了存放容器里的数据，也不是用来进行容器和宿主机之间的数据交换。这些特殊 Volume 的作用，是为容器提供预先定义好的数据。所以，从容器的角度来看，这些 Volume 里的信息就是仿佛是被 Kubernetes“投射”（Project）进入容器当中的。
+
+17. Job和CornJob
+
+    1. “离线业务”也可以分为两种。一种是“临时任务”，跑完就完事了，下次有需求了说一声再重新安排；另一种是“定时任务”，可以按时按点周期运行，不需要过多干预。对应到 Kubernetes 里，“临时任务”就是 API 对象 Job，“定时任务”就是 API 对象 CronJob，使用这两个对象你就能够在 Kubernetes 里调度管理任意的离线业务了。
+
+       1. Job:
+
+          - activeDeadlineSeconds，设置 Pod 运行的超时时间。backoffLimit，设置 Pod 的失败重试次数。completions，Job 完成需要运行多少个 Pod，默认是 1 个。parallelism，它与 completions 相关，表示允许并发运行的 Pod 数量，避免过多占用资源。
+
+          - ```yaml
+            #Job基础yaml文件
+            apiVersion: batch/v1
+            kind: Job
+            metadata:
+              name: sleep-job
+            
+            spec:
+              activeDeadlineSeconds: 15
+              backoffLimit: 2
+              completions: 4
+              parallelism: 2
+            
+              template:
+                spec:
+                  restartPolicy: OnFailure
+                  containers:
+                  - image: busybox
+                    name: echo-job
+                    imagePullPolicy: IfNotPresent
+                    command:
+                      - sh
+                      - -c
+                      - sleep $(($RANDOM % 10 + 1)) && echo done
+            ```
+
+       2. CornJob：
+
+          1. <img src="https://static001.geekbang.org/resource/image/yy/3c/yy352c661ae37dd116dd12c61932b43c.jpg?wh=1920x2206" alt="img" style="zoom:30%;" />
+
+18. ConfigMap和Secret:
+
+    1. ```yaml
+       #configMap的基础yaml文件
+       apiVersion: v1
+       kind: ConfigMap
+       metadata:
+         name: info
+       
+       data:
+         count: '10'
+         debug: 'on'
+         path: '/etc/systemd'
+         greeting: |
+           say hello to kubernetes.
+       ```
+
+    2. ```yaml
+       #secret的基础yaml文件
+       apiVersion: v1
+       kind: Secret
+       metadata:
+         name: user
+       
+       data:
+         name: cm9vdA==  # root
+         pwd: MTIzNDU2   # 123456
+         db: bXlzcWw=    # mysql
+       ```
+
+    3. ```yaml
+       #Pob绑定secret案例
+       spec:
+         containers:
+         - env:
+           - name: MYSQL_DATABASE
+           - name: MYSQL_USER
+           - name: MYSQL_ROOT_PASSWORD
+             valueFrom:
+               secretKeyRef:
+                 key: mysql-root-password
+                 name: mysql
+           - name: MYSQL_PASSWORD
+             valueFrom:
+               secretKeyRef:
+                 key: mysql-password
+                 name: mysql
+       ```
+
+    4. ```yaml
+       #通过挂载的形式获取secret或者ConfigMap
+       
+       apiVersion: v1
+       kind: Pod
+       metadata:
+         name: vol-pod
+       
+       spec:
+       	#挂载2个volumn
+         volumes: 
+         - name: cm-vol
+           configMap:
+             name: info
+         - name: sec-vol
+           secret:
+             secretName: user
+       
+         containers:
+         #容器中获取挂载的volumn
+         - volumeMounts:
+           - mountPath: /tmp/cm-items
+             name: cm-vol
+           - mountPath: /tmp/sec-items
+             name: sec-vol
+       
+           image: busybox
+           name: busy
+           imagePullPolicy: IfNotPresent
+           command: ["/bin/sleep", "300"]
+       ```
+
+    5. 用env和volume两种方式创建的pod都尝试了，修改了ConfigMap/Secret 的 YAML后 kubectl apply，Pod里的value并不会改变。
