@@ -43,7 +43,7 @@
    sudo mkdir -p /etc/docker
    sudo tee /etc/docker/daemon.json <<-'EOF'
    {
-     "registry-mirrors": ["https://7jogr2wj.mirror.aliyuncs.com"]
+     "registry-mirrors": ["https://7jogr2wj.mirror.aliyuncs.com"],
    	"exec-opts": ["native.cgroupdriver=systemd"],
      "log-driver": "json-file",
      "log-opts": {
@@ -67,4 +67,4 @@
      
    ```
 
-​	
+​	PS:安装问题总结：
