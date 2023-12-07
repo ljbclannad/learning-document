@@ -6,8 +6,9 @@
 
 2. 拉取镜像：```docker pull mysql```
 3. 启动镜像：```docker run --name mysql -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root -d mysql```
-4. 进入Mysql镜像：```docker exec -it mysql bash```
-5. 使用创建的password进行登录校验：```mysql -uroot -proot```
+4. docker run --restart=always --privileged=true -d -v /root/molport/mysql/data:/var/lib/mysql  -p 3306:3306 --name mysql -e MYSQL_ROOT_PASSWORD=root mysql
+5. 进入Mysql镜像：```docker exec -it mysql bash```
+6. 使用创建的password进行登录校验：```mysql -uroot -proot```
 
 # 常见问题：
 

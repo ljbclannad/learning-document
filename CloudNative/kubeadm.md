@@ -11,7 +11,7 @@
    #Kubernetes 1.8开始要求关闭系统的Swap，如果不关闭，默认配置下kubelet将无法启动，关闭系统的Swap方法如下:
    swapoff -a
    
-   #修改 /etc/fstab 文件，注释掉 SWAP 的自动挂载，使用free -m确认swap已经关闭。 swappiness参数调整，修改/etc/sysctl.d/k8s.conf添加下面一行：
+   #修改 /etc/fstab 文件，注释掉 SWAP 的自动挂载，使用free -m确认swap已经关闭。 swappiness参数调整，修改/etc/sysctl.d/k8s.conf添加下面一行k
    vm.swappiness=0
    
    #执行
@@ -38,8 +38,14 @@
    
    systemctl enable kubelet
    
+   #关闭containerd的cri_disabled注解
+   vi /etc/containerd/config.toml
+   
+   systemctl restart containerd
+   
    
    #配置docker镜像加速
+   #https://cr.console.aliyun.com/cn-hangzhou/instances/mirrors
    sudo mkdir -p /etc/docker
    sudo tee /etc/docker/daemon.json <<-'EOF'
    {
@@ -58,13 +64,29 @@
    
    #安装kubeadm镜像(如果kubeadm出现错误，可以使用kubeadm reset删除错误安装内容)
     kubeadm init \
-     --apiserver-advertise-address=112.124.23.98 \
      --image-repository registry.aliyuncs.com/google_containers \
      --kubernetes-version v1.23.3 \
      --service-cidr=10.1.0.0/16 \
      --pod-network-cidr=10.244.0.0/16
+     # --apiserver-advertise-address=112.124.23.98 \
      
+   #执行
+   mkdir -p $HOME/.kube
+     sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+     sudo chown $(id -u):$(id -g) $HOME/.kube/config
+   
+   #master安装flannel
+   kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml  
      
+    #子NODE加入 (父子节点需要相同版本)
+    kubeadm join 172.26.26.141:6443 --token h2tlyf.nfk34fkkyg3q9r51 \
+   	--discovery-token-ca-cert-hash sha256:87096d6ef5baca3ef025a35b2744df05cd6b751ea812ffe38a0a478374807333 
+   	
+   	
+   #验证
+   kubectl create deployment nginx --image=nginx
+   kubectl expose deployment nginx --port=80 --type=NodePort
+   kubectl get pod,svc
+   
+   访问nodeIp:pod的port验证
    ```
-
-​	PS:安装问题总结：
