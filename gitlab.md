@@ -10,6 +10,7 @@
    stages:
    	- test
    	- build
+   	- deploy
    	
    run_tests: #jobName
    	stage: test
@@ -30,8 +31,19 @@
    		- docker build -t $IMAGE_NAME:$IMAGE_TAG .
    		- docker push $IMAGE_NAME:$IMAGE:TAG
    		
+   deploy:
+   	stage: deploy
+   	before_script:
+   		- chomd 400 $SSH_KEY
+   	script:
+   		- ssh -o StrictHostKeyChecking=no -i $SSH_KEY root@161.35.223.117 "
+   		docker login -u $REGISTRY_USER -p $REGISTER_PASS && 
+   		docker ps -aq |xargs docker stop| xargs docker rm &&
+   		docker run -d -p 5000:5000 $IMAGE_NAME:$IMAGE_TAG"
+   	
+   		
    ```
-
+   
 4. Project-Settinig-CI/CD-variable: 设置gitlabCI/CD中的参数
 
 5. Stage1: run_tests  Stage2: build_image Stage3: deploy
@@ -40,4 +52,4 @@
 
    only if build and push was successful,we want to deploy the new image
 
-6. 
+   通过stage参数控制顺序
