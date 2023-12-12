@@ -11,3 +11,15 @@ infrastructure: 基础设施，structure：结构，设施。
 fundamental: adj. 根本的，基本的 n:基本原理
 
 Specify: v： 明确指出，指定
+
+combination: 组合   Crash Course：速成班
+
+Standardized：标准化  conficts: 冲突  storage：存储  Distribution system: 分布系统
+
+ Aritfact and instructions：工具和说明   kernel: 内核  components：组件
+
+compability：兼容性  Hypervisor:管理程序 Hypervisor Layer：管理程序层
+
+responsible for : 责任  previous:之前
+
+ 
