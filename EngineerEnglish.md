@@ -22,9 +22,13 @@ compability：兼容性  Hypervisor:管理程序 Hypervisor Layer：管理程序
 
 responsible for : 责任  previous:之前
 
- 
-Specify: v： 明确指出，指定    Tutorial:教程    founded: 成立
+
+ Tutorial:教程    founded: 成立
 
 research: n. （尤指大学或科研机构进行的）研究，探讨 v. 研究，探索
 
-Perform: 执行    strategy:策略
+Perform: 执行    strategy:策略   introduction:介绍,采用
+
+Guide: 指南，手册  industry: 行业  program:程序  efficiently:高效的
+
+Performance：性能 Memory：内存   pseudoCode:伪代码
