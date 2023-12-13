@@ -10,4 +10,8 @@ infrastructure: 基础设施，structure：结构，设施。
 
 fundamental: adj. 根本的，基本的 n:基本原理
 
-Specify: v： 明确指出，指定
+Specify: v： 明确指出，指定    Tutorial:教程    founded: 成立
+
+research: n. （尤指大学或科研机构进行的）研究，探讨 v. 研究，探索
+
+Perform: 执行    strategy:策略
