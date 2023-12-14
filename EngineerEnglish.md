@@ -32,3 +32,7 @@ Perform: 执行    strategy:策略   introduction:介绍,采用
 Guide: 指南，手册  industry: 行业  program:程序  efficiently:高效的
 
 Performance：性能 Memory：内存   pseudoCode:伪代码
+
+process: 过程 processing:处理  complexity:复杂度
+
+analysis: 分析   linearSearch: 线性查找 BinarySearch:二分法查找
