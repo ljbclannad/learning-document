@@ -10,7 +10,7 @@ infrastructure: 基础设施，structure：结构，设施。
 
 fundamental: adj. 根本的，基本的 n:基本原理
 
-Specify: v： 明确指出，指定
+Specify: v： 明确指出，指定   
 
 combination: 组合   Crash Course：速成班
 
@@ -36,3 +36,5 @@ Performance：性能 Memory：内存   pseudoCode:伪代码
 process: 过程 processing:处理  complexity:复杂度
 
 analysis: 分析   linearSearch: 线性查找 BinarySearch:二分法查找
+
+measure: 测量，判断   efficient:高效的
