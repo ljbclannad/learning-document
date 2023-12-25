@@ -38,3 +38,5 @@ process: 过程 processing:处理  complexity:复杂度
 analysis: 分析   linearSearch: 线性查找 BinarySearch:二分法查找
 
 measure: 测量，判断   efficient:高效的
+
+priority：优先   dynamic:动态
