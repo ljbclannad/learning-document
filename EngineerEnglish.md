@@ -39,4 +39,8 @@ analysis: 分析   linearSearch: 线性查找 BinarySearch:二分法查找
 
 measure: 测量，判断   efficient:高效的
 
-priority：优先   dynamic:动态
+priority：优先   dynamic:动态  consecutive：连续
+
+SinglyLinkedList: 单向链表 DoublyLinkedList:双向链表
+
+traversal: 遍历
