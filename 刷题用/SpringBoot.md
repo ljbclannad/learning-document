@@ -12,7 +12,7 @@
 
 1. Spring模块：
 
-   ![image-20220510102821766](/Users/lejinbo/Library/Application Support/typora-user-images/image-20220510102821766.png)
+   
 
 2. 控制反转（IOC）和依赖注入等概念参考Spring.md
 
@@ -26,7 +26,7 @@
 
 2. 路径匹配参数配：
 
-   ![image-20220510143525828](/Users/lejinbo/Library/Application Support/typora-user-images/image-20220510143525828.png)
+   
 
 
 
@@ -35,5 +35,4 @@
 1. @SpringBootApplication注解主要组合了@Configuration,@EnableAutoConfiguration,@ComponentScan
 2. 关闭特定的自动配置应该使用SpringBootApplication注解的exclude参数。
 3. 可以使用@ImportResource来加载xml配置。
-4. @SpringBootApplication中继承了@EnableAutoConfiguration，@EnableAutoConfiguration中Import了AutoConfigurationImportSelector.class,AutoConfigurationImportSelector.class中通过List<String> configurations = SpringFactoriesLoader.loadFactoryNames(this.getSpringFactoriesLoaderFactoryClass(), this.getBeanClassLoader());获取所有META-INF/spring.factories的Bean。
-5. 
+4. @SpringBootApplication中继承了@EnableAutoConfiguration，@EnableAutoConfiguration中Import了AutoConfigurationImportSelector.class,AutoConfigurationImportSelector.class中通过List configurations = SpringFactoriesLoader.loadFactoryNames(this.getSpringFactoriesLoaderFactoryClass(), this.getBeanClassLoader());获取所有META-INF/spring.factories的Bean。
