@@ -11,6 +11,7 @@
 	2. 保证一致性：同一个dokcerfile可以在不同环境下生成一致的镜像
 	3. 自动化构建：通过Dockerfile可以方便地实现镜像的自动化构建，简化了CI/CD过程
 	4. Dockerfile可以使用版本控制工具进行管理，方便回滚和跟踪更改记录
+	5. 核心指令：FROM、WORKDIR、COPY、ADD、RUN、CMD、ENV、EXPOSE
 4. Docker容器网络(--network)：        
 	1. 桥接网络(bridge)：默认的网络模式，会创建一个名为bridge的虚拟网络，所有容器默认都会连接到这个Bridge网络上
 	2. 主机网络（host)：让容器和宿主机共享IP地址
@@ -18,9 +19,9 @@
 	4. 覆盖网络(overlay network)：适用于docker swarm或者k8s，可以连接多台docker主机上的容器
 	5. macvlan网络：容器会获取一个唯一的MAC地址，并且可以通过宿主机的物理网络接口来发送和接收数据包
 5. 优化容器启动时间：        
-	1. 使用较小的基础镜像
-	2. 减少镜像层数
-	3. 利用缓存
+	1. 使用较小的基础镜像（alpine）
+	2. 减少镜像层数（合并RUN指令）
+	3. 利用缓存（宿主机缓存）
 	4. 适当配置健康检查
 	5. 预启动依赖服务
 	6. 本地化镜像
@@ -52,12 +53,19 @@
 	3. docker save -o dataway.tar registry.cn-hangzhou.aliyuncs.com/repo_public/dataway-pro:20 打包成tar
 	4. docker load -i dataway.tar 解析tar包为镜像
 	5. microk8s.ctr images import dataway.tar 解析tar，返回镜像
-	6. docker build ,docker tag ,docker push
+	6. docker build dockerhub-username/repository-name/imagename .  ,docker tag ,docker push
+	7. docker run [OPTIONS] IMAGE [COMMAND] [ARG...]
 2.  日志相关：        
 	1. docker logs --tail 10 my-container  查看最新的几行日志，可以使用--tail参数。
 	2. docker logs --since="2021-01-01T00:00:00" --until="2021-01-01T01:00:00" my-container  查看指定日期内的日志
 3. 配置相关：        
 	1. /etc/docker/daemon.json  配置docker
+	2. 设置docker自动补全：
+``` shell
+curl -L https://raw.githubusercontent.com/docker/cli/master/contrib/completion/bash/docker -o ~/.docker-completion.bash
+echo "source ~/.docker-completion.bash" >> ~/.bashrc
+source ~/.bashrc
+```
 4. 数据卷相关：        
 	1. 创建数据卷：docker volume create my_volume
 	2. 挂载数据卷：docker run -d -v my_volume:/data --name my_container nginx
@@ -307,7 +315,6 @@ ENV config.MinioSecretKey minio@admin
 
   
   
-
 FROM development_${env} AS final
 
 RUN echo "final production: ${env}"

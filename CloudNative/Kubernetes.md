@@ -98,3 +98,195 @@
     - 只要 Pod 的 restartPolicy 指定的策略允许重启异常的容器（比如：Always），那么这个 Pod 就会保持 Running 状态，并进行容器重启。否则，Pod 就会进入 Failed 状态 。
     - 对于包含多个容器的 Pod，只有它里面所有的容器都进入异常状态后，Pod 才会进入 Failed 状态。在此之前，Pod 都是 Running 状态。此时，Pod 的 READY 字段会显示正常容器的个数，比如：
 - Projected Volumn：它们存在的意义不是为了存放容器里的数据，也不是用来进行容器和宿主机之间的数据交换。这些特殊 Volume 的作用，是为容器提供预先定义好的数据。所以，从容器的角度来看，这些 Volume 里的信息就是仿佛是被 Kubernetes“投射”（Project）进入容器当中的。
+
+# 3. deployment中的访问
+在 Kubernetes (K8s) 中，多个 `Deployment` 之间的互相访问通常通过 **Service** 实现。`Service` 为一组 `Pod` 提供了一个稳定的网络标识（虚拟 IP 和 DNS 名称），使 `Deployment` 之间的通信更加可靠和便捷。以下是详细说明：
+
+---
+
+## **1. Deployment 的基本结构**
+
+- **Deployment** 定义了 `Pod` 的模板，用于管理一组副本的生命周期。
+- 每个 `Pod` 会被分配一个动态的 IP 地址（`ClusterIP`），但该 IP 地址可能会因为重启或扩容而变化。
+
+---
+
+## **2. Service 提供稳定访问入口**
+
+为了让不同 `Deployment` 的 `Pod` 能稳定地互相访问，K8s 提供了 **Service**，它的作用包括：
+
+1. **提供稳定的访问入口**：
+    
+    - 通过 `ClusterIP` 为一组 `Pod` 提供一个固定的虚拟 IP。
+    - 使用 DNS 名称（由 K8s 内部的 DNS 服务生成）访问服务。
+2. **负载均衡**：
+    
+    - Service 会根据定义的选择器（`selector`）匹配到目标的 `Pod`，并通过负载均衡将流量分发到所有匹配的 `Pod` 上。
+
+---
+
+## **3. Deployment 间的访问流程**
+
+### **3.1 定义 Deployment 和 Service**
+
+1. **创建 Deployment A**
+    
+    ```yaml
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: deployment-a
+    spec:
+      replicas: 2
+      selector:
+        matchLabels:
+          app: app-a
+      template:
+        metadata:
+          labels:
+            app: app-a
+        spec:
+          containers:
+          - name: app-a
+            image: nginx
+            ports:
+            - containerPort: 80
+    ```
+    
+2. **为 Deployment A 创建 Service**
+    
+    ```yaml
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: service-a
+    spec:
+      selector:
+        app: app-a
+      ports:
+      - protocol: TCP
+        port: 80
+        targetPort: 80
+      type: ClusterIP
+    ```
+    
+3. **创建 Deployment B**
+    
+    ```yaml
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: deployment-b
+    spec:
+      replicas: 2
+      selector:
+        matchLabels:
+          app: app-b
+      template:
+        metadata:
+          labels:
+            app: app-b
+        spec:
+          containers:
+          - name: app-b
+            image: busybox
+            command:
+            - sleep
+            - "3600"
+    ```
+    
+
+---
+
+### **3.2 Deployment B 访问 Deployment A**
+
+1. **通过 Service 名称访问**：
+    
+    - 在 K8s 内部，Service 会通过 DNS 创建一个域名。
+    - Service 的 DNS 名称格式为：`<service-name>.<namespace>.svc.cluster.local`。
+    - 在相同命名空间内，直接使用 `service-a` 即可访问。
+2. **示例：在 Pod 中访问 Deployment A**
+    
+    - 进入 Deployment B 的某个 Pod：
+        
+        ```bash
+        kubectl exec -it <pod-name> -- sh
+        ```
+        
+    - 使用 `curl` 访问 Service A：
+        
+        ```bash
+        curl service-a
+        ```
+        
+    - 如果服务监听了不同的端口，可以指定端口：
+        
+        ```bash
+        curl service-a:80
+        ```
+        
+
+---
+
+## **4. 不同命名空间之间的访问**
+
+如果两个 Deployment 分别在不同的命名空间中，可以通过完整的 DNS 名称访问。
+
+1. 假设：
+    
+    - Deployment A 和 Service A 在命名空间 `namespace-a`。
+    - Deployment B 在命名空间 `namespace-b`。
+2. **完整的 DNS 名称格式**：
+    
+    ```
+    <service-name>.<namespace>.svc.cluster.local
+    ```
+    
+3. **跨命名空间访问示例**： 在 `namespace-b` 的 Pod 中访问：
+    
+    ```bash
+    curl service-a.namespace-a.svc.cluster.local
+    ```
+    
+
+---
+
+## **5. Service 类型选择**
+
+在 K8s 中，Service 有多种类型，具体选择取决于访问场景：
+
+1. **ClusterIP（默认）**：
+    
+    - 提供集群内部访问。
+    - 适用于 Deployment 间的通信。
+2. **NodePort**：
+    
+    - 暴露固定端口到每个节点上，允许外部访问。
+3. **LoadBalancer**：
+    
+    - 提供云服务商的负载均衡器，允许外部流量访问服务。
+4. **Headless Service**：
+    
+    - 不分配 `ClusterIP`，直接返回 Pod 的 IP 地址，适用于需要完全控制流量分发的场景（如数据库集群）。
+
+---
+
+## **6. 负载均衡与健康检查**
+
+1. **负载均衡**：
+    
+    - Service 会轮询将流量分发到匹配的 Pod 上。
+    - 使用 kube-proxy 维护负载均衡规则。
+2. **健康检查**：
+    
+    - 如果某个 Pod 不健康，Service 会自动将其移出流量分发范围。
+    - 健康检查由 `livenessProbe` 和 `readinessProbe` 实现。
+
+---
+
+## **7. 总结**
+
+- Deployment 间的通信依赖于 Service 提供的稳定访问入口。
+- Service 提供了 DNS 名称和虚拟 IP，支持负载均衡和动态实例感知。
+- 跨命名空间时，需要使用完整的 DNS 名称访问。
+- 通过配置不同类型的 Service，可以实现内部通信、外部暴露等多种访问场景。

@@ -3,7 +3,7 @@
 2. 拉取镜像：`docker pull nginx`
 3. 启动镜像：
 ```shell
-docker run --name nginx -p 80:80 -v /home/lighthouse/nginx/nginx.conf:/etc/nginx/nginx.conf -v /home/docker-nginx/log:/var/log/nginx -d nginx
+docker run --name nginx -p 80:80 -v /mnt/nginx/nginx.conf:/etc/nginx/conf.d -v /home/docker-nginx/log:/var/log/nginx -d nginx
 ```
    *-v 指定挂载路径，将宿主机的nginx.conf挂载至容器中的nginx.conf*
 4. 访问配置nginx：`curl http://host:80`，出现welcom to nginx即为安装成功
