@@ -1,34 +1,67 @@
 # 1. InnoDb和MyISAM的区别
 1. InnoDb提供事务支持，提供行级锁，支持外键，支持MVCC，默认隔离级别为可重复读
 2. MyISAM不提供事务，且只有表级锁，不支持外键，不支持MVCC
+3. 实际业务开发重为啥不推荐外键：
+	1. 性能影响
+		- 外键在插入、更新、删除时要额外检查关联表数据，影响写入性能；
+		- 特别是在大数据量、高并发的系统中，不希望数据库增加开销。
+	 2. 限制分布式架构
+		- 外键只能在**同一个数据库实例内生效**；
+		- 无法跨数据库或微服务进行约束，不利于数据库水平拆分（Sharding）。
+    3. 控制权转移到数据库
+		- 外键会自动触发级联删除等操作，开发人员无法完全控制，存在隐患；
+		- 很多团队更愿意将数据一致性控制权交给应用层。
 # 2. 锁
 1. **表级锁：** MySQL 中锁定 **粒度最大** 的一种锁，对当前操作的整张表加锁，实现简单，资源消耗也比较少，加锁快，不会出现死锁。其锁定粒度最大，触发锁冲突的概率最高，并发度最低，MyISAM 和 InnoDB 引擎都支持表级锁。
 2. **行级锁**： MySQL 中锁定 粒度最小 的一种锁，只针对当前操作的行进行加锁。 行级锁能大大减少数据库操作的冲突。其加锁粒度最小，并发度高，但加锁的开销也最大，加锁慢，会出现死锁。
+	1. **行锁是数据库层面的一种锁类型**，由 InnoDB 在 UPDATE/DELETE/SELECT ... FOR UPDATE 时自动或手动触发； 而**悲观锁和乐观锁是并发控制策略**，**乐观锁依赖版本判断，悲观锁依赖行锁阻塞控制**；
+	2. ┌──────────────┐
+		│  乐观锁（业务层） │
+		│  - 不加锁     │
+		│  - version判断 │
+		└──────┬───────┘
+		       ↓
+		    提交 UPDATE 时
+		       ↓
+		┌──────────────┐
+		│  行锁（InnoDB） │ ← 自动加锁（Record Lock）
+		│  - 保证更新原子性│
+		└──────────────┘
+		       ↑
+		┌──────────────┐
+		│  悲观锁（业务层） │
+		│  - SELECT FOR UPDATE │
+		│  - 显式加锁，提前锁住行 │
+		└──────────────┘
 3. **锁分类**：​
 	1. 共享锁（share lock）：被称为读锁，其他用户可以并发读取数据，但任何事务都不能获取数据上的排他锁，直到已释放所有共享锁。（SELECT ... FOR SHARE）
 		1. 例子：如果事务1对对象A上了锁，那么其他事务只能再对对象A上共享锁，而不能加锁，直到事务1释放了对对象A的S锁，这就保证了其他事务可以读取A，但是在事务1利用完A期间A不会被其他事务改变
 	2. 排他锁（exclusive lock）：在事务1对对象A进行操作的时候，其他事务都不能读取或者修改对象A（select  for update）
-4. **不可重复读（读取已提交），可重复读，幻读**
+4.  #Mysql 不可重复读（读取已提交），可重复读，幻读
 	1. 很多人容易搞混不可重复读和幻读，确实这两者有些相似。但不可重复读重点在于update和delete，而幻读的重点在于insert。
 	2. 如果使用锁机制来实现这两种隔离级别，在可重复读中，该sql第一次读取到数据后，就将这些数据加锁，其它事务无法修改这些数据，就可以实现可重复读了。但这种方法却无法锁住insert的数据，所以当事务A先前读取了数据，或者修改了全部数据，事务B还是可以insert数据提交，这时事务A就会发现莫名其妙多了一条之前没有的数据，这就是幻读，不能通过行锁来避免。需要Serializable隔离级别 ，读用读锁，写用写锁，读锁和写锁互斥，这么做可以有效的避免幻读、不可重复读、脏读等问题，但会极大的降低数据库的并发能力。
 # 3. 优化慢SQL的分析
+
 1. 查看sql是否涉及多表的联表或者子查询，如果有，看是否能进行业务拆分，相关字段冗余或者合并成临时表（业务和算法的优化）
-2. 涉及链表的查询，是否能进行分表查询，单表查询之后的结果进行字段整合
-3. 如果以上两种都不能操作，非要链表查询，那么考虑对相对应的查询条件做索引。加快查询速度
-4. 针对数量大的表进行历史表分离（如交易流水表）
-5. 数据库主从分离，读写分离，降低读写针对同一表同时的压力，至于主从同步，mysql有自带的binlog实现 主从同步
-6. explain分析sql语句，查看执行计划，分析索引是否用上，分析扫描行数等等
-7. 查看mysql执行日志，看看是否有其他方面的问题
+2. 涉及联表的查询，是否能进行分表查询，单表查询之后的结果进行字段整合
+3. 如果以上两种都不能操作，非要联表查询，那么考虑对相对应的查询条件做索引。加快查询速度
+4. 表结构设计优化（索引）
+5. 针对数量大的表进行历史表分离（如交易流水表）
+6. 数据库主从分离，读写分离，降低读写针对同一表同时的压力，至于主从同步，mysql有自带的binlog实现 主从同步
+7. explain分析sql语句，查看执行计划，分析索引是否用上，分析扫描行数等等
+8. 查看mysql执行日志，看看是否有其他方面的问题
+9. ![[Pasted image 20250304160700.png]]
 
 # 4. ACID
-1. 原子性：事务是最小的执行单位，不允许分割。事务的原子性确保动作要么全部完成，要么完全不起作用。
-2. 一致性：执行事务前后，数据保持一致，例如转账业务中，无论事务是否成功，转账者和收款人的总额应该是不变的。
-3. 隔离性：并发访问数据库时，一个用户的事务不被其他事务所干扰，各并发事务之间数据库是独立的
-4. 持久性：一个事务被提交之后。它对数据库中数据的改变是持久的，即使数据库发生故障也不应该对其有任何影响
+
+1. 原子性（Atomicity）：事务是最小的执行单位，不允许分割。事务的原子性确保动作要么全部完成，要么完全不起作用。
+2. 一致性（Consistency）：执行事务前后，数据保持一致，例如转账业务中，无论事务是否成功，转账者和收款人的总额应该是不变的。
+3. 隔离性（Isolation）：并发访问数据库时，一个用户的事务不被其他事务所干扰，各并发事务之间数据库是独立的
+4. 持久性（Durability）：一个事务被提交之后。它对数据库中数据的改变是持久的，即使数据库发生故障也不应该对其有任何影响
 5. 主要通过锁、Redo Log、Undo Log、MVCC来实现事务
-	1. Redo Log:记录事务对数据库的所有修改，在崩溃时恢复未提交的更改，用来满足事务的持久性
-	2. Undo Log:记录事务的反向操作，简单地说就是保存数据的历史版本，用于事务的回滚，使得事务执行失败之后可以恢复之前的样子。实现原子性和隔离性。
-	3. **Redo Log和Undo Log的区别**
+	1. Redo Log（重做日志）:记录事务对数据库的所有修改，在崩溃时恢复未提交的更改，用来满足事务的持久性，如果宕机后数据页未写入，但 redo log 已提交，可以“重放日志”恢复数据。
+	2. Undo Log（回滚日志）:记录事务的反向操作，简单地说就是保存数据的历史版本，用于事务的回滚，使得事务执行失败之后可以恢复之前的样子。实现原子性和隔离性。
+	3. #Mysql **Redo Log和Undo Log的区别**
 	
 	   | 特性         | redo log                 | undo log                     |
 	   | ------------ | ------------------------ | ---------------------------- |
@@ -51,6 +84,7 @@
 
 # 7. 数据库分表操作
 1. 数据库分表（Sharding）是将大表的数据拆分成多个小表的技术，旨在提高性能和可维护性。分表可以根据不同的策略进行，以下是分表的常见方法、实施步骤和注意事项。
+2. ![[Pasted image 20250305143312.png]]
 ## 1. **分表的目的**
 - **提升性能**：减小单个表的数据量，提高查询速度和写入效率。
 - **扩展性**：分布数据到多个物理存储上，支持更高的并发。
@@ -167,7 +201,7 @@ DROP TABLE users;
 	1. 高效的查找性能
 	2. 树的高度增长不会过快，查询磁盘的I/O次数减少
 	3. 范围查询能力强
-## 6. 索引失效
+## 6. #Mysql 索引失效
 1. **未遵循最左前缀匹配导致索引失效**
 2. **使用函数导致索引失效**
 3. **计算导致索引失效**
@@ -178,7 +212,7 @@ DROP TABLE users;
 8. **like模糊匹配以通配符开头导致索引失效**
 9. **OR 前后存在非索引的列，索引失效**
 
-## 7.覆盖索引
+## 7. #Mysql 覆盖索引
 1. 二级索引中包含了查询所需的所有字段，从而使查询可以仅通过访问二级索引而不需要访问实际的表数据
 
 2. **索引包含所有查询列**：
@@ -198,13 +232,13 @@ DROP TABLE users;
     2. SELECT name,email FROM users WHERE age = 30;
 
     
-# 9.SQL优化
+# 9. #Mysql SQL优化
 1. 应尽量避免在`WHERE`子句中对字段进行`NULL`值判断，否则将导致引擎放弃使用索引而进行全表扫描
 2. 值分布很稀少的字段不适合建索引，例如"性别"这种只有两三个值的字段
-3. 使用多列索引时主意顺序和查询条件保持一致，同时删除不必要的单列索引
+3. 使用多列索引时主意顺序和查询条件保持一致，同时删除不必要的单列索引（最左匹配原则）
 4. 不做列运算：`SELECT id WHERE age + 1 = 10`，任何对列的操作都将导致表扫描，它包括数据库教程函数、计算表达式等等，查询时要尽可能将操作移至等号右边
 5. 尽量不用函数和触发器，在应用程序实现
-6. 分页的优化：对于大数据SELECT * from user limit **100001**,**20** 优化为select * from user where id>(select id from user where id>=**100000** limit **1**) limit **20**
+6. 分页的优化（覆盖索引+子查询）：对于大数据SELECT * from user limit **100001**,**20** 优化为select * from user where id>(select id from user where id>=**100000** limit **1**) limit **20**
 7. Join时尽量让小表做驱动表，因为驱动表需要全表扫描，而被驱动表需要通过索引查询
 8. **/etc/mysql/conf.d**配置中slow_query_log = 1，slow_query_log_file = /var/lib/mysql/slow.log，long_query_time = 5配置属性或者设置SET GLOBAL slow_query_log = 'ON';SET GLOBAL slow_query_log_file = '/var/log/mysql/mysql-slow.log';SET GLOBAL long_query_time = 2.0;SET GLOBAL log_queries_not_using_indexes = 'ON'; 查看slow.log日志，寻找慢查询sql 
 # 10.MySQL执行过程
@@ -240,7 +274,7 @@ SELECT name FROM employees WHERE department = 'Sales' ORDER BY hire_date;
 3. **执行**：检索 `employees` 表中的数据，过滤出属于 `Sales` 部门的员工，然后按 `hire_date` 排序。
 4. **返回结果**：将查询结果返回给客户端。
 
-# 11.MySQL的ChangeBuffer
+# 11. #Mysql MySQL的ChangeBuffer
 1. MySQL 的 Change Buffer 是一个用于优化插入和更新操作的机制，特别是在使用 InnoDB 存储引擎时。它的主要目的是提高对非唯一索引的性能，尤其是在大量插入、更新或删除操作的情况下。
 ## Change Buffer 概述
 1. **背景**：
@@ -266,12 +300,13 @@ SELECT name FROM employees WHERE department = 'Sales' ORDER BY hire_date;
 ## 总结
 MySQL 的 Change Buffer 是一种有效的性能优化机制，尤其适用于高写入负载的场景。通过暂存对非唯一索引的修改，Change Buffer 能够显著减少磁盘 I/O，从而提高整体性能。在实际使用中，合理配置和监控 Change Buffer 的使用情况可以进一步优化数据库的性能。
 
-# 12. 聚簇索引和非聚簇索引
+# 12. #Mysql 聚簇索引和非聚簇索引
 1. 聚簇索引（Clustered Index）和非聚簇索引（Non-Clustered Index）是数据库中常用的两种索引类型，它们在存储结构、访问方式和性能方面有显著的区别。以下是它们的主要区别：
 ## 1. **定义**
 - **聚簇索引**：
   - 数据库表的物理存储顺序与索引的顺序相同。即，聚簇索引决定了数据的存储顺序。
   - 每个表只能有一个聚簇索引，因为表的数据行只能按一种方式排序。
+  - ![[Pasted image 20250305110339.png]]
 - **非聚簇索引**：
   - 索引的存储顺序与数据的物理存储顺序无关。非聚簇索引包含索引键和指向数据行的指针。
   - 一个表可以有多个非聚簇索引。
@@ -311,6 +346,7 @@ MySQL 的 Change Buffer 是一种有效的性能优化机制，尤其适用于�
   ```
   这里创建的 `idx_age` 是一个非聚簇索引，存储 `Age` 列的值和指向数据行的指针。
 ## 总结
+![[Pasted image 20250305110813.png]]
 
 1. 聚簇索引和非聚簇索引各有优缺点和适用场景。聚簇索引更适合需要频繁排序和范围查询的情况，而非聚簇索引则更灵活，可以在一个表上创建多个索引，以满足不同的查询需求。在设计数据库时，合理选择和组合这两种索引可以有效提高查询性能。
 
@@ -419,8 +455,8 @@ def execute_transaction():
 
 # 15.Sharding-jdbc(分库带来的一致性影响)
 ### 1. https://github.com/ljbclannad/shardingsphere-jdbc-demo2. 
-### 2. 事务
-### 3. 联表JOIN问题
+### 2. 事务（分布式事务）
+### 3. 联表JOIN问题（跨节点关联）
 ### 4.ID主键问题
 
 
@@ -449,7 +485,7 @@ Doublewrite Buffer 是一种机制，通过将数据首先写入一个缓冲区�
 ## 总结
 Doublewrite Buffer 是一种有效的数据保护机制，旨在提高数据库的可靠性和数据完整性。通过将数据先写入缓冲区再写入磁盘，它能够有效防止数据损坏和丢失，尤其是在系统崩溃或写入失败的情况下。尽管引入了一定的性能开销，但在许多应用场景中，数据的安全性和一致性是更为重要的考虑因素。
 
-# 17.Delete、Truncate和Drop的区别
+# 17. #Mysql Delete、Truncate和Drop的区别
 1. 在 SQL 中，`DELETE`、`TRUNCATE` 和 `DROP` 是用于删除数据或数据库对象的命令，但它们之间有显著的区别。以下是这三者的详细比较：
 ## 1. `DELETE`
 - **功能**：用于删除表中的一行或多行数据。
@@ -485,11 +521,11 @@ Doublewrite Buffer 是一种有效的数据保护机制，旨在提高数据库�
   - **数据依赖**：如果其他对象依赖于被删除的对象，可能会导致错误。
   - **不支持事务**：在大多数数据库中，`DROP` 操作不能回滚。
 ## 总结
-| 操作      | 影响范围       | 能否回滚 | 触发器 | 速度       |
-|-----------|----------------|----------|--------|------------|
-| `DELETE`  | 删除行         | 可回滚   | 会触发 | 较慢       |
-| `TRUNCATE`| 删除所有行     | 不可回滚 | 不会触发| 较快       |
-| `DROP`    | 删除整个表     | 不可回滚 | 不会触发| 最快       |
+| 操作         | 影响范围  | 能否回滚 | 触发器  | 速度  |
+| ---------- | ----- | ---- | ---- | --- |
+| `DELETE`   | 删除行   | 可回滚  | 会触发  | 较慢  |
+| `TRUNCATE` | 删除所有行 | 不可回滚 | 不会触发 | 较快  |
+| `DROP`     | 删除整个表 | 不可回滚 | 不会触发 | 最快  |
 在选择使用 `DELETE`、`TRUNCATE` 还是 `DROP` 时，应根据具体需求（是否需要保留结构、是否需要回滚、数据量大小等）做出决策。
 
 # 18.设计原则
@@ -534,7 +570,7 @@ Doublewrite Buffer 是一种有效的数据保护机制，旨在提高数据库�
 ### 总结
 良好的数据库表设计能够提高性能、确保数据一致性和完整性，并为后续的维护和扩展打下良好的基础。遵循以上原则可以帮助设计出高效且可维护的数据库结构。
 
-# 19. Group By和HAVING的关系
+# 19. #Mysql Group By和HAVING的关系
 
 `GROUP BY` 和 `HAVING` 是 SQL 中用于分组和筛选分组结果的重要子句。它们各有作用，且通常一起使用以满足分组和筛选的需求。
 
@@ -666,13 +702,13 @@ HAVING total_sales > 500;
 
 ### **常用整数类型及范围**
 
-|数据类型|存储大小|有符号范围|无符号范围|
-|---|---|---|---|
-|`TINYINT`|1 字节|-128 到 127|0 到 255|
-|`SMALLINT`|2 字节|-32,768 到 32,767|0 到 65,535|
-|`MEDIUMINT`|3 字节|-8,388,608 到 8,388,607|0 到 16,777,215|
-|`INT`|4 字节|-2,147,483,648 到 2,147,483,647|0 到 4,294,967,295|
-|`BIGINT`|8 字节|-9,223,372,036,854,775,808 到 9,223,372,036,854,775,807|0 到 18,446,744,073,709,551,615|
+| 数据类型        | 存储大小 | 有符号范围                                                  | 无符号范围                          |
+| ----------- | ---- | ------------------------------------------------------ | ------------------------------ |
+| `TINYINT`   | 1 字节 | -128 到 127                                             | 0 到 255                        |
+| `SMALLINT`  | 2 字节 | -32,768 到 32,767                                       | 0 到 65,535                     |
+| `MEDIUMINT` | 3 字节 | -8,388,608 到 8,388,607                                 | 0 到 16,777,215                 |
+| `INT`       | 4 字节 | -2,147,483,648 到 2,147,483,647                         | 0 到 4,294,967,295              |
+| `BIGINT`    | 8 字节 | -9,223,372,036,854,775,808 到 9,223,372,036,854,775,807 | 0 到 18,446,744,073,709,551,615 |
 
 ### **选择指南**
 
@@ -689,11 +725,11 @@ HAVING total_sales > 500;
 
 ### **常用类型**
 
-|数据类型|描述|
-|---|---|
-|`FLOAT`|4 字节，存储近似小数值，精度有限，适合科学计算或非精确值（如温度）。|
-|`DOUBLE`|8 字节，存储近似小数值，精度更高。|
-|`DECIMAL`|存储精确的小数值，适合需要高精度的场景，如财务数据。|
+| 数据类型      | 描述                                  |
+| --------- | ----------------------------------- |
+| `FLOAT`   | 4 字节，存储近似小数值，精度有限，适合科学计算或非精确值（如温度）。 |
+| `DOUBLE`  | 8 字节，存储近似小数值，精度更高。                  |
+| `DECIMAL` | 存储精确的小数值，适合需要高精度的场景，如财务数据。          |
 
 ### **选择指南**
 
@@ -727,13 +763,13 @@ HAVING total_sales > 500;
 
 ### **常用类型**
 
-|数据类型|存储大小|范围|精度|
-|---|---|---|---|
-|`DATE`|3 字节|1000-01-01 到 9999-12-31|天|
-|`DATETIME`|8 字节|1000-01-01 00:00:00 到 9999-12-31 23:59:59|秒|
-|`TIMESTAMP`|4 字节|1970-01-01 00:00:01 UTC 到 2038-01-19 03:14:07 UTC|秒|
-|`TIME`|3 字节|-838:59:59 到 838:59:59|秒|
-|`YEAR`|1 字节|1901 到 2155|年|
+| 数据类型        | 存储大小 | 范围                                                | 精度  |
+| ----------- | ---- | ------------------------------------------------- | --- |
+| `DATE`      | 3 字节 | 1000-01-01 到 9999-12-31                           | 天   |
+| `DATETIME`  | 8 字节 | 1000-01-01 00:00:00 到 9999-12-31 23:59:59         | 秒   |
+| `TIMESTAMP` | 4 字节 | 1970-01-01 00:00:01 UTC 到 2038-01-19 03:14:07 UTC | 秒   |
+| `TIME`      | 3 字节 | -838:59:59 到 838:59:59                            | 秒   |
+| `YEAR`      | 1 字节 | 1901 到 2155                                       | 年   |
 
 ### **选择指南**
 
@@ -801,6 +837,7 @@ MySQL 的 B+树是一种常用的索引数据结构，特别是在 InnoDB 存储
 
 ## **1. B+树简介**
 
+![[Pasted image 20250305104837.png]]
 ### **B+树的结构特点**
 
 1. **多叉树**：
@@ -1013,7 +1050,7 @@ CREATE TABLE orders (
     - 合理设计索引，减少树的深度。
     - 避免频繁分裂和合并页，减少维护成本。
 
-# 23.MySQL中的隐式类转换
+# 23. #Mysql MySQL中的隐式类转换
 在 MySQL 中，当查询中的数据类型不匹配时，MySQL 会尝试进行 **隐式类型转换** 来使操作符、表达式或函数能够正确执行。这种机制虽然便于开发，但在某些情况下可能导致性能问题或不符合预期的结果。
 
 ---
@@ -1216,3 +1253,512 @@ SELECT * FROM users WHERE balance = 'abc';
 
 通过合理的设计和规范化操作，可以有效避免隐式类型转换带来的问题，提高 MySQL 的性能和稳定性。
 
+# 24. 数据迁移步骤及注意事项
+从 **MySQL 迁移到 PostgreSQL** 是一个常见但复杂的数据库迁移过程，涉及 **数据结构、数据类型、SQL语法、函数、工具、测试和性能差异** 等多个层面。下面是详细的迁移步骤与注意事项清单：
+
+---
+
+**🧭 一、迁移流程总览**
+
+```
+准备阶段 → 结构迁移 → 数据迁移 → SQL/函数迁移 → 应用改造 → 测试验证 → 切换上线
+```
+
+  
+
+---
+
+**🧱 二、详细迁移步骤**
+
+  
+
+**✅ 1. 评估准备阶段**
+
+• ✅ 确定迁移目标（全量迁移/分批迁移/实时双写等）
+
+• ✅ 盘点数据量、表结构复杂度、依赖的数据库特性（如触发器、存储过程）
+
+• ✅ 检查业务是否强依赖 MySQL 特性（如 AUTO_INCREMENT、ENUM 等）
+
+---
+
+**✅ 2. 数据库结构迁移（DDL）**
+
+  
+
+**🔁 工具推荐：**
+
+• [pgloader](https://pgloader.io/)：开源、支持从 MySQL → PostgreSQL。
+
+• [AWS SCT](https://aws.amazon.com/dms/schema-conversion-tool/)：跨数据库结构转换。
+
+• db-migration-tool（自建脚本/中间层工具）。
+
+  
+
+**🔧 结构转换注意点：**
+
+|**MySQL**|**PostgreSQL**|**说明**|
+|---|---|---|
+|AUTO_INCREMENT|SERIAL 或 GENERATED|PostgreSQL 无 AUTO_INCREMENT 关键字|
+|TINYINT(1)|BOOLEAN|PostgreSQL 有原生布尔类型|
+|DATETIME|TIMESTAMP|格式略有差异|
+|ENUM('a','b')|TEXT + CHECK 或 ENUM 类型|PostgreSQL ENUM 类型不兼容|
+|DEFAULT CURRENT_TIMESTAMP|同名，但语义略有差别|精度和触发行为不同|
+|ENGINE=InnoDB|无|PostgreSQL 不区分存储引擎|
+
+**✅ 示例转换：**
+
+```
+-- MySQL
+CREATE TABLE users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(100),
+  is_active TINYINT(1),
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- PostgreSQL
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(100),
+  is_active BOOLEAN,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+  
+
+---
+
+**✅ 3. 数据迁移（DML）**
+
+  
+
+**✅ 方法一：使用 pgloader**
+
+```
+pgloader mysql://user:pass@localhost/mydb postgresql://user:pass@localhost/pgdb
+```
+
+• 自动完成表结构、数据、索引、外键的迁移。
+
+  
+
+**✅ 方法二：手动导出 + 导入**
+
+```
+# 1. MySQL 导出 CSV
+SELECT * FROM users INTO OUTFILE '/tmp/users.csv' FIELDS TERMINATED BY ',' ENCLOSED BY '"' LINES TERMINATED BY '\n';
+
+# 2. PostgreSQL 导入
+COPY users FROM '/tmp/users.csv' DELIMITER ',' CSV HEADER;
+```
+
+**✅ 注意事项**
+
+• 日期格式、NULL 值、转义字符需兼容
+
+• TEXT/BLOB 类型需处理编码
+
+• 需要开启 PostgreSQL 中的 standard_conforming_strings
+
+---
+
+**✅ 4. SQL语法/函数迁移**
+
+|**MySQL 语法/函数**|**PostgreSQL 替代语法**|
+|---|---|
+|LIMIT offset, count|LIMIT count OFFSET offset|
+|IFNULL(a, b)|COALESCE(a, b)|
+|CONCAT(a, b)|`a|
+|NOW()|CURRENT_TIMESTAMP 或 NOW()|
+|STR_TO_DATE()|TO_TIMESTAMP()|
+|DATE_FORMAT()|TO_CHAR()|
+|INSERT IGNORE|ON CONFLICT DO NOTHING|
+|REPLACE INTO|INSERT ... ON CONFLICT DO UPDATE|
+
+**✅ 示例：**
+
+```
+-- MySQL
+SELECT CONCAT(first_name, ' ', last_name) FROM users;
+
+-- PostgreSQL
+SELECT first_name || ' ' || last_name FROM users;
+```
+
+  
+
+---
+
+**✅ 5. 存储过程、触发器迁移**
+
+• PostgreSQL 使用 PL/pgSQL，与 MySQL 的 SQL 存储过程语法不同。
+
+• 需重写逻辑。
+
+• 工具如 Ora2Pg 可辅助部分迁移。
+
+---
+
+**✅ 6. 应用层兼容改造**
+
+  
+
+**代码注意：**
+
+• 驱动差异：mysql-connector-java → postgresql 驱动。
+
+• 分页 SQL 写法差异。
+
+• 类型映射差异（Boolean, JSON, 时间戳）。
+
+• JDBC 配置项不同（如 stringtype=unspecified 处理枚举、UUID）。
+
+---
+
+**✅ 7. 测试 & 性能调优**
+
+• ✅ 数据校验：行数、字段值是否一致
+
+• ✅ 查询验证：慢 SQL、分页、模糊查询是否正常
+
+• ✅ 性能对比：PostgreSQL 有更严格事务模型，必要时调优 autovacuum, analyze, 索引等
+
+• ✅ 编码兼容：MySQL UTF8 != PostgreSQL UTF8（建议使用 UTF8MB4 → UTF8）
+
+---
+
+**✅ 8. 上线切换（可选）**
+
+|**方式**|**说明**|
+|---|---|
+|一次性全量切换|业务停机时间短，适合小型系统|
+|雪花双写 + 灰度切换|写双库，读按灰度引流|
+|主备架构平滑切换|借助中间件（如 ShardingSphere、Canal）|
+
+  
+
+---
+
+**🚨 三、迁移注意事项（总结）**
+
+|**类型**|**说明**|
+|---|---|
+|数据类型差异|BOOLEAN, ENUM, TEXT, JSON 类型需重点关注|
+|自动增长主键|PostgreSQL 用 SERIAL 或 GENERATED ALWAYS AS IDENTITY|
+|SQL 语法差异|LIMIT, INSERT IGNORE, REPLACE, 函数语法等|
+|字符集与排序规则|utf8mb4_bin vs UTF8 排序结果可能不同|
+|工具选择|pgloader 推荐全量迁移；DMS + SCT 适合复杂场景|
+|索引、唯一约束|PostgreSQL 对 NULL 的处理与 MySQL 不同|
+
+  
+
+---
+
+**✅ 四、工具推荐**
+
+|**工具**|**说明**|
+|---|---|
+|pgloader|最主流的 MySQL → PostgreSQL 工具|
+|AWS SCT|Schema Conversion Tool，跨库结构转换|
+|DBeaver|可视化导入导出工具|
+|Flyway / Liquibase|数据库结构迁移管理工具|
+
+  
+
+---
+
+如你提供具体表结构或业务场景，我可以帮你定制迁移脚本或做字段映射建议 👇
+
+# 25. MVCC、间隙锁、记录锁
+
+---
+
+### MVCC（多版本并发控制）
+
+- MVCC 是 InnoDB 引擎实现的一种**无锁并发读机制**，底层依赖 `undo log` 和事务快照（Read View）控制数据可见性。
+- 适用于普通的 `SELECT` 查询，不会加锁。
+- 可以防止 **脏读**、**不可重复读**，但**无法防止幻读**。
+
+#### 特点：
+- 每条记录都有隐藏的 `trx_id` 和 `roll_pointer` 字段。
+- 不加锁，通过对比 `Read View` 与记录版本号，判断是否可见。
+- 在 `REPEATABLE READ` 隔离级别下，即使其他事务已插入新数据，当前事务也看不到（读取的是快照）。
+
+---
+
+### 记录锁（Record Lock）
+
+- 是 InnoDB 在更新/删除/加锁操作中对**行记录加的锁**。
+- 精确锁定一条记录，防止其他事务修改或删除它。
+
+#### 触发场景：
+- `UPDATE`
+- `DELETE`
+- `SELECT ... FOR UPDATE` / `LOCK IN SHARE MODE`
+
+#### 特点：
+- 仅作用于命中的数据行。
+- 用于保证事务隔离的一致性。
+- 无法防止“幻读”——因为只锁现有行，无法阻止新插入。
+
+---
+
+### 间隙锁（Gap Lock）
+
+- 间隙锁锁住的是**两个索引值之间的空隙范围**，用于防止**“幻插入”**。
+- 通常和记录锁组合形成 **Next-Key Lock**，用于防止幻读。
+
+#### 触发场景：
+- `REPEATABLE READ` 隔离级别下的：
+  - `SELECT ... FOR UPDATE`（范围条件）
+  - `DELETE ... WHERE 范围条件`
+
+#### 特点：
+- 会锁住类似 `(a, b]` 的范围，禁止往该区间插入数据。
+- 不锁已有记录的内容，但阻止插入。
+- 防止“第二次查询时，条件内多出新数据”的幻读现象。
+
+---
+
+### Next-Key Lock = Record Lock + Gap Lock
+
+- 是 InnoDB 在 RR 隔离级别下默认使用的组合锁。
+- 会锁住一行以及其前面的间隙。
+- 插入一条“命中间隙”的数据（比如 `2.5` 落在 `(2,3]`），会被阻塞。
+
+---
+
+### 总结对比表
+
+| 项目 | 加锁对象 | 能否防幻读 | 是否自动触发 | 常见语句 |
+|------|----------|-------------|----------------|----------|
+| MVCC | 无（版本判断） | ❌ 否 | ✅ 是 | 普通 `SELECT` |
+| 记录锁 | 精确某行 | ❌ 否 | ✅ 是 | `UPDATE`, `DELETE`, `FOR UPDATE` |
+| 间隙锁 | 范围间隙 | ✅ 是 | ✅ 是（RR下） | 范围 `SELECT ... FOR UPDATE`, `DELETE WHERE 范围` |
+| Next-Key Lock | 记录 + 间隙 | ✅ 是 | ✅ 是（RR下） | 范围语句 |
+
+---
+
+### 常见理解误区澄清
+
+- MVCC 不加锁，不能防幻读。
+- 间隙锁是 InnoDB 自动加的，不需要手动控制，但只有在 RR 隔离级别下才启用。
+- `DELETE WHERE 范围` 会自动加 Next-Key Lock，防止别的事务插入删除区间中的新数据。
+- `SELECT ... FOR UPDATE` 会触发记录锁和间隙锁，用于显式加锁防止并发修改或插入。
+
+---
+
+```
+## 🔍 案例 SQL：MVCC、记录锁与间隙锁
+
+---
+
+案例 1：MVCC 快照读（不会加锁）
+
+```sql
+-- 会话A
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT * FROM user WHERE id = 1; -- 假设读取 name = 'Alice'
+
+-- 会话B
+INSERT INTO user (id, name) VALUES (2, 'Bob');
+COMMIT;
+
+-- 会话A
+SELECT * FROM user; -- 仍然看不到 id = 2（MVCC生效）
+COMMIT;
+
+案例 2：记录锁阻塞并发更新（行锁）
+
+```sql
+-- 会话A
+START TRANSACTION;
+UPDATE user SET name = 'Alice-1' WHERE id = 1;
+
+-- 会话B（会被阻塞）
+START TRANSACTION;
+UPDATE user SET name = 'Alice-2' WHERE id = 1;
+
+-- 会话A提交后，会话B才会继续执行
+
+案例 3：MVCC 无法防止幻读
+
+```sql
+-- 会话A
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT * FROM orders WHERE amount > 15;
+-- 结果：香蕉、梨子
+
+-- 会话B
+INSERT INTO orders (product_name, amount) VALUES ('西瓜', 25);
+COMMIT;
+
+-- 会话A 再次查询
+SELECT * FROM orders WHERE amount > 15;
+-- 结果：香蕉、梨子、西瓜（MVCC无效，出现幻读）
+
+案例 4：用 FOR UPDATE 防止幻读（间隙锁 + 行锁）
+
+```sql
+-- 会话A
+START TRANSACTION;
+SELECT * FROM orders WHERE amount > 15 FOR UPDATE;
+
+-- 会话B（被阻塞）
+INSERT INTO orders (product_name, amount) VALUES ('火龙果', 20);
+-- 插入失败或阻塞，直到A提交
+
+-- 会话A
+COMMIT;
+
+案例 5：DELETE 范围自动加 Next-Key Lock，防止幻插入
+
+```sql
+-- 会话A
+START TRANSACTION;
+DELETE FROM orders WHERE id >= 2 AND id <= 3;
+
+-- 会话B（尝试插入中间值，会被阻塞）
+INSERT INTO orders (id, product_name, amount) VALUES (2.5, '芒果', 22);
+
+-- 会话A提交后，B 才能继续
+
+案例 6：精准 DELETE 不加间隙锁（不会阻塞插入）
+
+```sql
+-- 会话A
+START TRANSACTION;
+DELETE FROM orders WHERE id = 2;
+
+-- 会话B（不会阻塞）
+INSERT INTO orders (id, product_name, amount) VALUES (2.5, '百香果', 18);
+
+
+总结提示：
+
+| 查询方式            | 是否加锁 | 可否防幻读 |
+|---------------------|-----------|-------------|
+| 普通 SELECT         | ❌ 不加锁 | ❌ 否       |
+| SELECT FOR UPDATE   | ✅ 加锁   | ✅ 是       |
+| DELETE 范围         | ✅ 加 Next-Key Lock | ✅ 是 |
+| DELETE 精确主键     | ✅ 加记录锁 | ❌ 否      |
+```
+
+
+# 26. 锁问题
+
+---
+
+## 1. 锁是基于索引实现的
+
+- InnoDB 的行锁是通过**索引加的锁**。
+- 如果 WHERE 条件未命中索引，可能加**表锁**。
+
+```sql
+-- 没有命中索引，可能锁全表
+SELECT * FROM user WHERE name = 'Alice' FOR UPDATE;
+```
+
+**建议**：确保加锁语句走索引，避免锁粒度过大。
+
+---
+
+## 2. 间隙锁仅在 REPEATABLE READ 隔离级别下启用
+
+- READ COMMITTED 下不会启用间隙锁。
+- 在 RC 下，`SELECT ... FOR UPDATE` 不能防止幻读。
+
+```sql
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SELECT * FROM orders WHERE amount > 10 FOR UPDATE;
+```
+
+---
+
+## 3. Next-Key Lock 是默认行为，不一定只加记录锁
+
+- Next-Key Lock = 行锁 + 前间隙锁
+- 除非使用**唯一索引 + 精确等值匹配**，否则 InnoDB 会默认使用 Next-Key Lock
+
+```sql
+-- 精确匹配主键，加纯记录锁
+SELECT * FROM orders WHERE id = 1 FOR UPDATE;
+```
+
+---
+
+## 4. 死锁（Deadlock）
+
+- 两个事务交叉持锁，互相等待，造成死锁。
+- InnoDB 会自动检测死锁并回滚其中一个事务。
+
+```sql
+-- 会话A
+START TRANSACTION;
+UPDATE user SET name = 'A' WHERE id = 1;
+
+-- 会话B
+START TRANSACTION;
+UPDATE user SET name = 'B' WHERE id = 2;
+
+-- 会话A
+UPDATE user SET name = 'A2' WHERE id = 2;
+
+-- 会话B
+UPDATE user SET name = 'B2' WHERE id = 1;
+-- ⚠️ 死锁发生！
+```
+
+**建议**：
+- 尽量保证加锁顺序一致
+- 控制事务大小和持锁时间
+
+---
+
+## 5. 隐式表锁可能被触发
+
+- 条件未走索引，或范围过宽，InnoDB 会主动使用表锁
+- 行锁数量超限，也可能自动升级为表锁
+
+---
+
+## 6. 大事务延迟锁释放
+
+- InnoDB 使用两阶段锁协议：执行时加锁，提交后释放
+- 大事务占锁时间长，影响其他事务并发和性能
+
+**建议**：
+- 拆小事务、尽快提交
+- 写前读后，减少锁冲突
+
+---
+
+## 7. RC + FOR UPDATE 不等于可重复读
+
+- 在 RC 隔离级别下，即使加了 `FOR UPDATE`，也不能保证数据一致性
+- 因为 `Read View` 每次查询都会更新
+
+---
+
+## 8. 外键约束可能引发锁冲突
+
+- 删除父表记录会锁子表做一致性校验
+- 多事务同时操作外键关联表，容易出现隐式锁、阻塞或死锁
+
+---
+
+## ✅ 常见锁问题汇总表
+
+| 问题                             | 说明                         | 建议                         |
+|----------------------------------|------------------------------|------------------------------|
+| 没走索引导致表锁                 | 锁粒度放大，性能差            | 确保 WHERE 命中索引         |
+| 死锁                             | 事务交叉持锁引发              | 保持加锁顺序一致             |
+| 大事务长时间占锁                 | 影响并发，易死锁              | 拆小事务，尽快提交           |
+| 间隙锁阻塞插入                   | 插入被卡，事务等待            | 明确隔离级别和加锁策略       |
+| SELECT 不加锁                    | 数据可能已变                  | 用 `FOR UPDATE` 或乐观锁控制 |
+| 多事务插入相邻值时发生死锁       | 索引页竞争                    | 控制插入顺序或加随机间隔     |

@@ -74,12 +74,11 @@ Redis之所以非常快，主要归功于以下几个原因：
 
 ---
 
-综上，Redis的速度来源于内存操作、高效数据结构、单线程设计、多路复用等技术的有机结合。这使它成为一款适合高性能场景的缓存和数据存储解决方案。
+综上， #Redis Redis的速度来源于内存操作、高效数据结构、单线程设计、多路复用等技术的有机结合。这使它成为一款适合高性能场景的缓存和数据存储解决方案。
 
 # 2. I/O多路复用
 
 #### **什么是I/O多路复用？**
-
 I/O多路复用是一种高效管理多个网络连接的技术。通过单个线程同时监听多个文件描述符（如套接字），一旦某些描述符有事件发生（如数据可读、可写），操作系统会通知应用程序进行处理，而无需为每个连接创建一个线程或进程。
 
 Redis使用I/O多路复用处理多个客户端请求，这使得它在单线程模型下仍然可以高效地处理高并发连接。
@@ -251,7 +250,7 @@ SREM fruits "apple"             # 删除元素
 
 ---
 
-### **5. Sorted Set（有序集合）**
+### **5. #Redis Sorted Set（有序集合）**
 
 **特点：**
 
@@ -282,6 +281,7 @@ ZREM leaderboard "Alice"         # 删除元素
 
 - 排行榜（如游戏分数榜）。
 - 延迟队列。
+- 分桶而治。
 
 ---
 
@@ -389,7 +389,7 @@ GEODIST locations "Palermo" "Catania" km       # 返回距离，单位公里
 ### **Redis中的跳表详解**
 
 跳表（Skip List）是一种动态数据结构，提供了一种快速的有序数据访问方式。它是Redis实现**有序集合（Sorted Set）**的核心数据结构之一。
-
+https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/ea6a591ff380479bac6e11f90d55146b~tplv-k3u1fbpfcp-zoom-in-crop-mark:1512:0:0:0.awebp
 ---
 
 ### **什么是跳表？**
@@ -545,7 +545,7 @@ ZRANK leaderboard "Bob"  # 返回排名（从0开始）
 
 ### **总结**
 
-Redis的跳表是实现有序集合的核心，它结合了高效的查找性能和灵活的动态调整能力，使Redis在处理范围查询、排序等场景时表现出色。跳表的简单实现和优良性能是其在Redis中被广泛采用的原因之一。
+** #Redis  Redis的跳表是实现有序集合的核心，它结合了高效的查找性能和灵活的动态调整能力，使Redis在处理范围查询、排序等场景时表现出色。跳表的简单实现和优良性能是其在Redis中被广泛采用的原因之一**。
 
 # 5. redis中的hash
 
@@ -643,7 +643,7 @@ HKEYS stock                      # 返回所有商品 ["product1"]
     - 如果一个键包含多个字段，使用Hash比使用多个String键值对更节省内存。
 2. **高效操作**：
     
-    - 对字段的读写操作时间复杂度为O(1)。
+    - **对字段的读写操作时间复杂度为O(1)**。
 3. **清晰组织**：
     
     - 将相关数据集中在一个键中，方便管理。
@@ -1035,7 +1035,7 @@ Redis采用了主动删除、被动删除和内存淘汰相结合的方式来处
 
 通过合理配置Redis的`hz`、`maxmemory`和`maxmemory-policy`参数，可以针对不同场景优化过期键的删除策略，提升Redis的性能和资源利用效率。
 
-
+![[Pasted image 20250304140222.png]]
 # 8. redis的管道功能
 ### **Redis的Pipeline（管道）**
 
@@ -1432,7 +1432,7 @@ RDB是Redis默认支持的一种持久化方式，通过将内存中的数据以
 
 #### **触发方式**
 
-1. **自动触发**：
+1. **自动触发(默认为bgsave)**：
     
     - 根据配置的保存规则自动触发。
         
@@ -1513,14 +1513,14 @@ aof-use-rdb-preamble yes          # 开启混合持久化
 
 ### **4. 持久化方式对比**
 
-|**特性**|**RDB**|**AOF**|
-|---|---|---|
-|数据丢失可能性|可能丢失最近的写操作|丢失量较少（取决于`fsync`策略）|
-|恢复速度|恢复较快|恢复较慢（需要执行所有日志）|
-|性能开销|写入效率高，对性能影响较小|写入频繁，对性能影响较大|
-|文件大小|文件较小|文件较大|
-|文件可读性|二进制格式，不易读|文本格式，可读性强|
-|备份与迁移|便于备份和迁移|文件较大，不便于迁移|
+| **特性**  | **RDB**       | **AOF**             |
+| ------- | ------------- | ------------------- |
+| 数据丢失可能性 | 可能丢失最近的写操作    | 丢失量较少（取决于`fsync`策略） |
+| 恢复速度    | 恢复较快          | 恢复较慢（需要执行所有日志）      |
+| 性能开销    | 写入效率高，对性能影响较小 | 写入频繁，对性能影响较大        |
+| 文件大小    | 文件较小          | 文件较大                |
+| 文件可读性   | 二进制格式，不易读     | 文本格式，可读性强           |
+| 备份与迁移   | 便于备份和迁移       | 文件较大，不便于迁移          |
 
 ---
 
@@ -1605,7 +1605,7 @@ Redis提供了两种主要的持久化方式（RDB和AOF），各有优缺点，
     - 对热点Key设置较长的过期时间，避免频繁失效。
 2. **缓存预热**：
     - 在缓存过期前主动刷新数据，或在系统启动时加载热点数据到缓存中。
-3. **加锁（分布式锁）**：
+3. **互斥锁（分布式锁）强一致**：
     - 使用分布式锁（如Redis的`SETNX`）保证只有一个线程去加载数据库，其余线程等待缓存加载完成后再获取数据。
     - 示例（Java Redis实现）：
         
@@ -1624,9 +1624,10 @@ Redis提供了两种主要的持久化方式（RDB和AOF），各有优缺点，
             jedis.get(key);
         }
         ```
-        
-4. **异步更新**：
+        ![[Pasted image 20250304104018.png]]
+4. **异步更新 高可用**：
     - 在缓存失效时，后台启动一个异步线程重新加载数据。
+    - ![[Pasted image 20250304104354.png]]
 
 ---
 
@@ -1931,15 +1932,25 @@ messageQueue.send("UPDATE_CACHE", "key");
 
 ### **总结**
 
-|**模式**|**特点**|**适用场景**|
-|---|---|---|
-|Cache Aside|读写分离，缓存过期由应用逻辑控制|数据更新频繁，但读操作较多的场景|
-|Write Through|数据写操作同步到缓存和数据库|数据写操作频繁，读写比例接近的场景|
-|Write Behind|数据写操作只更新缓存，异步写入数据库|对写性能要求较高，且容忍一定延迟的一致性场景|
-|Read Through|缓存系统负责从数据库加载数据|缓存不命中率较高，且希望缓存与数据库一致的场景|
-|消息队列+最终一致性|通过异步消息确保缓存更新|高并发读写场景，追求最终一致性|
+| **模式**        | **特点**             | **适用场景**                |
+| ------------- | ------------------ | ----------------------- |
+| Cache Aside   | 读写分离，缓存过期由应用逻辑控制   | 数据更新频繁，但读操作较多的场景        |
+| Write Through | 数据写操作同步到缓存和数据库     | 数据写操作频繁，读写比例接近的场景       |
+| Write Behind  | 数据写操作只更新缓存，异步写入数据库 | 对写性能要求较高，且容忍一定延迟的一致性场景  |
+| Read Through  | 缓存系统负责从数据库加载数据     | 缓存不命中率较高，且希望缓存与数据库一致的场景 |
+| 消息队列+最终一致性    | 通过异步消息确保缓存更新       | 高并发读写场景，追求最终一致性         |
 
 选择合适的方案需根据业务需求权衡性能与一致性。对于大多数场景，**Cache Aside**结合消息队列的方式是常用的解决方案，既简单又高效。
+![[Pasted image 20250304111414.png]]
+ 延迟双删：
+ 1.首先，代码先删除了 Redis 中的缓存数据，以确保接下来的读取操作会从数据库中读取最新的数据。
+2.接着，代码更新了数据库中的数据，将数据更新为最新的值。
+3.在此之后，代码让当前线程休眠一段时间N，这个时间段是为了给数据库操作足够的时间来完成，确保数据已经持久化到数据库中。
+
+4.最后，代码再次删除 Redis 中的缓存数据。这里是延迟双删的关键步骤。由于之前已经删除了缓存数据，再次删除的目的是为了防止在 Thread.sleep(N) 的时间内有其他线程读取到旧的缓存数据。因为在这段时间内，缓存数据已经被清空，所以其他线程在读取数据时会发现缓存中不存在，然后从数据库中读取最新的数据并写入缓存，从而保证了数据的一致性。
+需要注意的是，这种延迟双删策略并不能完全保证数据的一致性。  
+如果在 Thread.sleep(N) 的时间内发生了其他线程的写入操作，并且将新数据写入了缓存中，那么在第二次删除缓存时，会将这个新数据从缓存中删除，可能导致缓存和数据库中的数据不一致。  
+因此，延迟双删策略只能在一定程度上提高数据一致性的概率，但不能完全解决数据一致性的问题。更加严格的数据一致性保证需要使用更复杂的机制，比如使用消息队列等。
 
 # 13.Redis分布式锁
 以下是使用 **Java** 实现 Redis 分布式锁的示例代码，包含基本的锁获取和释放，以及一些高级功能的实现。
@@ -1947,6 +1958,8 @@ messageQueue.send("UPDATE_CACHE", "key");
 ### 1. 基础实现：使用 `SET NX PX`
 
 Redis 的 `SET` 命令支持 `NX` 和 `PX` 参数，非常适合用来实现分布式锁。
+- **NX（Not Exists）**：只有当 key **不存在** 时才会执行 `SET`，用于**加锁**或**防止覆盖已有值**。
+- **PX（Expire in milliseconds）**：设置 key 的**过期时间**，单位是**毫秒**，防止**死锁**或**长期占用资源**
 
 **依赖：引入 Jedis**
 
@@ -2601,3 +2614,821 @@ Redisson 的功能非常丰富，适合在分布式系统中解决各种高并�
 4. 分布式缓存、事件广播和 ID 生成。
 
 这些场景结合 Redis 的高性能特性，能够有效提高分布式系统的可靠性和并发能力。
+
+# 16. 读写锁保证双写强一致性
+### **用读写锁解决缓存与数据库的双写不一致问题**
+
+在高并发场景下，数据库和缓存的双写不一致问题是一个常见的挑战。使用**读写锁（Read-Write Lock）**，可以有效控制并发读写操作，确保数据的一致性。
+
+---
+
+## **1. 读写锁的基本概念**
+
+- **读锁（Shared Lock）**：多个线程可以同时读取缓存，但不能进行写入操作。
+- **写锁（Exclusive Lock）**：只允许一个线程写入数据，同时阻止所有读取操作。
+
+使用读写锁可以保证：
+
+- **写操作的原子性**：在写数据库和更新缓存的过程中，其他线程无法读取旧数据。
+- **读操作的并发性**：多个线程可以同时从缓存中读取数据，减少数据库压力。
+
+---
+
+## **2. 使用读写锁解决双写不一致**
+
+### **2.1 方案设计**
+
+**基本思路**：
+
+1. **读操作（查询数据）**：
+    
+    - 先获取 **读锁**，查询缓存；
+    - 如果缓存命中，直接返回；
+    - 如果缓存未命中，则释放读锁，获取**写锁**，查询数据库并更新缓存；
+    - 最后，释放**写锁**，并重新获取**读锁**，返回数据。
+2. **写操作（更新数据）**：
+    
+    - 获取 **写锁**，更新数据库；
+    - 更新缓存；
+    - 释放 **写锁**。
+
+---
+
+## **3. 代码实现（Java + Redis + ReentrantReadWriteLock）**
+
+### **3.1 依赖引入**
+
+如果使用 **Redisson（推荐）** 进行 Redis 分布式锁控制，需要添加以下 Maven 依赖：
+
+```xml
+<dependency>
+    <groupId>org.redisson</groupId>
+    <artifactId>redisson</artifactId>
+    <version>3.16.8</version>
+</dependency>
+```
+
+---
+
+### **3.2 代码示例**
+
+#### **使用 Java 读写锁（ReentrantReadWriteLock）**
+
+```java
+import org.redisson.Redisson;
+import org.redisson.api.RedissonClient;
+import org.redisson.api.RReadWriteLock;
+import org.redisson.config.Config;
+import redis.clients.jedis.Jedis;
+
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+public class RedisReadWriteLockExample {
+    private static final Jedis redis = new Jedis("localhost", 6379);
+    private static final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+
+    public static void main(String[] args) {
+        // 读取数据
+        String value = read("user:1");
+        System.out.println("读取数据：" + value);
+
+        // 更新数据
+        write("user:1", "newValue");
+    }
+
+    /**
+     * 读操作
+     */
+    public static String read(String key) {
+        lock.readLock().lock();  // 获取读锁
+        try {
+            String value = redis.get(key);
+            if (value != null) {
+                return value;
+            }
+        } finally {
+            lock.readLock().unlock();  // 释放读锁
+        }
+
+        // 缓存未命中，升级为写锁
+        lock.writeLock().lock();
+        try {
+            String value = queryDatabase(key); // 查询数据库
+            redis.setex(key, 60, value); // 写入缓存
+            return value;
+        } finally {
+            lock.writeLock().unlock(); // 释放写锁
+        }
+    }
+
+    /**
+     * 写操作
+     */
+    public static void write(String key, String newValue) {
+        lock.writeLock().lock();  // 获取写锁
+        try {
+            updateDatabase(key, newValue); // 更新数据库
+            redis.setex(key, 60, newValue); // 更新缓存
+        } finally {
+            lock.writeLock().unlock();  // 释放写锁
+        }
+    }
+
+    /**
+     * 模拟查询数据库
+     */
+    private static String queryDatabase(String key) {
+        return "database_value"; // 假设数据库中的值
+    }
+
+    /**
+     * 模拟更新数据库
+     */
+    private static void updateDatabase(String key, String value) {
+        System.out.println("更新数据库：" + key + " -> " + value);
+    }
+}
+```
+
+---
+
+## **4. 采用分布式读写锁（Redisson 实现）**
+
+在分布式环境下，`ReentrantReadWriteLock` 只适用于**单机应用**，如果多个应用实例访问相同的 Redis 资源，就需要使用 **Redisson 提供的分布式读写锁**。
+
+### **4.1 代码实现（Redisson 分布式读写锁）**
+
+```java
+import org.redisson.Redisson;
+import org.redisson.api.RReadWriteLock;
+import org.redisson.api.RedissonClient;
+import org.redisson.config.Config;
+import redis.clients.jedis.Jedis;
+
+public class RedisRedissonReadWriteLock {
+    private static final Jedis redis = new Jedis("localhost", 6379);
+    private static final RedissonClient redissonClient = createRedissonClient();
+
+    public static void main(String[] args) {
+        String key = "user:1";
+
+        // 读取数据
+        String value = read(key);
+        System.out.println("读取数据：" + value);
+
+        // 更新数据
+        write(key, "newValue");
+    }
+
+    /**
+     * 读取数据（使用Redisson读写锁）
+     */
+    public static String read(String key) {
+        RReadWriteLock lock = redissonClient.getReadWriteLock("lock:" + key);
+        lock.readLock().lock();  // 获取分布式读锁
+        try {
+            String value = redis.get(key);
+            if (value != null) {
+                return value;
+            }
+        } finally {
+            lock.readLock().unlock();  // 释放读锁
+        }
+
+        // 缓存未命中，升级为写锁
+        lock.writeLock().lock();
+        try {
+            String value = queryDatabase(key); // 查询数据库
+            redis.setex(key, 60, value); // 写入缓存
+            return value;
+        } finally {
+            lock.writeLock().unlock(); // 释放写锁
+        }
+    }
+
+    /**
+     * 写数据（使用Redisson写锁）
+     */
+    public static void write(String key, String newValue) {
+        RReadWriteLock lock = redissonClient.getReadWriteLock("lock:" + key);
+        lock.writeLock().lock();
+        try {
+            updateDatabase(key, newValue); // 更新数据库
+            redis.setex(key, 60, newValue); // 更新缓存
+        } finally {
+            lock.writeLock().unlock(); // 释放写锁
+        }
+    }
+
+    /**
+     * 创建Redisson客户端
+     */
+    private static RedissonClient createRedissonClient() {
+        Config config = new Config();
+        config.useSingleServer().setAddress("redis://127.0.0.1:6379");
+        return Redisson.create(config);
+    }
+
+    /**
+     * 模拟查询数据库
+     */
+    private static String queryDatabase(String key) {
+        return "database_value"; // 假设数据库中的值
+    }
+
+    /**
+     * 模拟更新数据库
+     */
+    private static void updateDatabase(String key, String value) {
+        System.out.println("更新数据库：" + key + " -> " + value);
+    }
+}
+```
+
+---
+
+## **5. 方案对比**
+
+|**方案**|**适用场景**|**优点**|**缺点**|
+|---|---|---|---|
+|**ReentrantReadWriteLock**|适用于单机应用|读写分离，减少数据库压力|不能用于分布式环境|
+|**Redisson分布式锁**|适用于多应用实例，共享 Redis 资源|解决分布式环境的读写并发问题|增加 Redis 访问开销|
+
+---
+
+## **6. 总结**
+
+- **单机应用**可以使用 **ReentrantReadWriteLock**，提高读性能，减少数据库访问。
+- **分布式应用**推荐使用 **Redisson 分布式读写锁**，确保多个实例之间的一致性。
+- **适用于高并发读、多线程写场景**，如：
+    - **商品库存管理**
+    - **用户资料修改**
+    - **订单状态更新**
+
+读写锁是数据库和缓存双写一致性问题的一种**有效解决方案**，但需根据具体业务选择适合的策略，以确保性能和一致性。🚀
+
+# 17. Redisson的可重入
+## **Redisson 分布式锁的可重入性**
+
+### **1. 什么是可重入锁？**
+
+可重入锁（Reentrant Lock）指的是**同一个线程**可以多次获取同一把锁，而不会发生死锁。例如：
+
+- 线程A已经获取了锁，再次尝试获取同一把锁时，不会被阻塞，而是成功获取，并增加锁的重入计数。
+- 线程A释放锁时，只有当所有的重入次数都释放完，其他线程才能获取该锁。
+
+---
+
+### **2. Redisson 分布式锁的可重入性**
+
+**Redisson 的 `RLock` 是可重入锁**，它的底层基于 **Redis 的 `setnx` 和 `hash` 结构** 来实现可重入功能。
+
+#### **2.1 可重入的实现原理**
+
+Redisson 通过**哈希表（Hash Structure）**存储锁的持有线程 ID（Thread ID）和重入次数（Count），实现可重入锁的功能。
+
+- **获取锁**
+    - 第一次获取锁，Redis `setnx` 成功，锁计数为 `1`。
+    - 再次获取锁，Redis `hset` 更新锁计数，计数 `+1`。
+- **释放锁**
+    - 释放锁时，计数 `-1`，只有当计数降到 `0` 时，真正释放锁。
+
+---
+
+### **3. 可重入锁的代码示例**
+
+#### **3.1 引入 Redisson 依赖**
+
+在 **Maven** 项目中引入 Redisson 依赖：
+
+```xml
+<dependency>
+    <groupId>org.redisson</groupId>
+    <artifactId>redisson</artifactId>
+    <version>3.16.8</version>  <!-- 确保使用最新版本 -->
+</dependency>
+```
+
+---
+
+#### **3.2 Redisson 可重入锁示例**
+
+```java
+import org.redisson.Redisson;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
+import org.redisson.config.Config;
+
+public class RedissonReentrantLockExample {
+    public static void main(String[] args) {
+        // 1. 创建 Redisson 客户端
+        RedissonClient redisson = createRedissonClient();
+
+        // 2. 获取可重入锁
+        RLock lock = redisson.getLock("reentrant-lock");
+
+        try {
+            // 3. 第一次获取锁
+            lock.lock();
+            System.out.println(Thread.currentThread().getName() + " 获取锁，执行任务...");
+
+            // 4. 第二次获取同一把锁（可重入）
+            lock.lock();
+            System.out.println(Thread.currentThread().getName() + " 再次获取锁，执行子任务...");
+
+            // 业务逻辑
+            Thread.sleep(3000);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        } finally {
+            // 5. 释放锁
+            lock.unlock();
+            System.out.println(Thread.currentThread().getName() + " 释放锁（重入 -1）");
+
+            lock.unlock();
+            System.out.println(Thread.currentThread().getName() + " 释放锁（最终释放）");
+        }
+
+        // 6. 关闭 Redisson 客户端
+        redisson.shutdown();
+    }
+
+    /**
+     * 创建 Redisson 客户端
+     */
+    private static RedissonClient createRedissonClient() {
+        Config config = new Config();
+        config.useSingleServer().setAddress("redis://127.0.0.1:6379");
+        return Redisson.create(config);
+    }
+}
+```
+
+**输出结果**：
+
+```shell
+main 获取锁，执行任务...
+main 再次获取锁，执行子任务...
+main 释放锁（重入 -1）
+main 释放锁（最终释放）
+```
+
+**说明**：
+
+1. **线程 `main` 获取锁 2 次**（可重入）。
+2. **锁的释放顺序与获取次数相匹配**，只有完全释放后，其他线程才能获取该锁。
+
+---
+
+### **4. Redisson 可重入锁的底层实现**
+
+Redisson 采用 **Redis `hash` 结构** 来存储锁信息：
+
+```shell
+127.0.0.1:6379> HGETALL "reentrant-lock"
+1) "threadId"
+2) "12345"  # 线程ID
+3) "count"
+4) "2"  # 锁的重入次数
+```
+
+- **threadId**：当前持有锁的线程 ID。
+- **count**：当前线程获取该锁的次数。
+
+当 `count = 0` 时，锁才会释放。
+
+---
+
+### **5. 可重入锁的超时问题**
+
+在 Redisson 中，**默认情况下，锁的过期时间是 30 秒**，但可以使用 `lock(long leaseTime, TimeUnit unit)` 设置锁的自动释放时间。
+
+#### **5.1 设置过期时间**
+
+```java
+lock.lock(10, TimeUnit.SECONDS); // 10秒后自动释放锁
+```
+
+#### **5.2 WatchDog 机制**
+
+如果 `lock.lock()` 方法**没有指定超时时间**，Redisson 会启动**看门狗（WatchDog）机制**，**每隔 10 秒自动续期**，防止锁被其他线程抢占：
+
+```java
+lock.lock(); // 默认30秒，但会自动续期
+```
+
+- 线程持有锁时，每 10 秒会自动续期。
+- 线程执行完成后释放锁，不会影响 Redis 其他操作。
+
+---
+
+### **6. Redisson 可重入锁 vs 其他锁**
+
+|**锁类型**|**是否支持可重入**|**适用场景**|**优点**|**缺点**|
+|---|---|---|---|---|
+|Redisson 可重入锁|✅ 是|分布式系统、高并发业务|自动续期、支持超时、防死锁|依赖 Redis|
+|`synchronized`|✅ 是|单机多线程|轻量级、性能高|不能跨进程、无超时机制|
+|`ReentrantLock`|✅ 是|多线程并发|适用于单机、多线程环境|不能跨进程|
+|`Redis SETNX` 实现|❌ 否|基础分布式锁|轻量级、性能高|不能重入、无续期机制|
+
+---
+
+### **7. 总结**
+
+- **Redisson 分布式锁是可重入的**，支持同一线程多次获取同一把锁，并通过 `count` 记录重入次数。
+- **默认 30 秒自动续期**，防止业务执行时间过长导致锁被释放（WatchDog 机制）。
+- **适用于高并发分布式环境**，比 `Redis SETNX` 实现的简单分布式锁更安全可靠。
+- **适用于**：
+    - **库存扣减**
+    - **订单支付**
+    - **任务调度**
+    - **分布式事务**
+
+🚀 **推荐在分布式高并发场景使用 Redisson 实现可重入分布式锁，避免 Redis `SETNX` 方案的缺陷，提高系统可靠性！
+![[Pasted image 20250304151407.png]]**
+
+# 18. Redis的主从同步
+
+## **1. 什么是Redis主从同步？**
+
+Redis主从同步（Master-Slave Replication）是一种**数据复制**机制，允许多个Redis实例协同工作，以提高数据可用性、实现读写分离并增强系统的高可用性。
+
+- **主节点（Master）**：处理**写操作**，将数据同步给从节点。
+- **从节点（Slave）**：接收主节点的更新，可**提供读操作**，缓解主节点压力。
+- **同步方向**：Master -> Slave
+- **支持级联复制**：Slave 可以作为 Master 的 Slave（即多级复制）。
+
+---
+
+## **2. Redis主从同步的作用**
+
+1. **读写分离**：主库负责**写入**，从库负责**读取**，提高系统吞吐量。
+2. **数据备份**：从库实时同步主库的数据，提供故障恢复能力。
+3. **高可用性**：如果主库宕机，可以通过**Redis Sentinel** 或 **Redis Cluster** 提升可用性。
+
+---
+
+## **3. Redis主从同步流程**
+
+Redis主从同步分为两种：
+
+1. **全量同步（Full Synchronization）**
+2. **增量同步（Partial Synchronization）**
+
+### **3.1 全量同步（Full Sync）**
+
+**触发条件**：
+
+- 从库第一次连接主库。
+- 从库的数据较老，无法进行增量复制。
+
+**流程：**
+
+1. **从库发送 `PSYNC` 指令** 给主库，请求同步数据。
+2. **主库执行 `BGSAVE` 生成 RDB 快照**，并将快照文件发送给从库。
+3. **从库加载 RDB 文件**，并应用数据。
+4. **主库将同步期间的新写入操作**（增量数据）通过 **缓冲区（Replication Buffer）** 发送给从库。
+5. **同步完成**，主从库数据一致。
+
+**缺点**：
+
+- **消耗较高的 CPU 和内存**（因为 `BGSAVE` 创建 RDB 需要 fork 进程）。
+- **全量同步速度较慢**，如果数据量大，可能会导致网络传输压力增加。
+
+---
+
+### **3.2 增量同步（Partial Sync）**
+
+**触发条件**：
+
+- 从库与主库短暂断开后重新连接，并且主库的 **`replication backlog buffer`** 仍然保存了断开期间的写入操作。
+
+**流程：**
+
+1. **从库发送 `PSYNC <replicationid> <offset>` 请求** 主库同步数据。
+2. **主库检查 `replication backlog buffer`** 是否保存了从库缺失的数据：
+    - **如果有**，则直接发送增量数据（不需要RDB）。
+    - **如果没有**，则回退到 **全量同步** 方式。
+
+**优点**：
+
+- **避免全量同步的高消耗**，加快同步速度。
+- **减少 Redis 主库的压力**，提升可用性。
+
+---
+
+## **4. Redis主从同步的配置**
+
+### **4.1 配置主从**
+
+**步骤 1：启动 Redis 主库**
+
+```shell
+redis-server --port 6379
+```
+
+**步骤 2：启动 Redis 从库**
+
+```shell
+redis-server --port 6380
+```
+
+**步骤 3：配置从库** 在 `redis.conf` 中配置：
+
+```shell
+replicaof 127.0.0.1 6379  # 指定主库的 IP 和端口
+```
+
+或者使用命令：
+
+```shell
+SLAVEOF 127.0.0.1 6379
+```
+
+---
+
+### **4.2 验证主从同步**
+
+在 **主库** 中设置值：
+
+```shell
+SET key "hello"
+```
+
+在 **从库** 中读取：
+
+```shell
+GET key
+```
+
+如果配置成功，**从库应该返回相同的数据**。
+
+---
+
+## **5. 主从同步的数据结构**
+
+Redis 主从同步依赖 **`replication backlog buffer`** 进行增量数据同步。
+
+- **主库会存储最近的 N 条写入命令**，从库可以使用 `PSYNC` 命令拉取缺失的数据。
+- **默认缓冲区大小**：1MB（可在 `redis.conf` 配置 `repl-backlog-size`）。
+
+```shell
+CONFIG GET repl-backlog-size
+CONFIG SET repl-backlog-size 10485760  # 10MB
+```
+
+---
+
+## **6. Redis主从同步的故障处理**
+
+### **6.1 主库宕机**
+
+- 如果主库宕机，**从库仍然可以提供读操作**。
+- 但 **从库不能接收新的写入**（因为 Redis 只支持 **单向同步**）。
+- 解决方案：
+    - **手动提升从库为主库**：
+        
+        ```shell
+        SLAVEOF NO ONE
+        ```
+        
+    - **使用 Redis Sentinel 进行自动故障切换**（推荐）。
+
+### **6.2 从库宕机**
+
+- 从库重新启动时，会进行 **增量同步**（如果 `replication backlog buffer` 仍然有效）。
+- 如果 backlog 失效，会触发 **全量同步**（BGSAVE + RDB）。
+
+---
+
+## **7. Redis Sentinel（哨兵）+ 主从模式**
+
+Redis Sentinel 主要用于 **监控主库状态** 并在主库宕机时**自动进行故障转移**（Failover）。
+
+### **7.1 配置 Redis Sentinel**
+
+创建 `sentinel.conf`：
+
+```shell
+sentinel monitor mymaster 127.0.0.1 6379 2  # 监控主库
+sentinel down-after-milliseconds mymaster 5000  # 5s 内主库无响应则判定宕机
+sentinel failover-timeout mymaster 10000  # 10s 内完成故障转移
+sentinel parallel-syncs mymaster 2  # 允许 2 个从库同步新主库
+```
+
+启动 Sentinel：
+
+```shell
+redis-sentinel sentinel.conf
+```
+
+Sentinel 监测到主库宕机后，会**自动提升从库为主库**，并通知其他从库连接新主库。
+
+---
+
+## **8. Redis Cluster（集群）+ 主从模式**
+
+Redis Cluster 结合 **主从复制** 和 **分片（Sharding）**，实现高可用和扩展性。
+
+- **每个主节点（Master）都有多个从节点（Slave）**，用于故障恢复。
+- **当主节点宕机时，从库会自动升级为主库**，保证数据可用性。
+
+### **8.1 创建 Redis 集群**
+
+```shell
+redis-cli --cluster create 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 --cluster-replicas 1
+```
+
+该命令会创建 3 个主节点，每个主节点有 1 个从节点。
+
+---
+
+## **9. 总结**
+
+|**模式**|**特点**|
+|---|---|
+|**全量同步**|适用于首次同步或数据丢失，使用 RDB 传输完整数据。|
+|**增量同步**|适用于短暂断开连接后恢复，基于 `replication backlog buffer`。|
+|**读写分离**|读操作走从库，写操作走主库，提高性能。|
+|**Redis Sentinel**|监控主库状态，自动进行故障转移。|
+|**Redis Cluster**|结合分片和主从复制，实现高可用和负载均衡。|
+
+在 **高并发、高可用性场景**（如秒杀、排行榜、社交应用）下，推荐使用：
+
+1. **主从模式 + 读写分离** 提高性能。
+2. **Sentinel 自动切换**，提升系统可用性。
+3. **Redis Cluster** 进行分片，支持大规模数据存储。
+
+🚀 **Redis 主从复制是实现高可用性架构的基础，建议结合 Sentinel 或 Cluster 方案增强系统稳定性！**
+
+# 19. 看门狗为什么不能适用于setNx
+
+### **1. `SETNX` 简单分布式锁的原理**
+
+`SETNX` (`SET if Not Exists`) 是 Redis 提供的一种原子操作，常用于实现最基础的**分布式锁**：
+
+```shell
+SETNX lock_key unique_value
+```
+
+- 如果 `lock_key` **不存在**，则设置 `lock_key`，成功获得锁。
+- 如果 `lock_key` **已经存在**，则获取锁失败。
+
+为了避免死锁，需要手动设置**过期时间**：
+
+```shell
+EXPIRE lock_key 10  # 设置10秒超时
+```
+
+或者使用 `SET` 命令一次性完成：
+
+```shell
+SET lock_key unique_value NX EX 10  # NX: 仅当键不存在时设置；EX: 过期时间10秒
+```
+
+> 这种方式是**一次性超时**，无法自动续期。
+
+---
+
+### **2. 为什么 `SETNX` 不能使用 Watchdog？**
+
+Redis 本身的 `SETNX` + `EXPIRE` 方式无法直接支持**看门狗（自动续期）**，原因如下：
+
+#### **🚫 1. `SETNX` 锁不会记录持有者线程**
+
+- `SETNX` 只是存储了**一个 Key-Value**，不能区分**哪个线程**或**哪个实例**持有锁。
+- **Redisson 的 Watchdog 需要记录当前线程的信息**，并**判断是否续期**。
+
+**示例**
+
+```shell
+SET lock_key "UUID-123" NX EX 10
+```
+
+- **Redis 仅存储字符串 `UUID-123`**，没有记录具体**哪个线程**持有该锁。
+- **无法判断是否应该续期**，因为 Redis 只知道 `lock_key` 是否存在。
+
+#### **🚫 2. `SETNX` 没有内置的 Watchdog 机制**
+
+- `SETNX` 是 **原生 Redis 命令**，只会设置键值，不会自动续期。
+- **Redisson Watchdog 是 Redisson 客户端实现的**，而 `SETNX` 本身不支持自动续期。
+
+> Watchdog 依赖的是 **Redisson 的 Lua 脚本 + Redis 的 `Hash` 结构**，而 `SETNX` 仅仅是一个**简单的 Key-Value** 存储，没有**续期逻辑**。
+
+#### **🚫 3. `EXPIRE` 不能自动续期**
+
+- `EXPIRE` 只能**在设置时生效**，不会自动延期。
+- **Redis 本身没有 API 允许自动续期**，所以 `SETNX` + `EXPIRE` 方式的锁不会自动延长时间。
+
+**示例**
+
+```shell
+SET lock_key "UUID-123" NX EX 10
+EXPIRE lock_key 10
+```
+
+- 这只会在 10 秒后自动删除 `lock_key`，不会每 10 秒续期。
+
+---
+
+### **3. Redisson 的 Watchdog 机制**
+
+Redisson 通过 **`Hash` 结构** 和 **后台线程** 实现 Watchdog，自动续期 Redis 分布式锁：
+
+```shell
+HSET lock_key threadId "UUID-123"
+HSET lock_key count 1
+EXPIRE lock_key 30  # 默认30秒
+```
+
+每隔 10 秒：
+
+- **如果当前线程仍持有锁**，就**重置 EXPIRE 计时为 30 秒**（续期）。
+- **如果锁已释放**，则不会再续期。
+
+示例：
+
+```shell
+127.0.0.1:6379> TTL lock_key
+(integer) 25
+(10 秒后)
+127.0.0.1:6379> TTL lock_key
+(integer) 30  # Watchdog 自动续期
+```
+
+> `SETNX` 方式的锁**不能支持这种续期机制**，因为它的 Key-Value 结构不支持线程信息存储，也不具备 Lua 脚本自动更新 TTL 的能力。
+
+---
+
+### **4. 解决方案：如何让 `SETNX` 支持 Watchdog？**
+
+如果仍想使用 `SETNX` 并实现自动续期，有两种方法：
+
+#### **✅ 方法 1：定时续期（定时任务）**
+
+- 在**后台启动一个线程**，每隔一定时间**手动调用 `EXPIRE` 续期**：
+
+```java
+String lockKey = "lock_key";
+String uniqueId = UUID.randomUUID().toString();
+
+// 获取锁
+boolean acquired = redis.set(lockKey, uniqueId, "NX", "EX", 10) != null;
+
+if (acquired) {
+    // 启动续期线程
+    ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+    scheduler.scheduleAtFixedRate(() -> {
+        if (uniqueId.equals(redis.get(lockKey))) {
+            redis.expire(lockKey, 10);  // 续期 10 秒
+        }
+    }, 0, 5, TimeUnit.SECONDS);
+
+    // 业务逻辑
+    Thread.sleep(20000);
+
+    // 释放锁
+    if (uniqueId.equals(redis.get(lockKey))) {
+        redis.del(lockKey);
+    }
+    scheduler.shutdown();
+}
+```
+
+- **缺点**：
+    - 需要额外管理线程池，增加系统复杂度。
+    - 如果线程崩溃，续期逻辑会失效，导致锁提前释放。
+
+---
+
+#### **✅ 方法 2：使用 Redisson 分布式锁**
+
+Redisson 的 `RLock` **天然支持 Watchdog 机制**：
+
+```java
+RLock lock = redisson.getLock("myLock");
+lock.lock();  // 默认 30s 超时 + 自动续期
+```
+
+- **Watchdog 每 10 秒自动续期**
+- **锁只有在 `unlock()` 时才会真正释放**
+
+**推荐使用 Redisson**，避免手动维护定时续期逻辑。
+
+---
+
+### **5. 总结**
+
+|**实现方式**|**是否支持 Watchdog**|**优缺点**|
+|---|---|---|
+|**Redis `SETNX`**|❌ 不支持|需手动设置 `EXPIRE`，超时后无法自动续期|
+|**手动续期 (`SETNX` + 线程池)**|✅ 支持|需要额外线程管理，复杂度高|
+|**Redisson `RLock`**|✅ 自动支持|**推荐**，看门狗自动续期|
+
+### **🚀 结论**
+
+✅ `SETNX` **无法使用 Watchdog**，因为 Redis 本身不支持自动续期。  
+✅ **推荐使用 Redisson `RLock`**，天然支持 Watchdog 机制，减少维护成本。  
+✅ **如果必须用 `SETNX`**，可以用**定时任务手动续期**，但代码复杂度较高。
+
+> **最佳实践：** 业务执行时间不确定的情况下，建议直接使用 **Redisson 分布式锁**！🚀

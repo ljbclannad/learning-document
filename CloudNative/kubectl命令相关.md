@@ -31,7 +31,7 @@
     - kubectl config view --minify |grep namespace
 4. 查看哪些 Kubernetes 资源在名字空间中，哪些不在名字空间中：
     - kubectl api-resources --namespaced=true #*位于名字空间中的资源*
-    - kubectl api-resources --namespaced=false  *#不在名字空间中的资源*
+    - kubectl api-resources --namespaced=false  #*不在名字空间中的资源* 
 
 # Deployments相关
 

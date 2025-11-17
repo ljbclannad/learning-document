@@ -6,7 +6,6 @@ Spring Boot 的启动流程是面试中常问的一个高级问题。以下是 S
 ### **Spring Boot 启动流程**
 
 1. **启动入口**
-    
     - Spring Boot 应用的启动入口通常是一个包含 `@SpringBootApplication` 注解的主类，通过调用 `SpringApplication.run(MainClass.class, args)` 启动应用。
 2. **`SpringApplication` 类的初始化**
     
@@ -16,7 +15,7 @@ Spring Boot 的启动流程是面试中常问的一个高级问题。以下是 S
         - 推断和加载主配置类。
 3. **调用`SpringApplication.run()`方法**
     
-    - 该方法包含 Spring Boot 的核心启动逻辑：
+    - #SpringBoot 该方法包含 Spring Boot 的核心启动逻辑：
         1. **准备环境（prepareEnvironment）**
             - 加载和配置 `Environment` 对象（如系统环境变量、配置文件中的参数）。
             - 加载自定义配置（通过 `EnvironmentPostProcessor` 接口扩展）。
@@ -194,7 +193,8 @@ Spring Boot 的自动配置基于 **条件注解** 来判断是否启用某个�
 1. **配置文件 `spring.factories`：**
     
     ```properties
-    org.springframework.boot.autoconfigure.EnableAutoConfiguration=\ ```
+    org.springframework.boot.autoconfigure.EnableAutoConfiguration=\ 
+```
     
 2. **自动配置类：**
     
@@ -219,14 +219,14 @@ Spring Boot 的自动配置基于 **条件注解** 来判断是否启用某个�
 
 以下是 Spring Boot 中常见的自动配置模块：
 
-|模块|自动配置类|作用|
-|---|---|---|
-|Web 应用|`WebMvcAutoConfiguration`|配置 Spring MVC 的默认行为|
-|数据源|`DataSourceAutoConfiguration`|配置数据库数据源|
-|JPA|`HibernateJpaAutoConfiguration`|配置 JPA 的默认实现（如 Hibernate）|
-|安全|`SecurityAutoConfiguration`|配置 Spring Security 的基本功能|
-|Actuator（监控）|`EndpointAutoConfiguration`|配置 Actuator 的端点和健康检查|
-|缓存|`CacheAutoConfiguration`|配置默认缓存管理器|
+| 模块           | 自动配置类                           | 作用                        |
+| ------------ | ------------------------------- | ------------------------- |
+| Web 应用       | `WebMvcAutoConfiguration`       | 配置 Spring MVC 的默认行为       |
+| 数据源          | `DataSourceAutoConfiguration`   | 配置数据库数据源                  |
+| JPA          | `HibernateJpaAutoConfiguration` | 配置 JPA 的默认实现（如 Hibernate） |
+| 安全           | `SecurityAutoConfiguration`     | 配置 Spring Security 的基本功能  |
+| Actuator（监控） | `EndpointAutoConfiguration`     | 配置 Actuator 的端点和健康检查      |
+| 缓存           | `CacheAutoConfiguration`        | 配置默认缓存管理器                 |
 
 ---
 
@@ -243,7 +243,8 @@ Spring Boot 的自动配置基于 **条件注解** 来判断是否启用某个�
     示例：
     
     ```properties
-    org.springframework.boot.autoconfigure.EnableAutoConfiguration=\ ```
+    org.springframework.boot.autoconfigure.EnableAutoConfiguration=\ 
+```
     
 3. **排除默认自动配置**
     
@@ -324,7 +325,7 @@ Spring Boot 的自动配置基于 **条件注解** 来判断是否启用某个�
 
 ---
 
-#### **3. 使用 `@ConfigurationProperties` 批量绑定配置**
+#### **3. #SpringBoot 使用 `@ConfigurationProperties` 批量绑定配置**
 
 对于复杂配置或嵌套结构，可以使用 `@ConfigurationProperties` 批量加载：
 

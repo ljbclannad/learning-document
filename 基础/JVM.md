@@ -1,27 +1,33 @@
 ## 1. 运行时数据区域：
 1. 线程公有的：
-    - 堆：此内存区域的唯一目的就是用来存放对象实例，几乎所有的对象实例以及数组都在这里分配内存。Java 堆是垃圾收集器管理的主要区域，因此也被称作GC 堆（Garbage Collected Heap）
-    - 方法区：它用于存储已被虚拟机加载的类信息、常量、静态变量、即时编译器编译后的代码等数据。
-    - 运行时常量：运行时常量：JDK1.7 及之后版本的 JVM 已经将运行时常量池从方法区中移了出来，在 Java 堆（Heap）中开辟了一块区域存放运行时常量池。（1.8之后开辟出来称为元空间）
+    - 堆：此内存区域的唯一目的就是用来存放对象实例，几乎所有的**对象实例以及数组**都在这里分配内存。Java 堆是垃圾收集器管理的主要区域，因此也被称作GC 堆（Garbage Collected Heap）
+    - 方法区（之前叫永久代、现在为元空间）：它用于存储已被虚拟机加载的**类信息、常量、静态变量、即时编译器编译后的代码等数据**。
     -  为什么用元空间替代永久代？
 	    - 永久代的问题：
-		    - 永久代大小固定（可通过 -XX:PermSize 和 -XX:MaxPermSize 设置），容易因为类加载过多导致 OutOfMemoryError。
+		    - 永久代大小固定（可通过 -XX:PermSize 和 -XX:MaxPermSize 设置），存放在堆中，容易因为类加载过多导致 OutOfMemoryError。
 		    - 管理困难，需要频繁调整大小。
 		- 元空间的优势：
 			- 使用本地内存（Native Memory），不受堆内存限制。
 			- 自动扩展：只要本地内存充足，元空间可以动态调整大小。
+	- ![[Pasted image 20250307110738.png]]
 2. 线程私有的：
     1. 程序计数器：字节码解释器通过改变程序计数器来依次读取指令，从而实现代码的流程控制，如：顺序执行、选择、循环、异常处理。在多线程的情况下，程序计数器用于记录当前线程执行的位置，从而当线程被切换回来的时候能够知道该线程上次运行到哪儿了。程序计数器私有主要是为了线程切换后能恢复到正确的执行位置。
     2. 虚拟机栈：局部变量，操作栈，动态连接，返回地址等部分
-    3. 局部变量：用来存储临时8个基本数据类型，对象引用地址
-    4. 操作栈：操作数栈就是用来操作的，例如代码中有个 i = 66，他在一开始的时候就会进行操作，读取我们的代码，进行计算后再放入局部变量表中去
+    3. ![[Pasted image 20250307111837.png]]
+    4. 局部变量：用来存储临时8个基本数据类型，**对象引用地址**
+	    1. 1. 包括 int, long, float, double, boolean, byte, char, short。这些值直接存在局部变量表的槽位（slot）中。
+	    2. Person p = new Person();   
+		    - JVM在**堆中**创建一个 Person 实例；
+		    - 栈中保存的是**堆对象的引用（地址指针）**，也就是p的值。
+    5. 操作栈：操作数栈就是用来操作的，例如代码中有个 i = 66，他在一开始的时候就会进行操作，读取我们的代码，进行计算后再放入局部变量表中去
         1. 动态链接：假如我方法中，有个 service.add()方法，要链接到别的方法中去，这就是动态链接，存储链接的地方。
         2. 出口：出口正常的话就是return 不正常的话就是抛出异常
-    5. 本地方法栈：虚拟机使用到的 Native 方法服务
+    6. 本地方法栈：虚拟机使用到的 Native 方法服务
 3. 静态变量放在方法区，静态的对象放在堆中
-4. 内存溢出：在申请内存时没有足够的内存够其使用
-5. 内存泄漏：无法释放已申请的内存空间，内存泄漏会导致内存溢出
-6. 内存溢出的分类：
+4.  栈装的是“指针和数字”，堆装的是“实体和数据”。真正的对象都活在堆中，栈只是临时拿着钥匙帮你开门。
+5. **内存溢出（无法申请）**：在申请内存时没有足够的内存够其使用
+6. **内存泄漏（无法释放）**：无法释放已申请的内存空间，内存泄漏会导致内存溢出
+7. 内存溢出的分类：
     1. JAVA堆溢出：只要不断的创建对象，并且保证GC ROOTS到对象之间有可达路径来避免垃圾回收机制清除这些对象。那么在对象数量达到最大堆的容量限制后就会产生内存溢出异常
     2. 虚拟机栈和本地方法栈溢出：
         1. 如果线程请求的栈深度大于虚拟机所允许的最大深度，将抛出StackOverFlowError异常
@@ -31,36 +37,44 @@
     3. 方法区和运行时常量溢出
         1. 方法区存放类名，访问修饰符，常量池，方法描述等，基本的思路是运行时产生大量的类
         2. 本机直接内存溢出-XX:MaxDirectMemorySize指定容量。
-7. String s1 = new String("abc");这句话创建了几个字符串对象？
-    1. 将创建 1 或 2 个字符串。如果池中已存在字符串常量“abc”，则只会在堆空间创建一个字符串对象“abc”。如果池中没有字符串常量“abc”，那么它将首先在池中创建，然后在堆空间中创建，因此将创建总共 2 个字符串对象
+8. String s1 = new String("abc");这句话创建了几个字符串对象？
+    1. 将创建 1 或 2 个字符串。如果字符串常量池中已存在字符串常量“abc”，则只会在堆空间创建一个字符串对象“abc”。如果池中没有字符串常量“abc”，那么它将首先在字符串常量池中创建，然后在堆空间中创建，因此将创建总共 2 个字符串对象
 
 ## 2. java堆内存空间：
 
 1. eden,s0(Survivor From),s1 (Survivor To),tentired，其中新生代和老年代的比例一般为1：2，新生代中的各个空间比例又为8:1:1
 2. minorGC（清理新生代）：
-    1. 首先，把Eden和SurvivorFrom区域中存活的对象复制到SurvicorTo区域（如果有对象的年龄以及达到了老年的标准，则赋值到老年代区），同时把这些对象的年龄+1（如果ServicorTo不够位置了就放到老年区）
+    1. 首先，把Eden和SurvivorFrom区域中存活的对象复制到SurvicorTo区域（如果有对象的年龄以及达到了老年的标准，则赋值到老年代区），同时把这些对象的年龄+1（**如果ServicorTo不够位置了就放到老年区**）
     2. 清空eden和SurvivorFrom空间
     3. 将SurvicorTo的内容转移到SurvivorFrom，原ServicorTo成为下一次GC时的ServicorFrom区
-4. 为什么新生代要分Eden和两个 Survivor 区域？
+3. 为什么新生代要分Eden和两个 Survivor 区域？
     1. Survivor的存在意义，就是减少被送到老年代的对象，进而减少Full GC的发生，Survivor的预筛选保证，只有经历15次Minor GC还能在新生代中存活的对象，才会被送到老年代。
-    2. 设置两个Survivor区最大的好处就是解决了碎片化，刚刚新建的对象在Eden中，经历一次Minor GC，Eden中的存活对象就会被移动到第一块survivor space S0，Eden被清空；等Eden区再满了，就再触发一次Minor GC，Eden和S0中的存活对象又会被复制送入第二块survivor space S1
-5. 对象分配规则：
+    2. **设置两个Survivor区最大的好处就是解决了碎片化**，刚刚新建的对象在Eden中，经历一次Minor GC，Eden中的存活对象就会被移动到第一块survivor space S0，Eden被清空；等Eden区再满了，就再触发一次Minor GC，Eden和S0中的存活对象又会被复制送入第二块survivor space S1
+4. 对象分配规则：
     1. 对象优先分配在eden区：
         1. 当 eden 区没有足够空间进行分配时，虚拟机将发起一次 Minor GC.新生代 GC（Minor GC）:指发生新生代的的垃圾收集动作，Minor GC 非常频繁，回收速度一般也比较快。
     2. 大对象优先分配在老年区：
         1. 目的是为了避免eden区和两个survivor区之间产生大量的内存复制
-        2. 为了避免为大对象分配内存时由于分配担保机制带来的复制而降低效率。如果不分配给老年区的话，可能会存在eden区大小不够，进行了minor GC,复制到survivor的时候survivor空间不足，会产生分配担保，分配至老年代
+        2. 为了避免为大对象分配内存时由于分配担保机制带来的复制而降低效率。如果不分配给老年区的话，**可能会存在eden区大小不够，进行了minor GC,复制到survivor的时候survivor空间不足，会产生分配担保，分配至老年代**
     3. 长期存活的对象将进入老年代：
         1. 虚拟机给每个对象一个对象年龄（Age）计数器。如果对象在 Eden 出生并经过第一次 Minor GC 后仍然能够存活，并且能被 Survivor 容纳的话，将被移动到 Survivor 空间中，并将对象年龄设为 1.对象在 Survivor 中每熬过一次 MinorGC,年龄就增加 1 岁，当它的年龄增加到一定程度（默认为 15 岁），就会被晋升到老年代中。
         2. 设置年龄过小导致老年代内存过大，设置年龄过大导致eden容易满，发生fullGc
-6. 空间分配担保：
+5. 空间分配担保：
     1. 在发生Minor GC时（前），虚拟机会检测之前每次晋升到老年代的平均大小（因为当次会有多少对象会存活是无法确定的，所以取之前的平均值/经验值）是否大于老年代的剩余空间大小，如果大于，则改为直接进行一次Full GC。如果小于，则查看HandlePromotionFailure设置是否允许担保失败；如果允许，那只会进行Minor GC；如果不允许，则也要改为进行一次Full GC。取平均值进行比较其实仍然是一种动态概率手段，也就是说如果某次Minor GC存活后的对象突增，远远高于平均值的话，依然会导致担保失败（Handle Promotion Failure），这样会触发Full GC。
-7. 判断对象是否死亡：
-    1. 引用计数法：给对象中添加一个引用计数器，每当有一个地方引用它，计数器就加 1；当引用失效，计数器就减 1；任何时候计数器为 0 的对象就是不可能再被使用的。
-    2. 可达性分析算法：这个算法的基本思想就是通过一系列的称为 “GC Roots” 的对象作为起点，从这些节点开始向下搜索，节点所走过的路径称为引用链，当一个对象到 GC Roots 没有任何引用链相连的话，则证明此对象是不可用的。可作用GC Roots的对象包括下面几种：虚拟机栈中引用的对象，方法区中类静态属性引用的对象，方法去中常量引用的对象，本地方法栈中native的对象
+    2. +----------+        +----------+       +----------+
+		|  Eden    | -----> | Survivor | ---> |   Old    |
+		+----------+        +----------+       +----------+
+		     ↑                  ↑                  ↑
+		      |                  |                  |
+		Eden 满了，GC开始     Survivor放不下     老年代空间判断
+		                    ↓
+		        晋升对象 = Eden + S0 活着对象
+6. 判断对象是否死亡：
+    1. 引用计数法：给对象中添加一个引用计数器，每当有一个地方引用它，计数器就加 1；当引用失效，计数器就减 1；任何时候计数器为 0 的对象就是不可能再被使用的。当对象间出现了循环引用的话，引用计数法会失效。
+    2. 可达性分析算法：这个算法的基本思想就是通过一系列的称为 “GC Roots” 的对象作为起点，从这些节点开始向下搜索，节点所走过的路径称为引用链，当一个对象到 GC Roots 没有任何引用链相连的话，则证明此对象是不可用的。可作用GC Roots的对象包括下面几种：**虚拟机栈中引用的对象，方法区中类静态属性引用的对象，方法去中常量引用的对象，本地方法栈中native的对象**
     3. 要宣告一个对象死亡，至少需要两次标记过程：如果没有和GCroots相连的引用链，则会标记第一次并进行一次筛选，筛选是否有必要执行finalized()，当对象没有覆盖finalized或者已经被虚拟机调用过，就为没有必要执行，判断为对象死亡。
     4. 如果需要执行finalize(),可以在方法中尝试与引用链上的任意一个对象关联起来即可，譬如把自己赋值给某个变量，但是一个系统只会自动调用一次finalized
-8. 引用的四种类型：
+7. 引用的四种类型：
     1. 强引用：那就类似于必不可少的生活用品，垃圾回收器绝不会回收它。
     2. 软引用：可有可无的生活用品。如果内存空间足够，垃圾回收器就不会回收它，如果内存空间不足了，就会回收这些对象的内存
     3. 弱引用：弱引用与软引用的区别在于：只具有弱引用的对象拥有更短暂的生命周期。在垃圾回收器线程扫描它所管辖的内存区域的过程中，一旦发现了只具有弱引用的对象，不管当前内存空间足够与否，都会回收它的内存。
@@ -91,11 +105,11 @@
 
 ## 3. 垃圾收集算法：
 
-1. 标记-清除算法：该算法分为“标记”和“清除”阶段：首先标记出所有需要回收的对象，在标记完成后统一回收所有被标记的对象。它是最基础的收集算法，后续的算法都是对其不足进行改进得到，会有大量空间碎片
-2. 复制算法：为了解决效率问题，“复制”收集算法出现了。它可以将内存分为大小相同的两块，每次使用其中的一块。当这一块的内存使用完后，就将还存活的对象复制到另一块去，然后再把使用的空间一次清理掉。
-3. 每次使用eden和其中一块survivor，将eden和survivor上刚才存活的对象一次性的复制到另外一个survivor上，如果survivor内存不足，则会依赖老年代进行分配担保
-4. 标记-整理算法：标记过程仍然与“标记-清除”算法一样，但后续步骤不是直接对可回收对象回收，而是让所有存活的对象向一端移动，然后直接清理掉端边界以外的内存。效率较低
-5. 分代收集算法：一般将 java 堆分为新生代和老年代，这样我们就可以根据各个年代的特点选择合适的垃圾收集算法。（新生代用复制，老年代用标记清除）
+1. **标记-清除算法**：该算法分为“标记”和“清除”阶段：首先标记出所有需要回收的对象，在标记完成后统一回收所有被标记的对象。它是最基础的收集算法，后续的算法都是对其不足进行改进得到，会有大量空间碎片
+2. **复制算法**：为了解决效率问题，“复制”收集算法出现了。它可以将内存分为大小相同的两块，每次使用其中的一块。当这一块的内存使用完后，就将还存活的对象复制到另一块去，然后再把使用的空间一次清理掉。
+	1. 每次使用eden和其中一块survivor，将eden和survivor上刚才存活的对象一次性的复制到另外一个survivor上，如果survivor内存不足，则会依赖老年代进行分配担保
+3. **标记-整理算法**：标记过程仍然与“标记-清除”算法一样，但后续步骤不是直接对可回收对象回收，而是让所有存活的对象向一端移动，然后直接清理掉端边界以外的内存。效率较低
+4. 分代收集算法：一般将 java 堆分为新生代和老年代，这样我们就可以根据各个年代的特点选择合适的垃圾收集算法。（新生代用复制，老年代用标记清除）
 	1. 老年代用标记清除原理：老年代对象存活时间长、存活比例高。标记-清除算法不需要频繁移动对象，适合老年代。内存碎片问题可以通过优化和整理算法解决。
 	2. 新生代用复制原理：
 		1. 回收效率高：**垃圾回收主要清理短命对象**：由于大多数对象在新生代中是短命的，所以存活对象数量很少。**复制效率高**：复制存活对象的成本低，直接清空内存效率比标记-清除或标记-整理算法更高
@@ -138,7 +152,7 @@
         1. 程序调用system.gc时触发
         2. 大多数情况下，对象在新生代Eden区中分配，当Eden区没有足够空间进行分配时，虚拟机将发起一次Minor GC；同理，当老年代中没有足够的内存空间来存放对象时，虚拟机会发起一次Major GC/Full GC。只要老年代的连续空间大于新生代对象总大小或者历次晋升的平均大小就会进行Minor GC，否则将进行Full CG（要满足分配担保）。
     9. GC调优:
-        1. GC调优的目的：将转移到老年代的对象数量降低到最小； 减少 GC 的执行时间。减少STW（STOP THE WORD）
+        1. GC调优的目的：**将转移到老年代的对象数量降低到最小； 减少 GC 的执行时间。减少STW（STOP THE WORD）**
         2. GC调优策略：
             1. 将新对象预留在新生代。由于 Full GC 的成本远高于 Minor GC（复制算法和标记清除算法），因此尽可能将对象分配在新生代是明智的做法，减少fullGC
             2. 大对象进入老年代。-XX:PretenureSizeThreshold 可以设置直接进入老年代的对象大小。
@@ -147,7 +161,7 @@
             5. 如果没有STW，中途线程可能结束释放对象引用，导致在fullGC时部分对象可能变为垃圾对象，影响fullGC
         3. 能否对JAVA虚拟机调优，让系统几乎不发起fullGC:调大年轻代
     10. 单服务器高并发：
-        1. 单服务器配置要高，年轻代老年代空间大，但是由于空间大，垃圾收集时寻找垃圾时间过长，stw时间过长，导致系统卡顿时间长，这时候需要修改使用的垃圾收集器
+        1. **单服务器配置要高，年轻代老年代空间大，但是由于空间大，垃圾收集时寻找垃圾时间过长，stw时间过长，导致系统卡顿时间长，这时候需要修改使用的垃圾收集器**
         2. 可以采用分批GC，年轻代一定的大小就触发GC，采用G1收集器，设置MaxGCPauseMillis（目标）
     11. 对象的创建流程：
         1. 类加载检查：虚拟机遇到一条 new 指令时，首先将去检查这个指令的参数是否能在常量池中定位到这个类的符号引用，并且检查这个符号引用代表的类是否已被加载过、解析和初始化过。如果没有，那必须先执行相应的类加载过程。
@@ -183,7 +197,7 @@
                         3. AppClassLoader(应用程序类加载器)，负责加在classpath下的类文件​
                         4. 使用不同的类加载器最终得到的都是同样一个 Object 对象​
                         5. 为了避免双亲委托机制，我们可以自己定义一个类加载器，然后重写 loadClass() 即可。ClassLoader.loadClass。​
-                        6. 双亲委派模型的好处:1. 为了安全性，避免用户自己编写的类动态替换java的一些核心类
+                        6.  **双亲委派模型的好处:1. 为了安全性，避免用户自己编写的类动态替换java的一些核心类**
                     8. 避免类的重复加载Arthas:
 
 	
@@ -198,13 +212,13 @@ Java提供了多种垃圾收集器（Garbage Collectors），用于自动管理�
 
 Java垃圾收集器可根据工作机制分为以下几类：
 
-| **分类**           | **代表垃圾收集器**           |
-| ------------------ | ---------------------------- |
-| **串行垃圾收集器** | Serial GC                    |
-| **并行垃圾收集器** | Parallel GC                  |
+| **分类**      | **代表垃圾收集器**                |
+| ----------- | -------------------------- |
+| **串行垃圾收集器** | Serial GC                  |
+| **并行垃圾收集器** | Parallel GC                |
 | **并发垃圾收集器** | CMS（Concurrent Mark-Sweep） |
-| **低延迟收集器**   | G1（Garbage-First） GC       |
-| **现代收集器**     | ZGC、Shenandoah GC           |
+| **低延迟收集器**  | G1（Garbage-First） GC       |
+| **现代收集器**   | ZGC、Shenandoah GC          |
 
 ------
 
@@ -256,7 +270,7 @@ Java垃圾收集器可根据工作机制分为以下几类：
 
   - 主要用于低延迟应用。
   - 采用“标记-清除”算法进行老年代的垃圾回收。
-  - 并发标记和清除阶段不会完全暂停应用线程。
+  - 并发标记和清除阶段不会完全暂停应用线程。（初始标记和重新标记由于不是并发的，所以会导致stw）
   - 缺点：容易产生内存碎片。
 
 - 工作流程：
@@ -361,13 +375,18 @@ Java垃圾收集器可根据工作机制分为以下几类：
 ### **4. 垃圾收集器调优**
 
 1. **分析GC日志：**
-   - 使用`-XX:+PrintGCDetails`打印详细GC日志。
-   - 配合`jstat`、VisualVM、JMC等工具分析性能瓶颈。
+	1. 使用`-XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:gc.log`打印详细GC日志。
+	2. 配合`jstat`、VisualVM、JMC等工具分析性能瓶颈。
 2. **调整参数：**
-   - 堆内存大小：`-Xms`和`-Xmx`。
-   - 新生代与老年代比例：`-XX:NewRatio`。
-   - GC暂停时间：`-XX:MaxGCPauseMillis`。
-   - Full GC避免：减少系统资源耗尽。
+	1. 堆内存大小：`-Xms（初始堆大小）`和`-Xmx（最大堆大小）`。
+	2. 新生代与老年代比例：`-XX:NewRatio`。
+	3. GC暂停时间：`-XX:MaxGCPauseMillis`。
+	4. **堆设置的核心不是“多大”，而是“GC频率与停顿的平衡”。小堆跑得快但GC频繁，大堆停顿少但GC耗时长。理想状态是：Minor GC频繁、Full GC稀少、应用稳定。**
+3.  针对不同项目类型的设置策略
+	1.  **Web服务（Spring Boot、微服务）**
+		- 特点： 请求频繁、对象短命
+		- 目标：减少 Minor GC 次数，快速清理临时对象。
+		- 建议设置： -Xms2G -Xmx2G -Xmn1G 新生代大一些，适合高并发短生命周期的对象
 
 ------
 
@@ -379,7 +398,8 @@ Java垃圾收集器可根据工作机制分为以下几类：
 # 6. 类加载和双亲委派
 ### **类加载（Class Loading）**
 
-Java的类加载机制负责将类的字节码文件（`.class`文件）加载到内存，并转化为JVM可以识别的**类对象（Class对象）**。类加载过程是Java运行时动态实现的。
+Java的类加载机制负责将类的字节码文件（`.class`文件）加载到内存，并转化为JVM可以识别的**类对象（Class对象）**。类加载过程是Java运行时动态实现的。 **Java的类加载过程是运行时动态实现的，因为类只有在第一次使用时才会被JVM按需加载、链接、初始化。**
+这种机制让 Java 拥有了**反射、热加载、模块化与安全隔离的强大能力**。
 
 ---
 
@@ -390,12 +410,12 @@ Java的类加载机制负责将类的字节码文件（`.class`文件）加载�
 1. **加载（Loading）：**
    
     - 通过类加载器（ClassLoader）将字节码文件加载到内存中。
-    - 加载后的字节码被存储在方法区，并在堆中创建对应的`Class`对象。
+    - **加载后的字节码被存储在方法区**，并在堆中创建对应的`Class`对象。
 2. **链接（Linking）：** 链接分为以下三步：
    
     - **验证（Verification）：** 验证字节码文件的格式、元数据的合法性和安全性。
     - **准备（Preparation）：** 为类的静态变量分配内存，并赋予默认初值。
-    - **解析（Resolution）：** 将类、字段和方法的符号引用解析为直接引用。
+    - **解析（Resolution）：** 将类、字段和方法的符号引用解析为直接引用（ 即找到目标类、字段、方法的真实内存地址）。
 3. **初始化（Initialization）：**
    
     - 执行类的静态初始化块和静态变量的赋值操作。
@@ -417,7 +437,7 @@ Java的类加载机制负责将类的字节码文件（`.class`文件）加载�
 
 ### **双亲委派模型**
 
-**双亲委派模型（Parent Delegation Model）**是Java类加载机制的核心设计，它规定了类加载器的工作方式：  
+**双亲委派模型（Parent Delegation Model）** 是Java类加载机制的核心设计，它规定了类加载器的工作方式：  
 当一个类加载器尝试加载类时，它会首先将请求委托给它的父加载器，只有在父加载器无法完成加载时，才由当前加载器自己加载。
 
 ---
@@ -1015,3 +1035,611 @@ G1 的名字 **Garbage First** 反映了它的核心思想：**优先回收垃�
 ### **7. 总结**
 
 G1 收集器通过分区和优先级回收机制，将垃圾回收的延迟和停顿时间控制在可接受范围内，非常适合大内存和对响应时间敏感的应用场景。其工作流程核心是 **年轻代回收、并发标记和混合回收**，并结合用户设置的目标停顿时间进行优化。
+
+# 11. 栈内存中局部变量线程不安全
+**局部变量存放在线程私有的栈中，为何仍然可能出现线程不安全？**
+
+你的问题很有深度，考察了 **线程栈的隔离性** 和 **共享资源的影响**。虽然 **局部变量存放在线程私有的栈中**，但线程安全性并不仅仅取决于变量存放的位置。以下是局部变量导致 **线程不安全** 的几种可能情况：
+
+---
+
+### **1. 局部变量本身是线程私有的，不会共享**
+
+- 由于 **JVM 为每个线程分配独立的栈空间**，方法的局部变量是线程私有的，不会被多个线程共享。
+- 如果局部变量是 **基本数据类型（如 `int`、`double`）** 或 **不可变对象（如 `String`）**，那么它不会存在线程安全问题。
+
+**示例（线程安全）：**
+
+```java
+public class SafeExample {
+    public void safeMethod() {
+        int localVar = 10; // 局部变量，每个线程都有自己的副本
+        localVar++;
+        System.out.println(localVar);
+    }
+}
+```
+
+- 在这个例子中，`localVar` 只在方法执行时存在，并且每个线程都有自己的栈，因此不会有线程安全问题。
+
+---
+
+### **2. 局部变量引用了** 线程共享的 **对象**
+
+- **如果局部变量引用了堆上的共享对象，就可能引发线程安全问题**。
+
+**示例（线程不安全）：**
+
+```java
+public class UnsafeExample {
+    private static StringBuilder sharedBuilder = new StringBuilder();
+
+    public void unsafeMethod() {
+        // localStringBuilder 是局部变量，但它引用了共享对象
+        StringBuilder localStringBuilder = sharedBuilder;
+        localStringBuilder.append(Thread.currentThread().getName());
+        System.out.println(localStringBuilder.toString());
+    }
+}
+```
+
+**问题：**
+
+- `localStringBuilder` 是方法内的局部变量 **（栈上存放的是引用）**，但它指向的是 **堆上的共享对象 `sharedBuilder`**。
+- 多个线程同时调用 `unsafeMethod()`，可能会导致 `StringBuilder` 发生竞态条件，数据错乱。
+
+**解决方案：**
+
+- 使用 **局部变量创建新对象**，避免共享：
+    
+    ```java
+    public void safeMethod() {
+        StringBuilder localStringBuilder = new StringBuilder(); // 每个线程有自己的实例
+        localStringBuilder.append(Thread.currentThread().getName());
+        System.out.println(localStringBuilder.toString());
+    }
+    ```
+    
+
+---
+
+### **3. 方法参数传递导致的线程安全问题**
+
+- 如果 **方法参数是一个可变对象**，并且方法内部修改了该对象，它仍然可能在多个线程之间共享，导致线程安全问题。
+
+**示例（线程不安全）：**
+
+```java
+public class ParameterExample {
+    public void modifyList(List<String> list) {
+        list.add(Thread.currentThread().getName()); // 修改了外部传入的对象
+    }
+}
+```
+
+**问题：**
+
+- `list` 是方法的局部变量，但它引用的对象是外部传入的，可能被多个线程共享。
+
+**解决方案：**
+
+- 采用 **防御性拷贝**（Defensive Copy）：
+    
+    ```java
+    public void modifyListSafely(List<String> list) {
+        List<String> localList = new ArrayList<>(list); // 复制一份
+        localList.add(Thread.currentThread().getName());
+    }
+    ```
+    
+- 这样，每个线程操作的都是自己的 `localList`，不会影响原始对象。
+
+---
+
+### **4. 局部变量引用了** 线程不安全的 **对象**
+
+- 如果局部变量内部使用 **线程不安全的对象（如 `SimpleDateFormat`、`ArrayList`）**，也可能导致线程安全问题。
+
+**示例（线程不安全）：**
+
+```java
+import java.text.SimpleDateFormat;
+import java.util.Date;
+
+public class DateExample {
+    private static final SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd");
+
+    public void formatDate(Date date) {
+        // 虽然 sdf 是局部变量，但它指向的是线程共享的 SimpleDateFormat 实例
+        String formattedDate = sdf.format(date);
+        System.out.println(formattedDate);
+    }
+}
+```
+
+**问题：**
+
+- `SimpleDateFormat` 不是线程安全的，多个线程可能同时修改其内部状态，导致日期格式化错误。
+
+**解决方案：**
+
+- **每次创建新对象**
+    
+    ```java
+    public void formatDateSafely(Date date) {
+        SimpleDateFormat localSdf = new SimpleDateFormat("yyyy-MM-dd");
+        String formattedDate = localSdf.format(date);
+        System.out.println(formattedDate);
+    }
+    ```
+    
+- **使用 `ThreadLocal`**
+    
+    ```java
+    private static final ThreadLocal<SimpleDateFormat> threadLocalSdf =
+        ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd"));
+    
+    public void formatDateSafely(Date date) {
+        String formattedDate = threadLocalSdf.get().format(date);
+        System.out.println(formattedDate);
+    }
+    ```
+    
+    这样每个线程都有自己的 `SimpleDateFormat` 实例，避免线程安全问题。
+
+---
+
+### **5. 逃逸分析导致的线程安全问题**
+
+- 如果一个局部变量的引用 **被方法返回** 或 **赋值给其他线程访问**，则它可能导致线程安全问题。
+
+**示例（线程不安全）：**
+
+```java
+public class EscapeExample {
+    private static Object sharedObject;
+
+    public void escapeMethod() {
+        Object localObj = new Object(); // 原本是局部变量
+        sharedObject = localObj; // 逃逸到全局变量，可能被其他线程访问
+    }
+}
+```
+
+**问题：**
+
+- `localObj` 本应是线程私有的，但它逃逸到 `sharedObject`，可能被其他线程访问，导致线程安全问题。
+
+**解决方案：**
+
+- 避免让局部变量逃逸到线程共享的作用域中。
+
+---
+
+### **总结**
+
+**局部变量线程不安全的几种情况：**
+
+|**情况**|**原因**|**示例**|**解决方案**|
+|---|---|---|---|
+|**局部变量引用共享对象**|变量本身在栈上，但指向堆中的共享资源|`StringBuilder sharedBuilder`|每个线程创建新对象|
+|**方法参数是可变对象**|方法内部修改了外部传入的共享对象|`modifyList(List<String> list)`|防御性拷贝|
+|**局部变量使用线程不安全的类**|`SimpleDateFormat`、`ArrayList` 等|`sdf.format(date)`|`ThreadLocal` 或新建对象|
+|**变量逃逸到共享作用域**|局部变量被方法返回或赋值到全局变量|`sharedObject = localObj`|避免逃逸|
+
+# 12.  JVM调优参数工具
+### **JVM 调优参数及设置方式**
+
+JVM 提供了丰富的参数用于 **内存管理、GC 调优、性能优化** 等。以下是 JVM 调优参数的分类及详细解释，并包含如何设置它们。
+
+---
+
+## **1. JVM 参数设置方式**
+
+### **1.1 在命令行中设置**
+
+在启动 Java 应用时，使用 `java` 命令加上 `-XX`、`-Xms` 等参数：
+
+```bash
+java -Xms512m -Xmx2g -XX:+UseG1GC -jar myapp.jar
+```
+
+- `-Xms512m`：初始堆大小 512MB
+- `-Xmx2g`：最大堆大小 2GB
+- `-XX:+UseG1GC`：使用 G1 GC
+
+### **1.2 在 `JAVA_OPTS` 或 `CATALINA_OPTS`（Tomcat等服务器）中设置**
+
+```bash
+export JAVA_OPTS="-Xms512m -Xmx2g -XX:+UseG1GC"
+```
+
+### **1.3 在 `application.yml` 或 `application.properties`（Spring Boot）中配置**
+
+```yaml
+server:
+  port: 8080
+  tomcat:
+    max-threads: 200
+    accept-count: 100
+
+spring:
+  jpa:
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 30
+  datasource:
+    url: jdbc:mysql://localhost:3306/mydb
+    username: root
+    password: password
+    hikari:
+      maximum-pool-size: 20
+```
+
+对于 Spring Boot，可以在 `application.properties` 配置：
+
+```properties
+JAVA_OPTS=-Xms512m -Xmx2g -XX:+UseG1GC
+```
+
+---
+
+## **2. JVM 内存管理相关参数**
+
+### **2.1 堆内存参数**
+
+|**参数**|**作用**|
+|---|---|
+|`-Xms<size>`|设置 **初始堆大小**（如 `-Xms512m` 表示 512MB）|
+|`-Xmx<size>`|设置 **最大堆大小**（如 `-Xmx4g` 表示 4GB）|
+|`-Xmn<size>`|设置 **新生代大小**（如 `-Xmn256m` 表示 256MB）|
+|`-XX:NewRatio=<n>`|设置 **新生代与老年代的比例**（如 `-XX:NewRatio=2` 表示 新生代:老年代=1:2）|
+|`-XX:SurvivorRatio=<n>`|设置 **Eden 与 Survivor 区的比例**（如 `-XX:SurvivorRatio=8` 表示 Eden:Survivor=8:1:1）|
+|`-XX:MaxMetaspaceSize=<size>`|限制 **元空间（Metaspace）** 的最大大小（如 `-XX:MaxMetaspaceSize=256m`）|
+
+**示例：**
+
+```bash
+java -Xms1g -Xmx4g -Xmn512m -XX:NewRatio=2 -XX:SurvivorRatio=8 -jar myapp.jar
+```
+
+---
+
+### **2.2 线程栈和方法区**
+
+|**参数**|**作用**|
+|---|---|
+|`-Xss<size>`|设置 **每个线程栈的大小**（如 `-Xss1m` 表示 1MB）|
+|`-XX:MaxDirectMemorySize=<size>`|设置 **最大直接内存**（NIO 相关）|
+|`-XX:+UseCompressedOops`|开启 **指针压缩**（减少 64-bit JVM 内存占用）|
+
+**示例：**
+
+```bash
+java -Xss512k -XX:MaxDirectMemorySize=256m -XX:+UseCompressedOops -jar myapp.jar
+```
+
+---
+
+## **3. GC（垃圾回收）相关参数**
+
+### **3.1 选择垃圾收集器**
+
+|**参数**|**作用**|
+|---|---|
+|`-XX:+UseSerialGC`|使用 **Serial GC**（适合小堆内存 <1GB）|
+|`-XX:+UseParallelGC`|使用 **Parallel GC**（吞吐量优先）|
+|`-XX:+UseConcMarkSweepGC`|使用 **CMS GC**（低延迟场景）|
+|`-XX:+UseG1GC`|使用 **G1 GC**（默认，适合大内存）|
+|`-XX:+UseZGC`|使用 **ZGC**（低停顿，适合超大内存 8GB+）|
+
+**示例：**
+
+```bash
+java -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -jar myapp.jar
+```
+
+---
+
+### **3.2 GC 相关参数**
+
+|**参数**|**作用**|
+|---|---|
+|`-XX:MaxGCPauseMillis=<n>`|设置 **最大 GC 停顿时间（毫秒）**|
+|`-XX:G1HeapRegionSize=<size>`|设置 **G1 GC 的 Region 大小**|
+|`-XX:+PrintGCDetails`|启用 **GC 详细日志**|
+|`-Xlog:gc*`|开启 GC 日志（JDK 9+）|
+
+**示例（开启 GC 日志）：**
+
+```bash
+java -Xlog:gc* -XX:+PrintGCDetails -XX:+PrintGCDateStamps -jar myapp.jar
+```
+
+---
+
+## **4. 监控与调试参数**
+
+|**参数**|**作用**|
+|---|---|
+|`-XX:+HeapDumpOnOutOfMemoryError`|当 OOM 发生时生成 **堆转储** 文件|
+|`-XX:HeapDumpPath=<file>`|指定 **Heap Dump** 的保存路径|
+|`-XX:+UnlockDiagnosticVMOptions`|启用 **诊断模式**|
+|`-XX:+LogCompilation`|记录 **JIT 编译** 日志|
+|`-XX:+PrintCompilation`|记录 **JIT 编译的函数**|
+|`-XX:+DisableExplicitGC`|禁止手动调用 `System.gc()`|
+
+**示例：**
+
+```bash
+java -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/heapdump.hprof -jar myapp.jar
+```
+
+---
+
+## **5. 典型 JVM 调优方案**
+
+### **5.1 低延迟应用（如 Web 服务）**
+
+适用于 **Spring Boot、Tomcat、Netty** 等：
+
+```bash
+java -Xms2g -Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=100 -jar myapp.jar
+```
+
+### **5.2 高吞吐量应用（如大数据、日志分析）**
+
+适用于 **Kafka、Hadoop、Spark**：
+
+```bash
+java -Xms4g -Xmx8g -XX:+UseParallelGC -XX:ParallelGCThreads=4 -jar myapp.jar
+```
+
+### **5.3 低内存服务器（小型应用）**
+
+```bash
+java -Xms512m -Xmx1g -XX:+UseSerialGC -jar myapp.jar
+```
+
+---
+
+## **6. 监控工具**
+
+### **6.1 命令行工具**
+
+- `jps`：查看正在运行的 JVM 进程
+- `jstat -gc <PID>`：查看 GC 状态
+- `jmap -dump:format=b,file=heapdump.hprof <PID>`：导出堆转储
+- `jstack <PID>`：查看线程栈信息
+
+### **6.2 GUI 工具**
+
+- **VisualVM**：实时监控 GC、内存、线程
+- **JConsole**：查看 JVM 指标
+- **Java Mission Control (JMC)**：高级性能调优工具
+
+---
+
+## **总结**
+
+JVM 调优涉及 **内存管理、GC 调优、监控工具** 等，选择合适的参数可以提升应用性能。调优方式应根据 **应用场景、硬件资源、GC 需求** 进行调整。
+
+你可以尝试根据实际应用场景 **手动测试不同的 JVM 参数**，观察 GC 日志、线程快照，找出最优配置！ 🚀
+
+# 13.JVM GC 调优指南（问题 → 参数 → 解决方案）
+
+---
+
+## 🧨 1. 频繁 Full GC
+
+**问题表现：**
+
+- Full GC 每隔几秒发生一次
+    
+- 响应时间大幅波动，服务频繁 STW（Stop The World）
+    
+
+**可能原因：**
+
+- 老年代空间不足
+    
+- Survivor 区放不下对象，直接晋升
+    
+- 元空间爆满
+    
+
+**参数优化建议：**
+
+-XX:+UseG1GC  
+-XX:InitiatingHeapOccupancyPercent=30  
+-XX:G1ReservePercent=20  
+-XX:+UseStringDeduplication
+
+---
+
+## 🔁 2. Minor GC 过于频繁
+
+**问题表现：**
+
+- 每秒多次 Young GC，程序卡顿
+    
+
+**可能原因：**
+
+- Eden 太小，大量短命对象爆堆
+    
+- Survivor 区未配置合理
+    
+
+**参数优化建议：**
+
+-XX:G1NewSizePercent=30  
+-XX:G1MaxNewSizePercent=50  
+-XX:MaxTenuringThreshold=1
+
+---
+
+## ⏳ 3. GC 停顿时间过长
+
+**问题表现：**
+
+- GC 停顿超过 200ms 或 1 秒以上
+    
+- 系统响应抖动，影响 SLO
+    
+
+**可能原因：**
+
+- Mixed GC 扫描范围太大
+    
+- GC 启动过晚
+    
+
+**参数优化建议：**
+
+-XX:MaxGCPauseMillis=100  
+-XX:InitiatingHeapOccupancyPercent=20  
+-XX:G1HeapRegionSize=2m
+
+---
+
+## 💥 4. OOM: GC Overhead Limit Exceeded
+
+**问题表现：**
+
+- 程序卡死，报错：GC overhead limit
+    
+
+**可能原因：**
+
+- 垃圾对象太多，GC 一直回收不掉
+    
+
+**参数优化建议：**
+
+-XX:+HeapDumpOnOutOfMemoryError  
+-XX:HeapDumpPath=logs/heapdump.hprof
+
+**处理建议：**
+
+- 用 MAT 工具查看是否存在缓存泄露、引用链过长等问题
+    
+
+---
+
+## 🧠 5. OOM: Metaspace/PermGen 溢出
+
+**问题表现：**
+
+- 报错：OutOfMemoryError: Metaspace
+    
+
+**可能原因：**
+
+- 类加载过多，动态生成类过多（如 CGLIB）
+    
+
+**参数优化建议：**
+
+-XX:MaxMetaspaceSize=256m
+
+**排查建议：**
+
+- 打开类加载日志：`-XX:+TraceClassLoading`
+    
+- `jcmd <pid> GC.class_histogram` 查看类分布
+    
+
+---
+
+## 🔒 6. 内存泄露导致 OOM
+
+**问题表现：**
+
+- 堆使用量持续上升
+    
+- Full GC 后内存不降
+    
+
+**可能原因：**
+
+- 静态变量持有临时对象
+    
+- ThreadLocal 未释放
+    
+
+**处理方式：**
+
+-XX:+HeapDumpOnOutOfMemoryError
+
+分析建议：使用 MAT 查看 GC Roots、保留引用路径
+
+---
+
+## 🛑 7. Stop-The-World 过于频繁
+
+**问题表现：**
+
+- GC 频繁中断应用
+    
+- 响应时间不可预测
+    
+
+**可能原因：**
+
+- 新生代过小，GC 触发频繁
+    
+- Mixed GC 被迫全量清理
+    
+
+**参数优化建议：**
+
+-XX:MaxGCPauseMillis=150  
+-XX:InitiatingHeapOccupancyPercent=25
+
+---
+
+## 📊 JVM GC 调优参数总览表
+
+|场景|参数|说明|
+|---|---|---|
+|G1 启用|`-XX:+UseG1GC`|启用 G1 垃圾收集器|
+|最大停顿时间|`-XX:MaxGCPauseMillis=200`|尝试控制 GC 停顿时间|
+|老年代占用触发 GC|`-XX:InitiatingHeapOccupancyPercent=30`|提前启动 Mixed GC|
+|晋升空间预留|`-XX:G1ReservePercent=20`|预留晋升空间防止失败|
+|新生代比例|`-XX:G1NewSizePercent` / `MaxNewSizePercent`|控制新生代大小占比|
+|Survivor 区控制|`-XX:MaxTenuringThreshold=1`|快速晋升，减少 Survivor 压力|
+|元空间限制|`-XX:MaxMetaspaceSize=256m`|控制类元信息使用内存|
+|堆设置|`-Xms`, `-Xmx`|控制初始/最大堆大小|
+
+---
+
+## 🔍 调试推荐工具
+
+|工具|用途|
+|---|---|
+|jvisualvm|实时 GC 行为、内存趋势图|
+|jstat -gc|堆区分布实时查看|
+|jmap -histo|查看对象分布|
+|MAT|分析堆 dump、内存泄漏路径|
+|GCLogViewer / GCEasy|GC 日志可视化分析|
+|Arthas|热排查 GC、类加载、内存分布|
+
+---
+
+## ✅ 启动参数推荐模板
+
+java -Xms1g -Xmx1g \  
+-XX:+UseG1GC \  
+-XX:MaxGCPauseMillis=100 \  
+-XX:InitiatingHeapOccupancyPercent=30 \  
+-XX:G1ReservePercent=15 \  
+-XX:+HeapDumpOnOutOfMemoryError \  
+-XX:HeapDumpPath=logs/heapdump.hprof \  
+-Xlog:gc*:file=logs/gc.log:time,uptime,level,tags \  
+-jar app.jar
+
+---
+
+> 持续 GC 优化是一项系统工程，不只是调参数，更是理解业务特性、对象生命周期、分配模式，以及应用负载变化。

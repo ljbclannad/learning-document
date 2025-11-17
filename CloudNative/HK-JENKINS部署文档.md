@@ -4,9 +4,9 @@
 docker run -d \
   --name jenkins \
   --user root \
-  -p 8080:8080 \
+  -p 9443:8080 \
   -p 50000:50000 \
-  -v /mnt/jenkins_home:/var/jenkins_home \
+  -v /home/star/2T/jenkins_home:/var/jenkins_home \
   -v /var/run/docker.sock:/var/run/docker.sock \
   --restart unless-stopped \
   jenkins/jenkins:lts
@@ -28,3 +28,9 @@ docker tag imageId dockerhub-username/repository-name/imageName:1 .
 docker push username/repository-name/imageName:1
 ```
 
+# 4. 配置kubernetes yaml修改
+```
+ssh xxx@xxx.xxx.xx.xx
+sed -i 
+kubectl apply -f xxx.yaml
+```
