@@ -212,13 +212,13 @@ Java提供了多种垃圾收集器（Garbage Collectors），用于自动管理�
 
 Java垃圾收集器可根据工作机制分为以下几类：
 
-| **分类**      | **代表垃圾收集器**                |
-| ----------- | -------------------------- |
-| **串行垃圾收集器** | Serial GC                  |
-| **并行垃圾收集器** | Parallel GC                |
+| **分类**           | **代表垃圾收集器**           |
+| ------------------ | ---------------------------- |
+| **串行垃圾收集器** | Serial GC                    |
+| **并行垃圾收集器** | Parallel GC                  |
 | **并发垃圾收集器** | CMS（Concurrent Mark-Sweep） |
-| **低延迟收集器**  | G1（Garbage-First） GC       |
-| **现代收集器**   | ZGC、Shenandoah GC          |
+| **低延迟收集器**   | G1（Garbage-First） GC       |
+| **现代收集器**     | ZGC、Shenandoah GC           |
 
 ------
 
@@ -395,7 +395,7 @@ Java垃圾收集器可根据工作机制分为以下几类：
 - **选择垃圾收集器：** 根据具体应用场景选择合适的GC（如吞吐量、延迟、内存规模）。
 - **调优：** 通过日志分析和参数调整，优化GC性能以满足应用需求。
 
-# 6. 类加载和双亲委派
+## 6. 类加载和双亲委派
 ### **类加载（Class Loading）**
 
 Java的类加载机制负责将类的字节码文件（`.class`文件）加载到内存，并转化为JVM可以识别的**类对象（Class对象）**。类加载过程是Java运行时动态实现的。 **Java的类加载过程是运行时动态实现的，因为类只有在第一次使用时才会被JVM按需加载、链接、初始化。**
@@ -561,7 +561,7 @@ public class MyClassLoader extends ClassLoader {
 - **双亲委派模型**通过委托机制提高了类加载的安全性和一致性。
 - 在特定场景下，可以通过自定义类加载器实现更灵活的类加载逻辑，但需要小心破坏双亲委派可能导致的安全问题。
 
-# 7. 为什么 G1 GC 使用 Humongous Region 来管理大对象？这种设计如何优化大对象的管理？
+## 7. 为什么 G1 GC 使用 Humongous Region 来管理大对象？这种设计如何优化大对象的管理？
 
 ### **1. 为什么 G1 使用 Humongous Region？**
 
@@ -625,14 +625,14 @@ public class MyClassLoader extends ClassLoader {
 
 ### **4. G1 的 Humongous Region 与传统老年代的对比**
 
-|**特性**|**传统老年代**|**G1 的 Humongous Region**|
-|---|---|---|
-|**大对象存储位置**|老年代中的内存块|独立的连续 Humongous Region|
-|**内存碎片问题**|容易产生内存碎片|减少内存碎片，连续分配和回收|
-|**GC 回收策略**|标记-清除或标记-整理|按收益优先回收 Humongous Region|
-|**调优复杂度**|难以控制大对象对老年代的影响|通过 Region 大小和 G1 参数灵活调优|
+| **特性**           | **传统老年代**               | **G1 的 Humongous Region**         |
+| ------------------ | ---------------------------- | ---------------------------------- |
+| **大对象存储位置** | 老年代中的内存块             | 独立的连续 Humongous Region        |
+| **内存碎片问题**   | 容易产生内存碎片             | 减少内存碎片，连续分配和回收       |
+| **GC 回收策略**    | 标记-清除或标记-整理         | 按收益优先回收 Humongous Region    |
+| **调优复杂度**     | 难以控制大对象对老年代的影响 | 通过 Region 大小和 G1 参数灵活调优 |
 
-# 8. 怎么处理大对象
+## 8. 怎么处理大对象
 ### **1. 分解大对象**
 
 1. **分块处理：**
@@ -778,7 +778,7 @@ public class MyClassLoader extends ClassLoader {
 
 通过这些手段，可以有效缓解频繁分配大对象对系统性能的影响，同时提升内存管理的效率。
 
-# 9.什么是 Stop-The-World（STW）？哪些场景会触发 STW？如何优化 STW 的影响？
+## 9. 什么是 Stop-The-World（STW）？哪些场景会触发 STW？如何优化 STW 的影响？
 
 ### **1. 什么是 Stop-The-World（STW）？**
 
@@ -918,7 +918,7 @@ public class MyClassLoader extends ClassLoader {
     2. 调整内存配置，减少 GC 触发。
     3. 监控应用内存使用情况，优化代码中的对象分配逻辑。
 
-# 10. G1垃圾收集器工作原理详解
+## 10. G1垃圾收集器工作原理详解
 G1（Garbage First）收集器是 Java 的一种垃圾收集器，旨在提供高效的垃圾回收性能，特别是在大内存和低延迟场景下使用。它的设计目标是替代 CMS 收集器，减少垃圾回收的停顿时间（STW，Stop-The-World）并提高整体吞吐量。
 
 ---
@@ -1036,7 +1036,7 @@ G1 的名字 **Garbage First** 反映了它的核心思想：**优先回收垃�
 
 G1 收集器通过分区和优先级回收机制，将垃圾回收的延迟和停顿时间控制在可接受范围内，非常适合大内存和对响应时间敏感的应用场景。其工作流程核心是 **年轻代回收、并发标记和混合回收**，并结合用户设置的目标停顿时间进行优化。
 
-# 11. 栈内存中局部变量线程不安全
+## 11. 栈内存中局部变量线程不安全
 **局部变量存放在线程私有的栈中，为何仍然可能出现线程不安全？**
 
 你的问题很有深度，考察了 **线程栈的隔离性** 和 **共享资源的影响**。虽然 **局部变量存放在线程私有的栈中**，但线程安全性并不仅仅取决于变量存放的位置。以下是局部变量导致 **线程不安全** 的几种可能情况：
@@ -1220,14 +1220,14 @@ public class EscapeExample {
 
 **局部变量线程不安全的几种情况：**
 
-|**情况**|**原因**|**示例**|**解决方案**|
-|---|---|---|---|
-|**局部变量引用共享对象**|变量本身在栈上，但指向堆中的共享资源|`StringBuilder sharedBuilder`|每个线程创建新对象|
-|**方法参数是可变对象**|方法内部修改了外部传入的共享对象|`modifyList(List<String> list)`|防御性拷贝|
-|**局部变量使用线程不安全的类**|`SimpleDateFormat`、`ArrayList` 等|`sdf.format(date)`|`ThreadLocal` 或新建对象|
-|**变量逃逸到共享作用域**|局部变量被方法返回或赋值到全局变量|`sharedObject = localObj`|避免逃逸|
+| **情况**                       | **原因**                             | **示例**                        | **解决方案**             |
+| ------------------------------ | ------------------------------------ | ------------------------------- | ------------------------ |
+| **局部变量引用共享对象**       | 变量本身在栈上，但指向堆中的共享资源 | `StringBuilder sharedBuilder`   | 每个线程创建新对象       |
+| **方法参数是可变对象**         | 方法内部修改了外部传入的共享对象     | `modifyList(List<String> list)` | 防御性拷贝               |
+| **局部变量使用线程不安全的类** | `SimpleDateFormat`、`ArrayList` 等   | `sdf.format(date)`              | `ThreadLocal` 或新建对象 |
+| **变量逃逸到共享作用域**       | 局部变量被方法返回或赋值到全局变量   | `sharedObject = localObj`       | 避免逃逸                 |
 
-# 12.  JVM调优参数工具
+## 12. JVM调优参数工具
 ### **JVM 调优参数及设置方式**
 
 JVM 提供了丰富的参数用于 **内存管理、GC 调优、性能优化** 等。以下是 JVM 调优参数的分类及详细解释，并包含如何设置它们。
@@ -1289,14 +1289,14 @@ JAVA_OPTS=-Xms512m -Xmx2g -XX:+UseG1GC
 
 ### **2.1 堆内存参数**
 
-|**参数**|**作用**|
-|---|---|
-|`-Xms<size>`|设置 **初始堆大小**（如 `-Xms512m` 表示 512MB）|
-|`-Xmx<size>`|设置 **最大堆大小**（如 `-Xmx4g` 表示 4GB）|
-|`-Xmn<size>`|设置 **新生代大小**（如 `-Xmn256m` 表示 256MB）|
-|`-XX:NewRatio=<n>`|设置 **新生代与老年代的比例**（如 `-XX:NewRatio=2` 表示 新生代:老年代=1:2）|
-|`-XX:SurvivorRatio=<n>`|设置 **Eden 与 Survivor 区的比例**（如 `-XX:SurvivorRatio=8` 表示 Eden:Survivor=8:1:1）|
-|`-XX:MaxMetaspaceSize=<size>`|限制 **元空间（Metaspace）** 的最大大小（如 `-XX:MaxMetaspaceSize=256m`）|
+| **参数**                      | **作用**                                                                                |
+| ----------------------------- | --------------------------------------------------------------------------------------- |
+| `-Xms<size>`                  | 设置 **初始堆大小**（如 `-Xms512m` 表示 512MB）                                         |
+| `-Xmx<size>`                  | 设置 **最大堆大小**（如 `-Xmx4g` 表示 4GB）                                             |
+| `-Xmn<size>`                  | 设置 **新生代大小**（如 `-Xmn256m` 表示 256MB）                                         |
+| `-XX:NewRatio=<n>`            | 设置 **新生代与老年代的比例**（如 `-XX:NewRatio=2` 表示 新生代:老年代=1:2）             |
+| `-XX:SurvivorRatio=<n>`       | 设置 **Eden 与 Survivor 区的比例**（如 `-XX:SurvivorRatio=8` 表示 Eden:Survivor=8:1:1） |
+| `-XX:MaxMetaspaceSize=<size>` | 限制 **元空间（Metaspace）** 的最大大小（如 `-XX:MaxMetaspaceSize=256m`）               |
 
 **示例：**
 
@@ -1308,11 +1308,11 @@ java -Xms1g -Xmx4g -Xmn512m -XX:NewRatio=2 -XX:SurvivorRatio=8 -jar myapp.jar
 
 ### **2.2 线程栈和方法区**
 
-|**参数**|**作用**|
-|---|---|
-|`-Xss<size>`|设置 **每个线程栈的大小**（如 `-Xss1m` 表示 1MB）|
-|`-XX:MaxDirectMemorySize=<size>`|设置 **最大直接内存**（NIO 相关）|
-|`-XX:+UseCompressedOops`|开启 **指针压缩**（减少 64-bit JVM 内存占用）|
+| **参数**                         | **作用**                                          |
+| -------------------------------- | ------------------------------------------------- |
+| `-Xss<size>`                     | 设置 **每个线程栈的大小**（如 `-Xss1m` 表示 1MB） |
+| `-XX:MaxDirectMemorySize=<size>` | 设置 **最大直接内存**（NIO 相关）                 |
+| `-XX:+UseCompressedOops`         | 开启 **指针压缩**（减少 64-bit JVM 内存占用）     |
 
 **示例：**
 
@@ -1326,13 +1326,13 @@ java -Xss512k -XX:MaxDirectMemorySize=256m -XX:+UseCompressedOops -jar myapp.jar
 
 ### **3.1 选择垃圾收集器**
 
-|**参数**|**作用**|
-|---|---|
-|`-XX:+UseSerialGC`|使用 **Serial GC**（适合小堆内存 <1GB）|
-|`-XX:+UseParallelGC`|使用 **Parallel GC**（吞吐量优先）|
-|`-XX:+UseConcMarkSweepGC`|使用 **CMS GC**（低延迟场景）|
-|`-XX:+UseG1GC`|使用 **G1 GC**（默认，适合大内存）|
-|`-XX:+UseZGC`|使用 **ZGC**（低停顿，适合超大内存 8GB+）|
+| **参数**                  | **作用**                                  |
+| ------------------------- | ----------------------------------------- |
+| `-XX:+UseSerialGC`        | 使用 **Serial GC**（适合小堆内存 <1GB）   |
+| `-XX:+UseParallelGC`      | 使用 **Parallel GC**（吞吐量优先）        |
+| `-XX:+UseConcMarkSweepGC` | 使用 **CMS GC**（低延迟场景）             |
+| `-XX:+UseG1GC`            | 使用 **G1 GC**（默认，适合大内存）        |
+| `-XX:+UseZGC`             | 使用 **ZGC**（低停顿，适合超大内存 8GB+） |
 
 **示例：**
 
@@ -1344,12 +1344,12 @@ java -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -jar myapp.jar
 
 ### **3.2 GC 相关参数**
 
-|**参数**|**作用**|
-|---|---|
-|`-XX:MaxGCPauseMillis=<n>`|设置 **最大 GC 停顿时间（毫秒）**|
-|`-XX:G1HeapRegionSize=<size>`|设置 **G1 GC 的 Region 大小**|
-|`-XX:+PrintGCDetails`|启用 **GC 详细日志**|
-|`-Xlog:gc*`|开启 GC 日志（JDK 9+）|
+| **参数**                      | **作用**                          |
+| ----------------------------- | --------------------------------- |
+| `-XX:MaxGCPauseMillis=<n>`    | 设置 **最大 GC 停顿时间（毫秒）** |
+| `-XX:G1HeapRegionSize=<size>` | 设置 **G1 GC 的 Region 大小**     |
+| `-XX:+PrintGCDetails`         | 启用 **GC 详细日志**              |
+| `-Xlog:gc*`                   | 开启 GC 日志（JDK 9+）            |
 
 **示例（开启 GC 日志）：**
 
@@ -1361,14 +1361,14 @@ java -Xlog:gc* -XX:+PrintGCDetails -XX:+PrintGCDateStamps -jar myapp.jar
 
 ## **4. 监控与调试参数**
 
-|**参数**|**作用**|
-|---|---|
-|`-XX:+HeapDumpOnOutOfMemoryError`|当 OOM 发生时生成 **堆转储** 文件|
-|`-XX:HeapDumpPath=<file>`|指定 **Heap Dump** 的保存路径|
-|`-XX:+UnlockDiagnosticVMOptions`|启用 **诊断模式**|
-|`-XX:+LogCompilation`|记录 **JIT 编译** 日志|
-|`-XX:+PrintCompilation`|记录 **JIT 编译的函数**|
-|`-XX:+DisableExplicitGC`|禁止手动调用 `System.gc()`|
+| **参数**                          | **作用**                          |
+| --------------------------------- | --------------------------------- |
+| `-XX:+HeapDumpOnOutOfMemoryError` | 当 OOM 发生时生成 **堆转储** 文件 |
+| `-XX:HeapDumpPath=<file>`         | 指定 **Heap Dump** 的保存路径     |
+| `-XX:+UnlockDiagnosticVMOptions`  | 启用 **诊断模式**                 |
+| `-XX:+LogCompilation`             | 记录 **JIT 编译** 日志            |
+| `-XX:+PrintCompilation`           | 记录 **JIT 编译的函数**           |
+| `-XX:+DisableExplicitGC`          | 禁止手动调用 `System.gc()`        |
 
 **示例：**
 
@@ -1427,7 +1427,7 @@ JVM 调优涉及 **内存管理、GC 调优、监控工具** 等，选择合适�
 
 你可以尝试根据实际应用场景 **手动测试不同的 JVM 参数**，观察 GC 日志、线程快照，找出最优配置！ 🚀
 
-# 13.JVM GC 调优指南（问题 → 参数 → 解决方案）
+## 13. JVM GC 调优指南（问题 → 参数 → 解决方案）
 
 ---
 
@@ -1602,29 +1602,29 @@ JVM 调优涉及 **内存管理、GC 调优、监控工具** 等，选择合适�
 
 ## 📊 JVM GC 调优参数总览表
 
-|场景|参数|说明|
-|---|---|---|
-|G1 启用|`-XX:+UseG1GC`|启用 G1 垃圾收集器|
-|最大停顿时间|`-XX:MaxGCPauseMillis=200`|尝试控制 GC 停顿时间|
-|老年代占用触发 GC|`-XX:InitiatingHeapOccupancyPercent=30`|提前启动 Mixed GC|
-|晋升空间预留|`-XX:G1ReservePercent=20`|预留晋升空间防止失败|
-|新生代比例|`-XX:G1NewSizePercent` / `MaxNewSizePercent`|控制新生代大小占比|
-|Survivor 区控制|`-XX:MaxTenuringThreshold=1`|快速晋升，减少 Survivor 压力|
-|元空间限制|`-XX:MaxMetaspaceSize=256m`|控制类元信息使用内存|
-|堆设置|`-Xms`, `-Xmx`|控制初始/最大堆大小|
+| 场景              | 参数                                         | 说明                         |
+| ----------------- | -------------------------------------------- | ---------------------------- |
+| G1 启用           | `-XX:+UseG1GC`                               | 启用 G1 垃圾收集器           |
+| 最大停顿时间      | `-XX:MaxGCPauseMillis=200`                   | 尝试控制 GC 停顿时间         |
+| 老年代占用触发 GC | `-XX:InitiatingHeapOccupancyPercent=30`      | 提前启动 Mixed GC            |
+| 晋升空间预留      | `-XX:G1ReservePercent=20`                    | 预留晋升空间防止失败         |
+| 新生代比例        | `-XX:G1NewSizePercent` / `MaxNewSizePercent` | 控制新生代大小占比           |
+| Survivor 区控制   | `-XX:MaxTenuringThreshold=1`                 | 快速晋升，减少 Survivor 压力 |
+| 元空间限制        | `-XX:MaxMetaspaceSize=256m`                  | 控制类元信息使用内存         |
+| 堆设置            | `-Xms`, `-Xmx`                               | 控制初始/最大堆大小          |
 
 ---
 
 ## 🔍 调试推荐工具
 
-|工具|用途|
-|---|---|
-|jvisualvm|实时 GC 行为、内存趋势图|
-|jstat -gc|堆区分布实时查看|
-|jmap -histo|查看对象分布|
-|MAT|分析堆 dump、内存泄漏路径|
-|GCLogViewer / GCEasy|GC 日志可视化分析|
-|Arthas|热排查 GC、类加载、内存分布|
+| 工具                 | 用途                        |
+| -------------------- | --------------------------- |
+| jvisualvm            | 实时 GC 行为、内存趋势图    |
+| jstat -gc            | 堆区分布实时查看            |
+| jmap -histo          | 查看对象分布                |
+| MAT                  | 分析堆 dump、内存泄漏路径   |
+| GCLogViewer / GCEasy | GC 日志可视化分析           |
+| Arthas               | 热排查 GC、类加载、内存分布 |
 
 ---
 
