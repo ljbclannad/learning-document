@@ -912,8 +912,8 @@ spring:
   jpa:
     properties:
 	  hibernate:
-      jdbc:
-        batch_size: 30
+	    jdbc:
+          batch_size: 30
   datasource:
     url: jdbc:mysql://localhost:3306/mydb
     username: root
