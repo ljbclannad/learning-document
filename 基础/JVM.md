@@ -905,21 +905,21 @@ export JAVA_OPTS="-Xms512m -Xmx2g -XX:+UseG1GC"
 server:
   port: 8080
   tomcat:
-	max-threads: 200
-	accept-count: 100
+  max-threads: 200
+  accept-count: 100
 
 spring:
   jpa:
-	properties:
+    properties:
 	  hibernate:
-		jdbc:
-		  batch_size: 30
+      jdbc:
+        batch_size: 30
   datasource:
-	url: jdbc:mysql://localhost:3306/mydb
-	username: root
-	password: password
-	hikari:
-	  maximum-pool-size: 20
+    url: jdbc:mysql://localhost:3306/mydb
+    username: root
+    password: password
+    hikari:
+      maximum-pool-size: 20
 ```
 
 对于 Spring Boot，可以在 `application.properties` 配置：
