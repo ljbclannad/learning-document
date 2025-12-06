@@ -59,17 +59,17 @@
 
 ## 2. 堆内存空间：
 
-1. eden,s0(Survivor From),s1 (Survivor To),tentired，其中新生代和老年代的比例一般为1：2，新生代中的各个空间比例又为8:1:1
+1. eden,s0(Survivor From),s1 (Survivor To),tentired。其中新生代和老年代的比例一般为1：2，新生代中的各个空间比例又为8:1:1
 2. minorGC（清理新生代）：
 	1. 首先，把Eden和SurvivorFrom区域中存活的对象复制到SurvicorTo区域（如果有对象的年龄以及达到了老年的标准，则赋值到老年代区），同时把这些对象的年龄+1（**如果ServicorTo不够位置了就放到老年区**）
 	2. 清空eden和SurvivorFrom空间
 	3. 将SurvicorTo的内容转移到SurvivorFrom，原ServicorTo成为下一次GC时的ServicorFrom区
 3. 为什么新生代要分Eden和两个 Survivor 区域？
 	1. Survivor的存在意义，就是减少被送到老年代的对象，进而减少Full GC的发生，Survivor的预筛选保证，只有经历15次Minor GC还能在新生代中存活的对象，才会被送到老年代。
-	2. **设置两个Survivor区最大的好处就是解决了碎片化**，刚刚新建的对象在Eden中，经历一次Minor GC，Eden中的存活对象就会被移动到第一块survivor space S0，Eden被清空；等Eden区再满了，就再触发一次Minor GC，Eden和S0中的存活对象又会被复制送入第二块survivor space S1
+	2. **设置两个Survivor区最大的好处就是解决了碎片化**：刚刚新建的对象在Eden中，经历一次Minor GC，Eden中的存活对象就会被移动到第一块survivor space S0，Eden被清空；等Eden区再满了，就再触发一次Minor GC，Eden和S0中的存活对象又会被复制送入第二块survivor space S1
 4. 对象分配规则：
 	1. 对象优先分配在eden区：
-		1. 当 eden 区没有足够空间进行分配时，虚拟机将发起一次 Minor GC.新生代 GC（Minor GC）:指发生新生代的的垃圾收集动作，Minor GC 非常频繁，回收速度一般也比较快。
+		1. 当 eden 区没有足够空间进行分配时，虚拟机将发起一次 Minor GC。
 	2. 大对象优先分配在老年区：
 		1. 目的是为了避免eden区和两个survivor区之间产生大量的内存复制
 		2. 为了避免为大对象分配内存时由于分配担保机制带来的复制而降低效率。如果不分配给老年区的话，**可能会存在eden区大小不够，进行了minor GC,复制到survivor的时候survivor空间不足，会产生分配担保，分配至老年代**
@@ -77,7 +77,7 @@
 		1. 虚拟机给每个对象一个对象年龄（Age）计数器。如果对象在 Eden 出生并经过第一次 Minor GC 后仍然能够存活，并且能被 Survivor 容纳的话，将被移动到 Survivor 空间中，并将对象年龄设为 1.对象在 Survivor 中每熬过一次 MinorGC,年龄就增加 1 岁，当它的年龄增加到一定程度（默认为 15 岁），就会被晋升到老年代中。
 		2. 设置年龄过小导致老年代内存过大，设置年龄过大导致eden容易满，发生fullGc
 5. 空间分配担保：
-	1. 在发生Minor GC时（前），虚拟机会检测之前每次晋升到老年代的平均大小（因为当次会有多少对象会存活是无法确定的，所以取之前的平均值/经验值）是否大于老年代的剩余空间大小，如果大于，则改为直接进行一次Full GC。如果小于，则查看HandlePromotionFailure设置是否允许担保失败；如果允许，那只会进行Minor GC；如果不允许，则也要改为进行一次Full GC。取平均值进行比较其实仍然是一种动态概率手段，也就是说如果某次Minor GC存活后的对象突增，远远高于平均值的话，依然会导致担保失败（Handle Promotion Failure），这样会触发Full GC。
+	1. **在发生Minor GC时（前），虚拟机会检测之前每次晋升到老年代的平均大小**（因为当次会有多少对象会存活是无法确定的，所以取之前的平均值/经验值）是否大于老年代的剩余空间大小，如果大于，则改为直接进行一次Full GC。如果小于，则查看HandlePromotionFailure设置是否允许担保失败；如果允许，那只会进行Minor GC；如果不允许，则也要改为进行一次Full GC。取平均值进行比较其实仍然是一种动态概率手段，也就是说如果某次Minor GC存活后的对象突增，远远高于平均值的话，依然会导致担保失败（Handle Promotion Failure），这样会触发Full GC。
 	2. +----------+        +----------+       +----------+
 		|  Eden    | -----> | Survivor | ---> |   Old    |
 		+----------+        +----------+       +----------+
@@ -97,25 +97,21 @@
 	3. 弱引用：弱引用与软引用的区别在于：只具有弱引用的对象拥有更短暂的生命周期。在垃圾回收器线程扫描它所管辖的内存区域的过程中，一旦发现了只具有弱引用的对象，不管当前内存空间足够与否，都会回收它的内存。
 	4. 虚引用：在任何时候都可能被垃圾回收。
 	5. **强引用 (Strong Reference)**:
-	
 	   - 默认的引用方式，例如`Object obj = new Object();`。
 	   - 对象只要有强引用存在，就永远不会被回收。
 	   - **场景**：几乎所有普通对象都属于强引用。可以通过对象池或者设置为null。
 	
 	   **软引用 (Soft Reference)**:
-	
 	   - 通过`SoftReference`类实现。
 	   - 对象会在内存不足时被GC回收，可用于内存敏感的数据缓存。
 	   - **场景**：图片缓存、数据缓存。
 	
 	   **弱引用 (Weak Reference)**:
-	
 	   - 通过`WeakReference`类实现。
 	   - GC会在下一次垃圾回收时回收弱引用对象。
 	   - **场景**：弱引用被用于`WeakHashMap`，实现内存敏感的键值对存储。
 	
 	   **虚引用 (Phantom Reference)**:
-	
 	   - 通过`PhantomReference`类实现。
 	   - 不能单独使用，必须和`ReferenceQueue`结合，用于跟踪对象的生命周期。
 	   - **场景**：清理资源或监控对象回收。
