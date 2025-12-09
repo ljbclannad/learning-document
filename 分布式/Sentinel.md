@@ -117,7 +117,7 @@ spring.cloud.sentinel.transport.dashboard: localhost:8858
 通过统计滑动时间窗口内的 QPS、RT 等指标，实现更精确的限流和降级控制。
 
 ### 1.6.2 Sentinel 的指标采样机制？
-基于滑动窗口 + Bucket 采样方式，默认 1 秒划分成 2 个 bucket，避免突发影响整体统计。
+基于滑动窗口+Bucket采样方式，默认1秒划分成2个bucket，避免突发影响整体统计。
 
 ### 1.6.3 如果一个接口同时配置了限流、熔断、降级，Sentinel 怎么执行？
 Sentinel 的责任链机制会按 Slot 顺序依次判断限流、熔断、降级、系统保护，每一个都可能影响执行路径。
@@ -127,22 +127,36 @@ Sentinel 控制台（Dashboard）检测客户端“是否在线”，靠的就�
 
 ## 2.1 心跳机制的基本原理
 Sentinel 的**客户端主动上报（push）**机制大致如下：
-1. 每个接入 Sentinel 的客户端（例如你的 order-service）在启动时会初始化一个 HeartbeatSender；
+1. 每个接入 Sentinel 的客户端（例如你的 order-service）在启动时会初始化一个**HeartbeatSender**；
 2. 该 Sender 会定时（默认 10 秒）向控制台发送 HTTP 请求；
 3. 控制台收到后更新一份内存表，记录客户端的最后心跳时间；
 4. 若某个客户端在一定时间（默认 30 秒）未上报心跳，则判定为“下线”。
 	整个过程是**单向通信**：客户端→控制台。
 
----
 ## 2.2 心跳发送的源码流程
 从客户端侧开始看，关键类在 sentinel-transport-simple-http 模块：
 ### 2.2.1 HeartbeatSenderInitFunc
-启动时由 InitExecutor.doInit() 调用，它会异步启动心跳线程。
+启动时由 **InitExecutor.doInit()** 调用，它会异步启动心跳线程。
 ``` java
 public class HeartbeatSenderInitFunc implements InitFunc {
     @Override
     public void init() throws Exception {
-        HeartbeatSenderProvider.getHeartbeatSender().start();
+        HeartbeatSender sender = HeartbeatSenderProvider.getHeartbeatSender();
+    }
+
+    //interval: 心跳间隔时间，可以从配置文件中取
+    private void scheduleHeartbeatTask(/*@NonNull*/ final HeartbeatSender sender, /*@Valid*/ long interval) {
+        pool.scheduleAtFixedRate(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    //SimpleHttpHeartbeatSender.sendHeartbeat()
+                    sender.sendHeartbeat();
+                } catch (Throwable e) {
+                    RecordLog.warn("[HeartbeatSender] Send heartbeat error", e);
+                }
+            }
+        }, 5000, interval, TimeUnit.MILLISECONDS);
     }
 }
 ```
@@ -153,16 +167,43 @@ com.alibaba.csp.sentinel.transport.heartbeat.SimpleHttpHeartbeatSender
 ```
 它会周期性执行：
 ``` java
-String url = getHeartbeatApiPath();
-HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
-connection.setRequestMethod("POST");
-connection.getOutputStream().write(generatePayload().getBytes());
+    @Override
+    public boolean sendHeartbeat() throws Exception {
+        Endpoint addrInfo = getAvailableAddress();
+        if (addrInfo == null) {
+            return false;
+        }
+        SimpleHttpRequest request = new SimpleHttpRequest(addrInfo, TransportConfig.getHeartbeatApiPath());
+        request.setParams(heartBeat.generateCurrentMessage());
+        try {
+            SimpleHttpResponse response = httpClient.post(request);
+            if (response.getStatusCode() == OK_STATUS) {
+                return true;
+            } else if (clientErrorCode(response.getStatusCode()) || serverErrorCode(response.getStatusCode())) {
+                RecordLog.warn("[SimpleHttpHeartbeatSender] Failed to send heartbeat to " + addrInfo
+                    + ", http status code: " + response.getStatusCode());
+            }
+        } catch (Exception e) {
+            RecordLog.warn("[SimpleHttpHeartbeatSender] Failed to send heartbeat to " + addrInfo, e);
+        }
+    }
 ```
 默认间隔：HeartbeatSender.DEFAULT_INTERVAL = 10000 毫秒（即 10 秒一次）。
 
 ---
 ### 2.2.3 心跳的内容：客户端“身份卡”
 心跳包里会携带一些元信息，控制台用它来识别客户端：
+``` java
+public class SimpleHttpRequest {
+
+    private Endpoint endpoint;
+    private String requestPath = "";
+    private int soTimeout = 3000;
+    private Map<String, String> params;
+    private Charset charset = Charset.forName(SentinelConfig.charset());
+}
+```
+param为心跳内容，Json格式
 ``` json
 {
   "app": "order-service",
@@ -205,14 +246,14 @@ machineRegistry.register(app, ip, port, hostname, version);
 - 返回 "success"。
 
 ### 2.3.3 数据存储结构：
-控制台在内存中维护一个 Map：
+控制台在内存中维护一个 Map：其中kei为AppName
 ``` java
-Map<String, AppInfo> appInfoMap;
+ConcurrentMap<String, AppInfo> appInfoMap;
 ```
 
-每个 AppInfo 里包含：
+每个 AppInfo 里包含：一组机器实例用来做集群管理
 ``` java
-List<MachineInfo> machines;
+Set<MachineInfo> machines;
 ```
 
 每个 **MachineInfo** 记录：
@@ -221,14 +262,13 @@ List<MachineInfo> machines;
 - Version
 - HeartbeatLossCount（丢失次数）
 
-
 Dashboard 页面展示的数据（“机器列表”、“状态在线/离线”）就是根据这些对象实时更新的。
 
 ## 2.4 检测下线：超时清理任务
 
 控制台有一个后台线程，周期性检查是否有客户端长时间未上报。
-类：AppManagement
-方法：removeDeadMachines()
+类：MetricFetcher.start()
+方法：removeMachine()
 逻辑伪代码：
 ``` java
 for (machine : allMachines) {
@@ -237,10 +277,8 @@ for (machine : allMachines) {
     }
 }
 ```
-也就是说，如果某个客户端 30 秒没发心跳，它就会从控制台的“在线机器列表”消失。
 
 ## 2.5 关键点总结
-
 | **角色** | **模块**                       | **核心类**                | **功能**         |
 | -------- | ------------------------------ | ------------------------- | ---------------- |
 | 客户端   | sentinel-transport-simple-http | SimpleHttpHeartbeatSender | 每 10 秒上报一次 |
@@ -364,7 +402,7 @@ sampleCount = 2, bucketLength = 500ms
 时间: 0~499 → index=0
 时间: 500~999 → index=1
 时间: 1000~1499 → index=0 （复用旧桶）
-当时间跨越到新的周期时，旧桶就被清空重置。
+当时间跨越到新的周期时，旧桶就被清空重置。（桶右移，并置0）
 
 ### 3.4.2 加锁的临界点：窗口切换
 锁的目的不是让每次请求都排队，而是**只在窗口切换时**保护“旧桶 → 新桶”的替换操作。
@@ -435,9 +473,7 @@ ReentrantLock 的引入，不是“性能退步”，而是“边界稳固”。
 
 阿里内部测试结论是：
 
-> “99.999% 的请求路径依然无锁，只有窗口滑动边界偶尔加锁一次，
-
-> 性能几乎不受影响，稳定性显著提升。”
+> “99.999% 的请求路径依然无锁，只有窗口滑动边界偶尔加锁一次，性能几乎不受影响，稳定性显著提升。”
 
 ## 3.8 总结
 Sentinel 的滑动窗口统计在新版实现中使用了 **ReentrantLock** 保护“窗口更新”临界区，结合 **AtomicReferenceArray + LongAdder + 惰性过期** 构建了一个高并发、近似实时、边界安全的流量统计引擎。
