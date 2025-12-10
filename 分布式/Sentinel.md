@@ -26,7 +26,7 @@ Sentinel 提供系统自适应保护机制，主要包括以下指标：
 - **RT（平均响应时间）**
 - **并发线程数**
 - **入口 QPS**
-    
+  
 ## 1.2 注解与编程
 
 ### 1.2.1 `@SentinelResource` 注解的作用？参数有哪些？
@@ -38,11 +38,11 @@ Sentinel 提供系统自适应保护机制，主要包括以下指标：
 - `fallback`: 异常降级处理方法（已被放行）
 - `defaultFallback`: 全局降级处理方法
 - `exceptionsToIgnore`: 忽略的异常
-    
+  
 ### 1.2.2 blockHandler和fallback 的区别？
 - **blockHandler**：被 Sentinel 限流、熔断等规则触发时的处理方法。
 - **fallback**：业务执行异常时（如抛出异常）执行的降级方法。
-    
+  
 ### 1.2.3 如何处理方法签名带参数的降级处理方法？
 
 处理方法需与原方法签名一致，且最后加上 `BlockException` 参数。
@@ -64,7 +64,7 @@ public String handleBlock(String name, BlockException e) { ... }
 支持，使用 Token Server/Client 模式：
 - Client 上报请求数据
 - Server 做统一限流判断 常结合 Nacos、ZooKeeper 管理限流配置。
-    
+  
 
 ### 1.3.2 如何使用 Nacos 实现动态规则配置？
 ``` yml
@@ -486,17 +486,17 @@ Sentinel 的滑动窗口统计在新版实现中使用了 **ReentrantLock** 保�
     - `com.alibaba.csp.sentinel.slots.block.flow.param.ParamFlowRule`
     - `com.alibaba.csp.sentinel.slots.block.flow.param.ParamFlowRuleManager`
     - `com.alibaba.csp.sentinel.slots.block.flow.param.ParamFlowItem`（单个参数值的"例外项"阈值）
-        
+    
 - **责任链与检查器**
     - `com.alibaba.csp.sentinel.slots.block.flow.param.ParamFlowSlot`（插入 SlotChain 的热点参数限流槽位）
     - `com.alibaba.csp.sentinel.slots.block.flow.param.ParamFlowChecker`（判定核心）
     - （集群版）`com.alibaba.csp.sentinel.slots.block.flow.param.ClusterParamFlowChecker`
-        
+    
 - **度量与存储（参数维度的滑窗统计）**
     - `com.alibaba.csp.sentinel.slots.block.flow.param.ParameterMetric`
     - `com.alibaba.csp.sentinel.slots.block.flow.param.ParameterMetricStorage`
     - `com.alibaba.csp.sentinel.slots.block.flow.param.ParameterLeapArray`（参数值维度的 `LeapArray`）
-        
+    
 - **通用统计基建（被 ParameterLeapArray 复用）**
     - `com.alibaba.csp.sentinel.slots.statistic.base.LeapArray<T>`
     - `com.alibaba.csp.sentinel.slots.statistic.base.WindowWrap<T>`
@@ -514,7 +514,7 @@ Sentinel 的滑动窗口统计在新版实现中使用了 **ReentrantLock** 保�
 2. **进入热点槽位**\ SlotChain 运行到 **`ParamFlowSlot#entry(...)`**：
     - 取当前资源的所有 `ParamFlowRule`（`ParamFlowRuleManager#getRulesOfResource`）。
     - 将**方法实参数组 `args`** 传给 **`ParamFlowChecker#passCheck`**。
-        
+    
 3. **检查器核心**（`ParamFlowChecker`）
     - 遍历该资源的每条热点规则：
         - 取 `rule.getParamIdx()`（第几个参数）。
@@ -524,7 +524,7 @@ Sentinel 的滑动窗口统计在新版实现中使用了 **ReentrantLock** 保�
         - 读取 **最近 1 秒**的 `passQps`（窗口求和）。
         - 若 `passQps + 本次申请数 > 阈值` → 抛 `ParamFlowException`（**拦**）。
     - 所有规则都没挡住 → **放行**。
-        
+    
 4. **统计更新**\ 放行后在 **`StatisticSlot`** 或参数维度的 **`ParameterLeapArray`** 中执行：
     currentWindow.value().addPass(1);
     使参数值维度的 QPS 被实时累计。
@@ -537,7 +537,7 @@ Sentinel 的滑动窗口统计在新版实现中使用了 **ReentrantLock** 保�
     - `paramIdx`：参数索引（第几个参数）
     - `count`：默认阈值（QPS）
     - `paramFlowItemList`：**例外项**列表，不同参数值可有不同阈值\ `ParamFlowItem { Object object; double count; }`
-        
+    
 - 获取阈值的伪代码：
     ``` java
     double threshold = rule.getCount();  
@@ -566,7 +566,7 @@ Sentinel 的滑动窗口统计在新版实现中使用了 **ReentrantLock** 保�
 1. **定位桶**（`currentWindow(now)`）
     - 计算索引：`idx = (now / bucketLength) % sampleCount`
     - 拿到 `array[idx]` 的 `WindowWrap<MetricBucket>`
-        
+    
 2. **跨窗时的更新**\ 新版本（1.8.x+）在 `LeapArray` 里引入：
     private final ReentrantLock updateLock = new ReentrantLock();
     只在**窗口切换时**短暂加锁，保证"旧桶→新桶"的**原子替换**，避免高并发下 CAS 抖动与多桶重复创建。\ 普通 `addPass(1)` 仍然是 **无锁**（`LongAdder`）。
@@ -606,7 +606,7 @@ boolean passCheck(ResourceWrapper r, ParamFlowRule rule, Object[] args) {
     - **Token Server** 维护全局的阈值判定；
     - 判定结果回传给客户端，执行放行/限流；
 - 适用全局热点（如"全站同一商品 id=xxx"）。
-    
+  
 ## 4.9 性能与工程权衡
 - **每个"参数值"一份 `LeapArray`**：实现真正的"热点"识别；
 - **LRU**：内存稳定、追踪"最近热门"；
@@ -731,7 +731,7 @@ Sentinel 的资源模型既能抽象网关层的路由/API，也能抽象服务�
         - hospitalId（医院）
         - deptId（科室）
         - patientId（患者编号）
-为了防止某一个医院的系统异常“狂打医保接口”，在 payment-service 里对 hospitalId 做了 Sentinel 热点参数限流。
+    为了防止某一个医院的系统异常“狂打医保接口”，在 payment-service 里对 hospitalId 做了 Sentinel 热点参数限流。
 
 2. 错误配置
     - 资源：medicareSettlement
@@ -844,7 +844,7 @@ Sentinel 的资源模型既能抽象网关层的路由/API，也能抽象服务�
     - 被切成 10 个桶
     - 每个桶代表 100ms
 那结构大概是：
-[桶0][桶1][桶2][桶3][桶4][桶5][桶6][桶7][桶8][桶9]
+桶0 桶1 桶2 桶3 桶4 桶5 桶6 桶7 桶8 桶9
   ↑
 当前时间命中的桶
 时间往前走时会发生什么？
@@ -854,11 +854,9 @@ Sentinel 的资源模型既能抽象网关层的路由/API，也能抽象服务�
 数组不变，索引在时间维度上“打转”——这就是“时间片轮转”
 
 ### 5.4.3 Sentinel的时间片轮转是怎么落地的？
+
 1. 核心结构：
-    - LeapArray<WindowWrap<MetricBucket>>
-    - 本质是：
-    - 一个 固定长度数组
-    - 每个元素绑定一个 时间戳 + 统计桶
+    - LeapArray<WindowWrap<MetricBucket>> 是一个固定长度数组，每个元素绑定一个时间戳 + 统计桶   
 
 2. 关键公式：
     - index = (currentTime / windowLength) % arrayLength
@@ -878,7 +876,7 @@ Sentinel 的资源模型既能抽象网关层的路由/API，也能抽象服务�
         - QPS 上来以后，限流组件自己先把系统拖慢
     - 为了避免多个线程同时修改统计数据，导致数据不准确，所以需要用 CAS 原子操作来累加。
 
-### 5.4.4 为什么Sentinel必须用“CAS+时间片轮转”，而不能用“锁 + 普通队列”？
+###  5.4.4 为什么 Sentinel 必须用“CAS+时间片轮转”，而不能用“锁 + 普通队列”？
 1. 方案一：CAS + 时间片轮转（Sentinel 方案）
     - 优点：
         - 无全局锁
@@ -890,7 +888,7 @@ Sentinel 的资源模型既能抽象网关层的路由/API，也能抽象服务�
         - 实现复杂
         - 统计是“近似值”，不是强一致
 
-1. 方案二：队列 + 定时统计
+2. 方案二：队列 + 定时统计
     - 比如：
         - 所有请求先丢进队列
         - 后台线程每秒扫一遍统计 QPS
