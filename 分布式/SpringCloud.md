@@ -1,6 +1,16 @@
 # 1. SpringCloud的组件
 Spring Cloud 是一个微服务架构的完整解决方案，提供了多种组件来帮助开发者构建和管理分布式系统。Spring Cloud 主要包含以下 **五大核心组件**：
 
+> 快速导航  
+> - [Spring Cloud Netflix](#1-spring-cloud-netflix服务注册与发现负载均衡熔断等)  
+> - [Spring Cloud Config](#2-spring-cloud-config分布式配置中心)  
+> - [Spring Cloud Gateway](#3-spring-cloud-gatewayapi-网关)  
+> - [Spring Cloud Sleuth](#4-spring-cloud-sleuth分布式链路追踪)  
+> - [Spring Cloud Stream](#5-spring-cloud-stream消息驱动)  
+> - [Spring Cloud LoadBalancer](#2spring-cloud-loadbalancer-详细解析)  
+> - [熔断与限流示例（Sentinel）](#3-熔断和限流示例)  
+> - [Sentinel 原理](#4--sentinel-的熔断和降级原理)
+
 ---
 
 ## **1. Spring Cloud Netflix（服务注册与发现、负载均衡、熔断等）**
@@ -206,12 +216,12 @@ public class MessageConsumer {
 
 ## **总结**
 
-| 组件                       | 作用                           |
-| ------------------------ | ---------------------------- |
-| **Spring Cloud Netflix** | 提供服务注册、发现、负载均衡、熔断等           |
-| **Spring Cloud Config**  | 分布式配置中心，集中管理微服务配置            |
-| **Spring Cloud Gateway** | 统一 API 网关，提供路由、过滤、认证等功能      |
-| **Spring Cloud Sleuth**  | 分布式链路追踪，监控微服务间调用链路           |
+| 组件                     | 作用                                      |
+| ------------------------ | ----------------------------------------- |
+| **Spring Cloud Netflix** | 提供服务注册、发现、负载均衡、熔断等      |
+| **Spring Cloud Config**  | 分布式配置中心，集中管理微服务配置        |
+| **Spring Cloud Gateway** | 统一 API 网关，提供路由、过滤、认证等功能 |
+| **Spring Cloud Sleuth**  | 分布式链路追踪，监控微服务间调用链路      |
 | **Spring Cloud Stream**  | 消息驱动，支持 Kafka、RabbitMQ 等消息队列 |
 
 ---
@@ -441,12 +451,12 @@ spring:
 
 Spring Cloud LoadBalancer 取代了 Ribbon，并进行了许多优化：
 
-|**对比项**|**Ribbon**|**Spring Cloud LoadBalancer**|
-|---|---|---|
-|**是否维护**|2020 之后被弃用|仍在维护|
-|**负载均衡策略**|轮询、随机、加权|轮询、随机、自定义|
-|**异步支持**|不支持|原生支持 Reactor 异步|
-|**可扩展性**|需要继承 `IRule`|直接扩展 `ReactorLoadBalancer`|
+| **对比项**       | **Ribbon**       | **Spring Cloud LoadBalancer**  |
+| ---------------- | ---------------- | ------------------------------ |
+| **是否维护**     | 2020 之后被弃用  | 仍在维护                       |
+| **负载均衡策略** | 轮询、随机、加权 | 轮询、随机、自定义             |
+| **异步支持**     | 不支持           | 原生支持 Reactor 异步          |
+| **可扩展性**     | 需要继承 `IRule` | 直接扩展 `ReactorLoadBalancer` |
 
 ---
 
@@ -626,14 +636,14 @@ spring:
 
 如果你使用 **Spring Cloud Alibaba**（Nacos），那 **Sentinel** 是最佳选择。但如果你没有使用 Alibaba 生态，建议用 **Resilience4j**。
 
-|特性|Sentinel|Resilience4j|
-|---|---|---|
-|维护方|阿里巴巴|Spring 官方|
-|适用场景|**Nacos、Dubbo、Spring Cloud Alibaba**|**Spring Cloud Netflix**|
-|熔断策略|**响应时间、失败率、流量**|**失败率、慢调用**|
-|限流|**支持**|**不支持**|
-|控制台|**有**|**无**|
-|规则动态配置|**支持 Nacos 配置**|**不支持**|
+| 特性         | Sentinel                               | Resilience4j             |
+| ------------ | -------------------------------------- | ------------------------ |
+| 维护方       | 阿里巴巴                               | Spring 官方              |
+| 适用场景     | **Nacos、Dubbo、Spring Cloud Alibaba** | **Spring Cloud Netflix** |
+| 熔断策略     | **响应时间、失败率、流量**             | **失败率、慢调用**       |
+| 限流         | **支持**                               | **不支持**               |
+| 控制台       | **有**                                 | **无**                   |
+| 规则动态配置 | **支持 Nacos 配置**                    | **不支持**               |
 
 ---
 
@@ -828,14 +838,14 @@ public class OrderController {
 
 ## **5. Sentinel 熔断和降级 vs Hystrix**
 
-|关键点|**Sentinel**|**Hystrix（已过时）**|
-|---|---|---|
-|维护方|阿里巴巴|Netflix（已停止维护）|
-|熔断方式|**失败率、响应时间、异常数**|**失败率、超时**|
-|限流|**支持**|**不支持**|
-|热点参数限流|**支持**|**不支持**|
-|动态规则更新|**支持（Nacos 配置）**|**不支持**|
-|控制台|**Sentinel Dashboard**|**Hystrix Dashboard**|
+| 关键点       | **Sentinel**                 | **Hystrix（已过时）** |
+| ------------ | ---------------------------- | --------------------- |
+| 维护方       | 阿里巴巴                     | Netflix（已停止维护） |
+| 熔断方式     | **失败率、响应时间、异常数** | **失败率、超时**      |
+| 限流         | **支持**                     | **不支持**            |
+| 热点参数限流 | **支持**                     | **不支持**            |
+| 动态规则更新 | **支持（Nacos 配置）**       | **不支持**            |
+| 控制台       | **Sentinel Dashboard**       | **Hystrix Dashboard** |
 
 > **🚀 结论：如果使用 Spring Cloud Alibaba（Nacos），最佳选择是 Sentinel！**
 
@@ -848,4 +858,13 @@ public class OrderController {
 ✅ **Sentinel 结合 Feign 可以自动实现熔断和降级**，无需手写大量代码。  
 ✅ **Sentinel Dashboard 可以动态管理熔断和限流规则**，不用重启服务。  
 ✅ **相比 Hystrix，Sentinel 提供更强大的限流、热点流控能力**。
+
+---
+
+## 落地建议（高并发场景）
+- 注册发现优先用 Spring Cloud LoadBalancer 搭配 Nacos/Eureka，减少 Ribbon 旧依赖。
+- 网关统一走 Spring Cloud Gateway，限流过滤器接 Sentinel。
+- 配置集中放 Config Server/Git，变更后配合 `bus-refresh` 热推送。
+- 链路追踪优先接 Sleuth + Zipkin/SkyWalking，问题定位靠 traceId。
+- 熔断、限流规则放入 Nacos 持久化，避免节点重启规则丢失。
 
