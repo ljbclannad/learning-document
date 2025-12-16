@@ -1,5 +1,9 @@
 # LLM(Large Language Model)
 
+[TOC]
+[1. 数据准备阶段](#1-数据准备阶段)
+
+
 # 1. 数据准备阶段
 
 ## 1.1 tokenization
@@ -390,3 +394,61 @@ effective batch 变大，通常学习率也能适当放大（但别机械线性�
                 - 长文切块/评估 ppl：优先 128~512，别太大避免重复过多
 
 ## 1.4 embdding(向量)
+
+1. Embedding 的本质：一张可训练的“查表矩阵”,给定词表大小 V、隐藏维度 d_model：
+    - 你有一个矩阵 E ∈ R^(V × d_model)
+	- 输入 token id：t
+	- 输出向量：x = E[t]（就是查第 t 行）
+    - 这一步非常快，和“按 id 取数组”一样。
+
+2. LLM 里常见的几类 embedding（别把它只当“词向量”）
+    1. Token Embedding（词表嵌入）:最基础那张表：input_ids -> vectors。
+    2. Position Embedding（位置嵌入）
+        - Transformer 不像 RNN 天生有顺序感，需要额外告诉它第几个 token：
+            - 绝对位置：pos_id -> p，然后 x = token_emb + pos_emb
+            - 相对位置 / 旋转位置（RoPE）：不加法，而是把位置信息“揉进注意力计算里”（现在更常见）
+        - 你平时看到的 “max_position_embeddings / rope_theta / rotary_dim” 就在这条线里。
+    3. Segment / Role Embedding（可选）
+        - BERT 时代的 token_type_ids（句子 A/B），或对话里不同角色（system/user/assistant）也可以用类似思想编码。
+    4. Output Embedding / LM Head（输出层）
+        - 语言模型最后要预测下一个 token 的概率：
+            - 有一个矩阵 W ∈ R^(d_model × V) 把隐藏态投影回词表大小
+            - 很多模型会做 weight tying：让 W = E^T（输入 embedding 和输出投影共享权重）
+            - 好处：参数更少、常常更稳
+
+3. Embedding 训练时到底学到什么（从“统计共现”到“可推理表征”）
+    - 在自回归 LM（预测下一个 token）里，embedding 会被优化成：
+        - 能让模型更容易预测下一个 token
+        - 所以它会编码：词性、语义、常见搭配、领域偏好、甚至格式/标点习惯
+    - 经典现象：
+        - “king - man + woman ≈ queen” 这种线性关系是 embedding 空间里常出现的结构（不是魔法，是统计结构+线性层偏好带来的几何结果）。
+        - 但在现代 LLM 里，语义并不只在 embedding 层，更大量的“抽象能力”在中间层的表示里。
+
+4. Embedding 在检索（RAG）里的用法：把“整段文本”变成一个向量
+    - 你平时做向量检索用的 embedding，通常不是 “token embedding”，而是 sentence/document embedding（把一句话/一段话压成一个向量）。
+    1. 怎么从 token 级变成句子级？常见池化（pooling）方式：
+	    - [CLS] 向量（BERT 系常见）
+        - Mean pooling：对所有 token 向量取平均（很常用）
+	    - Last token：取最后一个 token（某些 decoder-only embedding 模型用）
+        - 加权 pooling：按 attention 权重或 TF-IDF 权重加权
+        - 然后得到一个固定维度向量 v ∈ R^d，存进向量库。
+
+    2. 相似度怎么比？
+        - 余弦相似度（cosine）：最常见
+	    - 点积（dot product）：如果向量做过归一化，点积=余弦
+	    - 欧式距离：也能用，但检索里余弦/点积更主流
+
+5. 你做 RAG 必须知道的 embedding “坑位”
+	1.	同一个 embedding 模型 + 同一个归一化策略。文档库和查询必须一致，否则相似度会失真。
+	2.	维度越大不一定越好。大维度更吃存储和检索（HNSW/IVF 都更贵），收益递减明显。很多模型 768/1024/1536 就够用。
+	3.	领域适配很重要。医疗规则/医保条文这种文本，用通用 embedding 能用，但召回可能不够“贴领域”，常见做法：
+        - 选更强的 embedding 模型（偏检索优化的）
+        - 或做领域继续训练 / 对比学习微调
+	4.	chunk 切法比你想的更影响 embedding。chunk 太长：语义混杂；太短：信息不足。通常会配合重叠（overlap/stride）和结构化切分（按标题/条款/编号）。
+
+6. Embedding 和你已经学的 tokenization 的关系（上游地基）
+	- tokenization 决定：文本会被拆成什么 token id
+	- embedding 决定：每个 id 在向量空间是什么坐标
+	- 所以 tokenizer 换了、词表换了，embedding 表也必须一起换（否则 id 对不上）
+
+# 2. 编码注意力机制
