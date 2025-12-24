@@ -679,13 +679,13 @@ Spring 提供以下三种依赖注入方式：
 
 ### **3. `ApplicationContext` 的主要实现类**
 
-| 实现类                                                    | 描述                               |
-| ------------------------------------------------------ | -------------------------------- |
+| 实现类                                                 | 描述                                                   |
+| ------------------------------------------------------ | ------------------------------------------------------ |
 | **ClassPathXmlApplicationContext**                     | 从类路径下加载 XML 配置文件，适用于传统 XML 配置项目。 |
-| **FileSystemXmlApplicationContext**                    | 从文件系统加载 XML 配置文件。                |
-| **AnnotationConfigApplicationContext**                 | 支持基于注解的配置类，适用于现代化 Spring 项目。     |
-| **AnnotationConfigServletWebServerApplicationContext** | Spring Boot 默认的 Web 应用容器。        |
-| **GenericApplicationContext**                          | 通用实现类，可与其他上下文类型结合使用。             |
+| **FileSystemXmlApplicationContext**                    | 从文件系统加载 XML 配置文件。                          |
+| **AnnotationConfigApplicationContext**                 | 支持基于注解的配置类，适用于现代化 Spring 项目。       |
+| **AnnotationConfigServletWebServerApplicationContext** | Spring Boot 默认的 Web 应用容器。                      |
+| **GenericApplicationContext**                          | 通用实现类，可与其他上下文类型结合使用。               |
 
 ---
 
@@ -1205,13 +1205,13 @@ public void refresh() throws BeansException, IllegalStateException {
 
 ### **1. Spring 支持的 Bean Scope 类型**
 
-| 范围              | 描述                                         | 适用场景                |
-| --------------- | ------------------------------------------ | ------------------- |
-| **singleton**   | 默认范围，每个 Spring 容器中仅存在一个共享实例。               | 无状态 Bean，例如服务类。     |
-| **prototype**   | 每次请求都会创建一个新的实例。                            | 有状态 Bean，例如配置对象。    |
-| **request**     | 每个 HTTP 请求都会创建一个新的 Bean 实例，适用于 Web 应用。     | Web 应用中的请求范围数据。     |
-| **session**     | 每个 HTTP 会话共享一个 Bean 实例，适用于 Web 应用。         | Web 应用中的会话范围数据。     |
-| **application** | 整个 ServletContext 共享一个 Bean 实例，适用于 Web 应用。 | 应用级别的全局数据。          |
+| 范围            | 描述                                                        | 适用场景                     |
+| --------------- | ----------------------------------------------------------- | ---------------------------- |
+| **singleton**   | 默认范围，每个 Spring 容器中仅存在一个共享实例。            | 无状态 Bean，例如服务类。    |
+| **prototype**   | 每次请求都会创建一个新的实例。                              | 有状态 Bean，例如配置对象。  |
+| **request**     | 每个 HTTP 请求都会创建一个新的 Bean 实例，适用于 Web 应用。 | Web 应用中的请求范围数据。   |
+| **session**     | 每个 HTTP 会话共享一个 Bean 实例，适用于 Web 应用。         | Web 应用中的会话范围数据。   |
+| **application** | 整个 ServletContext 共享一个 Bean 实例，适用于 Web 应用。   | 应用级别的全局数据。         |
 | **websocket**   | 每个 WebSocket 会话共享一个 Bean 实例，适用于 Web 应用。    | WebSocket 通信中的会话数据。 |
 
 ---
@@ -1301,11 +1301,11 @@ public class PrototypeBean {
 
 ### **4. Prototype 和 Singleton 的区别**
 
-|**特性**|**Singleton**|**Prototype**|
-|---|---|---|
-|**实例数量**|容器中始终只有一个共享实例。|每次请求都会创建一个新的实例。|
-|**生命周期管理**|由 Spring 容器管理，容器关闭时销毁。|不受容器管理，由调用者负责销毁。|
-|**适用场景**|无状态 Bean（例如服务类）。|有状态 Bean（例如配置对象）。|
+| **特性**         | **Singleton**                        | **Prototype**                    |
+| ---------------- | ------------------------------------ | -------------------------------- |
+| **实例数量**     | 容器中始终只有一个共享实例。         | 每次请求都会创建一个新的实例。   |
+| **生命周期管理** | 由 Spring 容器管理，容器关闭时销毁。 | 不受容器管理，由调用者负责销毁。 |
+| **适用场景**     | 无状态 Bean（例如服务类）。          | 有状态 Bean（例如配置对象）。    |
 
 ---
 
@@ -1467,9 +1467,9 @@ public class DevConfig {
 - **通过配置文件：**
     - 在 `application.properties` 中设置：
         
-        ```properties
+    ```properties
         spring.profiles.active=dev
-```
+    ```
         
 - **通过代码：**
     
@@ -1564,7 +1564,7 @@ public class DevConfig {
     
     ```properties
     spring.profiles.active=dev,test
-```
+    ```
     
 
 #### **（2）默认 Profile**
@@ -1625,7 +1625,7 @@ public class DevConfig {
     
     ```properties
     spring.profiles.active=dev
-```
+    ```
     
 
 #### **（3）默认 Profile 是什么？如何设置？**
@@ -2365,12 +2365,12 @@ public class ConcurrentService {
 
 ## **4. 什么时候需要考虑线程安全？**
 
-|**场景**|**是否需要线程安全？**|**推荐方案**|
-|---|---|---|
-|**Controller 层**（`@Controller`）|❌ 无需线程安全|Spring MVC 处理请求是无状态的|
-|**Service 层**（`@Service`）|⭕ 需要视情况而定|1. 使用 `ThreadLocal`2. 避免实例变量|
-|**Repository 层**（`@Repository`）|❌ 无需线程安全|Spring Data JPA/Hibernate 本身线程安全|
-|**存储共享数据的 Bean**|✅ 需要线程安全|1. `ConcurrentHashMap`2. `synchronized`|
+| **场景**                           | **是否需要线程安全？** | **推荐方案**                            |
+| ---------------------------------- | ---------------------- | --------------------------------------- |
+| **Controller 层**（`@Controller`） | ❌ 无需线程安全         | Spring MVC 处理请求是无状态的           |
+| **Service 层**（`@Service`）       | ⭕ 需要视情况而定       | 1. 使用 `ThreadLocal`2. 避免实例变量    |
+| **Repository 层**（`@Repository`） | ❌ 无需线程安全         | Spring Data JPA/Hibernate 本身线程安全  |
+| **存储共享数据的 Bean**            | ✅ 需要线程安全         | 1. `ConcurrentHashMap`2. `synchronized` |
 
 ---
 
@@ -2406,17 +2406,17 @@ Bean 创建时（通过 BeanPostProcessor）扫描 @Transactional
 
 ---
 
-| **事务失效场景**                    | **原因**                                                                                                                          | **解决方案**                                                                                                                                   |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| **（1）自调用问题（this.method()）**   | Spring 事务基于代理，如果在同一个类中调用事务方法，代理不会生效。                                                                                            | 1. 通过 `AopContext.currentProxy()` 调用代理对象。2. 使用 `ApplicationContext.getBean()` 获取代理对象。                                                      |
-| **（2）非 public 方法**            | Spring AOP 代理 **只会拦截 public 方法**，非 `public` 方法不会被代理。CGLIB 使用字节码生成一个**子类**来“重写”目标类的方法，private、final方法无法被子类覆盖                     | 1. 确保事务方法是 `public` 修饰的。                                                                                                                   |
-| **（3）异常未被捕获**                 | 事务只对 **运行时异常（RuntimeException）或 Error** 生效，**CheckedException 不会触发回滚**。- CheckedException 通常表示“外部问题” → 比如文件找不到、远程调用失败，不一定代表业务失败 | 1. 手动抛出 `RuntimeException`（throw new RuntimeException(new IOException())）。2. 使用 `rollbackFor = Exception.class` 让 `@Transactional` 回滚所有异常。 |
-| **（4）事务方法被 final`修饰**         | CGLIB 代理模式下，`final` 方法无法被子类重写，因此事务不会生效。                                                                                         | **移除 final 修饰符**，让 Spring 能够动态代理该方法。                                                                                                       |
-| **（5）事务管理器没有正确配置**            | 事务管理器可能没有正确配置，如使用 `@Transactional` 但 `DataSourceTransactionManager` 没有生效。                                                       | 1. 确保 `@EnableTransactionManagement` 生效。2. 检查 `@Transactional` 是否正确标注在类或方法上。                                                               |
-| **（6）不同的 TransactionManager** | 事务方法 A 使用 `DataSourceTransactionManager`，事务方法 B 使用 `JpaTransactionManager`，事务不会共用。                                              | 确保所有相关事务使用相同的 `TransactionManager`。                                                                                                        |
-| **（7）多线程导致事务失效**              | Spring 事务是 **线程绑定的**，但如果事务方法在 **新线程** 中执行，事务上下文不会传播。                                                                            | 1. **使用 @TransactionalEventListener 监听异步任务**。2. **避免在事务方法中使用 @Async**。                                                                     |
-| **（8）@Transactional标注在接口上**   | 如果使用 **JDK 代理**，Spring 只代理接口方法，而 `@Transactional` 只能在 **实现类的方法** 上生效。                                                           | 1. **将 @Transactional标注在实现类的方法上**。                                                                                                         |
-| **（9）嵌套事务的 Propagation`设置**   | `@Transactional(propagation = Propagation.REQUIRES_NEW)` 会开启新事务，与外部事务无关，可能导致回滚失效。                                               | 1. **使用 Propagation.REQUIRED保证事务嵌套**。2. **根据业务需求正确选择事务传播方式**。                                                                              |
+| **事务失效场景**                     | **原因**                                                                                                                                                                              | **解决方案**                                                                                                                                                |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **（1）自调用问题（this.method()）** | Spring 事务基于代理，如果在同一个类中调用事务方法，代理不会生效。                                                                                                                     | 1. 通过 `AopContext.currentProxy()` 调用代理对象。2. 使用 `ApplicationContext.getBean()` 获取代理对象。                                                     |
+| **（2）非 public 方法**              | Spring AOP 代理 **只会拦截 public 方法**，非 `public` 方法不会被代理。CGLIB 使用字节码生成一个**子类**来“重写”目标类的方法，private、final方法无法被子类覆盖                          | 1. 确保事务方法是 `public` 修饰的。                                                                                                                         |
+| **（3）异常未被捕获**                | 事务只对 **运行时异常（RuntimeException）或 Error** 生效，**CheckedException 不会触发回滚**。- CheckedException 通常表示“外部问题” → 比如文件找不到、远程调用失败，不一定代表业务失败 | 1. 手动抛出 `RuntimeException`（throw new RuntimeException(new IOException())）。2. 使用 `rollbackFor = Exception.class` 让 `@Transactional` 回滚所有异常。 |
+| **（4）事务方法被 final`修饰**       | CGLIB 代理模式下，`final` 方法无法被子类重写，因此事务不会生效。                                                                                                                      | **移除 final 修饰符**，让 Spring 能够动态代理该方法。                                                                                                       |
+| **（5）事务管理器没有正确配置**      | 事务管理器可能没有正确配置，如使用 `@Transactional` 但 `DataSourceTransactionManager` 没有生效。                                                                                      | 1. 确保 `@EnableTransactionManagement` 生效。2. 检查 `@Transactional` 是否正确标注在类或方法上。                                                            |
+| **（6）不同的 TransactionManager**   | 事务方法 A 使用 `DataSourceTransactionManager`，事务方法 B 使用 `JpaTransactionManager`，事务不会共用。                                                                               | 确保所有相关事务使用相同的 `TransactionManager`。                                                                                                           |
+| **（7）多线程导致事务失效**          | Spring 事务是 **线程绑定的**，但如果事务方法在 **新线程** 中执行，事务上下文不会传播。                                                                                                | 1. **使用 @TransactionalEventListener 监听异步任务**。2. **避免在事务方法中使用 @Async**。                                                                  |
+| **（8）@Transactional标注在接口上**  | 如果使用 **JDK 代理**，Spring 只代理接口方法，而 `@Transactional` 只能在 **实现类的方法** 上生效。                                                                                    | 1. **将 @Transactional标注在实现类的方法上**。                                                                                                              |
+| **（9）嵌套事务的 Propagation`设置** | `@Transactional(propagation = Propagation.REQUIRES_NEW)` 会开启新事务，与外部事务无关，可能导致回滚失效。                                                                             | 1. **使用 Propagation.REQUIRED保证事务嵌套**。2. **根据业务需求正确选择事务传播方式**。                                                                     |
 
 ---
 
@@ -2608,12 +2608,12 @@ logging.level.org.springframework.jdbc.datasource.DataSourceTransactionManager=D
 
 ### **4. 结论**
 
-|**事务失效场景**|**原因**|**解决方案**|
-|---|---|---|
-|`this.method()` 调用事务方法|代理失效|使用 `AopContext.currentProxy()` 获取代理对象|
-|`private` 方法|AOP 只拦截 `public` 方法|改成 `public` 方法|
-|`CheckedException` 不回滚|Spring 只回滚 `RuntimeException`|`rollbackFor = Exception.class`|
-|`@Async` 事务失效|事务上下文不能跨线程|避免 `@Async`，或手动管理事务|
+| **事务失效场景**             | **原因**                         | **解决方案**                                  |
+| ---------------------------- | -------------------------------- | --------------------------------------------- |
+| `this.method()` 调用事务方法 | 代理失效                         | 使用 `AopContext.currentProxy()` 获取代理对象 |
+| `private` 方法               | AOP 只拦截 `public` 方法         | 改成 `public` 方法                            |
+| `CheckedException` 不回滚    | Spring 只回滚 `RuntimeException` | `rollbackFor = Exception.class`               |
+| `@Async` 事务失效            | 事务上下文不能跨线程             | 避免 `@Async`，或手动管理事务                 |
 
 如果你在项目中遇到事务失效的问题，可以按照这些步骤进行 Debug 和优化！ 🚀
 
@@ -2836,13 +2836,13 @@ Spring 可能会 **使用 CGLIB 子类代理 `PaymentService`**，然后调用�
 
 ## **6. 总结**
 
-|**场景**|**Spring 选择的构造方法**|
-|---|---|
-|只有一个构造方法|直接使用该构造方法|
-|有 `@Autowired` 的构造方法|**优先使用 `@Autowired`** 标注的方法|
-|没有 `@Autowired`，多个构造方法|**Spring 5 之后选择参数最多的构造方法**|
-|有 `@Bean` 配置方法|按参数最多的构造方法进行推断|
-|**CGLIB 代理（事务等）**|可能调用代理类构造方法|
+| **场景**                        | **Spring 选择的构造方法**               |
+| ------------------------------- | --------------------------------------- |
+| 只有一个构造方法                | 直接使用该构造方法                      |
+| 有 `@Autowired` 的构造方法      | **优先使用 `@Autowired`** 标注的方法    |
+| 没有 `@Autowired`，多个构造方法 | **Spring 5 之后选择参数最多的构造方法** |
+| 有 `@Bean` 配置方法             | 按参数最多的构造方法进行推断            |
+| **CGLIB 代理（事务等）**        | 可能调用代理类构造方法                  |
 
 ### **最佳实践**
 
@@ -3179,11 +3179,11 @@ public class UserServiceTest {
 
 ## **4. 结论**
 
-|**注入方式**|**优点**|**缺点**|**推荐度**|
-|---|---|---|---|
-|**字段注入**|代码简单，少写构造方法|不支持 `final`，难测试，违反封装|❌ 不推荐|
-|**Setter 注入**|适用于可选依赖|依赖可以随时更改，风险高|🟡 适用于少数情况|
-|**构造器注入**|线程安全，可测试，强制依赖注入|代码稍多|✅ 强烈推荐|
+| **注入方式**    | **优点**                       | **缺点**                         | **推荐度**       |
+| --------------- | ------------------------------ | -------------------------------- | ---------------- |
+| **字段注入**    | 代码简单，少写构造方法         | 不支持 `final`，难测试，违反封装 | ❌ 不推荐         |
+| **Setter 注入** | 适用于可选依赖                 | 依赖可以随时更改，风险高         | 🟡 适用于少数情况 |
+| **构造器注入**  | 线程安全，可测试，强制依赖注入 | 代码稍多                         | ✅ 强烈推荐       |
 
 ✅ **最佳实践**：**使用构造器注入，避免字段注入！** 🚀
 
