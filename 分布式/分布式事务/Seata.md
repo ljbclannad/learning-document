@@ -24,7 +24,7 @@ Seata 采用 **TC（事务协调者）、TM（事务管理者）、RM（资源�
 
 ## 1.2 Seata 事务流程流程
 
-假设 **订单服务（order-service）** 需要调用 **库存服务（stock-service）** 和 **支付服务（pay-service）**，并保证事务一致性，Seata 事务的执行流程如下：
+假设 **订单服务（order-service）** 需要调用 **库存服务（stock-serv  ice）** 和 **支付服务（pay-service）**，并保证事务一致性，Seata 事务的执行流程如下：
 1. **TM 向 TC 申请开启全局事务**：
     - `order-service` 作为事务发起者（TM），向 Seata Server（TC）注册一个全局事务，TC 生成全局事务 ID。
 2. **RM 向 TC 注册分支事务**：
