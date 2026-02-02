@@ -1,5 +1,3 @@
-[TOC]
-
 
 # 1. 网关到底是什么？和反向代理 / Ingress / Service Mesh 有啥区别？
 
