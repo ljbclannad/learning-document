@@ -9,6 +9,8 @@
 6. [RabbitMQ保证消息不丢失](#6-RabbitMQ保证消息不丢失)
 7. [延迟队列](#7-延迟队列)
 8. [消息堆积](#8-消息堆积)
+9. [死信队列的目的及使用场景](#9-死信队列的目的及使用场景)
+10. [死信队列代码](#10-死信队列代码)
 
 # 1. 概念及使用场景
 RabbitMQ 是一个开源的消息代理软件，使用高级消息队列协议（AMQP）进行消息传递。它允许应用程序通过异步通信和消息队列解耦，从而提高系统的可伸缩性和可靠性。
@@ -578,3 +580,491 @@ RabbitMQ 提供了 **Publisher Confirms** 模式，确保消息从生产者成�
 | 拆分队列              | 高优先级业务   | 提高关键任务响应速度 |
 | 生产端限流            | 生产速度过快   | 控制流量进入队列     |
 | 批量消费              | 单条消息处理快 | 减少 IO 开销         |
+
+# 9. 死信队列的目的及使用场景
+
+## 9.1 为什么一定要进死信？（工程上的硬理由）
+
+### 9.1.1 防止“无限重试风暴”把系统打爆
+
+最常见事故：代码里 `basicNack(requeue=true)` 写在所有异常分支。
+结果就是：
+
+* 同一条消息瞬间重复投递 → CPU/日志/DB 被刷爆
+* 队列堆积越来越大，**有效消息也被挤死**
+* 依赖服务被打到雪崩（级联故障）
+
+**DLQ 让失败消息“有上限地重试”，超过阈值就隔离**，主队列恢复健康吞吐。
+
+### 9.1.2 处理“短暂失败 vs 永久失败”的分流
+
+失败大致两类：
+
+* **暂时性失败**：网络抖动、下游超时、短时间限流 → 适合延迟重试（retry queue）
+* **永久性失败**：数据不合法、业务规则不满足、版本不兼容、缺少必要数据 → 重试 100 次也没用
+
+DLQ 是“判定为永久失败（或超出重试预算）”后的**最终归宿**，避免无意义重试。
+
+### 9.1.3 让“最终一致”闭环：可观测 + 可回放 + 可审计
+
+没有 DLQ，你只剩两种烂选择：
+
+* 一直重试到天荒地老（拖垮系统）
+* 直接丢弃（数据悄悄不一致，后续靠运气）
+
+DLQ 的价值在于：
+
+* **可观测**：DLQ 增长=明确告警信号
+* **可追踪**：能拿到 payload、headers、异常堆栈、重试次数
+* **可回放**：修复后重放，保证最终一致
+* **可审计**：你能解释“为什么失败、谁处理过、何时恢复”
+
+---
+
+## 9.2 什么情况下应该进死信？（明确触发条件）
+
+### 9.2.1 重试次数/时间预算耗尽
+
+比如：
+
+* 同一条消息已重试 10 次
+* 或者从首次消费开始超过 30 分钟还没成功（**时间窗口**往往比次数更可靠）
+
+### 9.2.2 明确的“不可重试”错误（Non-Retriable）
+
+典型：
+
+* 参数校验失败（缺字段、格式错）
+* 业务状态不允许（订单已取消却重复发货）
+* 幂等冲突且无法自动解决（比如冲正需要人工确认）
+* 版本不兼容（schema 变更未兼容）
+
+工程做法：给异常打标签，例如 `NonRetryableException`，直接进 DLQ。
+
+### 9.2.3 下游依赖长期不可用且已触发熔断
+
+当你发现下游服务处于熔断状态，继续重试只会扩大故障面。
+策略：快速把消息送入“延迟重试队列”，再不行进入 DLQ，等待恢复后回放。
+
+---
+
+## 9.3 DLQ 到底该怎么“用起来”？（不是只建个队列）
+
+### 9.3.1 DLQ 里必须带足“排障字段”
+
+建议至少：
+
+* `event_id / msg_id`（全局唯一）
+* `traceId / requestId`
+* `producer_service / consumer_service / topic / routingKey`
+* `retry_count`
+* `last_error_code / last_error_msg`（不要只放堆栈）
+* `first_seen_at / last_seen_at`
+
+否则你面对 DLQ 就像面对一堆“无名尸体”，查不动。
+
+### 9.3.2 配套三件事：告警、管理台、回放按钮
+
+* **告警**：DLQ 新增速率、DLQ 堆积量、最老消息年龄
+* **管理台/脚本**：
+
+  * 按 `event_id` 搜索
+  * 查看 payload / headers / 错误原因
+  * 选择“修复后回放 / 丢弃并记录原因 / 人工补偿”
+* **回放要幂等**：不然回放=重复扣款/重复发货起飞
+
+### 9.3.3 回放的两种姿势
+
+* **重新投递到原队列**（最常见）
+* **走补偿通道**（比如触发一条“修复指令”消息，执行补数据/冲正）
+
+---
+
+## 9.4 和 BASE 的关系：DLQ 是“最终一致”的安全阀
+
+BASE 体系里你默认接受“短期不一致”，但你必须保证：
+
+* 不一致能被发现（可观测/对账）
+* 不一致能被修复（补偿/回放）
+* 修复不会把系统拖死（隔离失败消息）
+
+DLQ 就是这三点的关键支点之一。
+
+---
+
+## 9.5 小结
+
+* **DLQ 的目的：隔离不可控失败，保护主链路，保留证据，提供修复入口。**
+* **没有 DLQ 的系统：要么被重试风暴拖死，要么悄悄数据错账。**
+* 真正“生产级”的 DLQ 必须配套：**明确不可重试规则 + 重试预算 + 告警 + 可查询 + 可回放 + 幂等**。
+
+# 10. 死信队列代码
+
+下面把你这套 **RabbitMQ 死信 + 延迟重试** 代码升级成 **“最多重试 5 次（上线 5 次）”** 的版本，并且把“每次重试的延迟梯度”固定下来，便于你压测、观测、SLA 解释。
+
+我给的默认重试梯度（你可按业务调整）：
+
+* 第 1 次：10s
+* 第 2 次：30s
+* 第 3 次：2m
+* 第 4 次：5m
+* 第 5 次：10m
+* 仍失败：进 DLQ
+
+> 仍然坚持：**不使用 requeue 重投**，全部走延迟队列（TTL + DLX）避免消息风暴。
+
+---
+
+## 1）升级版拓扑（5 级重试 + DLQ）
+
+* 主交换机：`biz.order.x`
+* 主队列：`biz.order.q`
+* 重试交换机：`biz.order.retry.x`
+* 重试队列（5 个）：
+
+  * `biz.order.retry.10s.q`  TTL 10s
+  * `biz.order.retry.30s.q`  TTL 30s
+  * `biz.order.retry.2m.q`   TTL 2m
+  * `biz.order.retry.5m.q`   TTL 5m
+  * `biz.order.retry.10m.q`  TTL 10m
+    （全部到期后 DLX 回 `biz.order.x` + `order.created`）
+* 死信交换机：`biz.order.dlq.x`
+* 死信队列：`biz.order.dlq.q`
+
+---
+
+## 2）Rabbit 配置（application.yml）
+
+```yaml
+spring:
+  rabbitmq:
+    host: 127.0.0.1
+    port: 5672
+    username: guest
+    password: guest
+
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
+
+    listener:
+      simple:
+        acknowledge-mode: manual
+        prefetch: 50
+        default-requeue-rejected: false  # 关键：异常默认不requeue
+```
+
+---
+
+## 3）队列/交换机声明（5 级重试版）
+
+```java
+import org.springframework.amqp.core.*;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.util.Map;
+
+@Configuration
+public class RabbitDlqConfig {
+
+    public static final String MAIN_EXCHANGE = "biz.order.x";
+    public static final String MAIN_QUEUE = "biz.order.q";
+    public static final String MAIN_RK = "order.created";
+
+    public static final String RETRY_EXCHANGE = "biz.order.retry.x";
+
+    public static final String RETRY_10S_QUEUE = "biz.order.retry.10s.q";
+    public static final String RETRY_30S_QUEUE = "biz.order.retry.30s.q";
+    public static final String RETRY_2M_QUEUE  = "biz.order.retry.2m.q";
+    public static final String RETRY_5M_QUEUE  = "biz.order.retry.5m.q";
+    public static final String RETRY_10M_QUEUE = "biz.order.retry.10m.q";
+
+    public static final String RETRY_10S_RK = "order.created.retry.10s";
+    public static final String RETRY_30S_RK = "order.created.retry.30s";
+    public static final String RETRY_2M_RK  = "order.created.retry.2m";
+    public static final String RETRY_5M_RK  = "order.created.retry.5m";
+    public static final String RETRY_10M_RK = "order.created.retry.10m";
+
+    public static final String DLQ_EXCHANGE = "biz.order.dlq.x";
+    public static final String DLQ_QUEUE = "biz.order.dlq.q";
+    public static final String DLQ_RK = "order.created.dlq";
+
+    @Bean
+    public DirectExchange mainExchange() { return new DirectExchange(MAIN_EXCHANGE, true, false); }
+
+    @Bean
+    public DirectExchange retryExchange() { return new DirectExchange(RETRY_EXCHANGE, true, false); }
+
+    @Bean
+    public DirectExchange dlqExchange() { return new DirectExchange(DLQ_EXCHANGE, true, false); }
+
+    @Bean
+    public Queue mainQueue() {
+        return QueueBuilder.durable(MAIN_QUEUE).build();
+    }
+
+    @Bean
+    public Binding mainBinding() {
+        return BindingBuilder.bind(mainQueue()).to(mainExchange()).with(MAIN_RK);
+    }
+
+    private Queue retryQueue(String name, int ttlMillis) {
+        return QueueBuilder.durable(name)
+                .withArguments(Map.of(
+                        "x-message-ttl", ttlMillis,
+                        "x-dead-letter-exchange", MAIN_EXCHANGE,
+                        "x-dead-letter-routing-key", MAIN_RK
+                ))
+                .build();
+    }
+
+    @Bean public Queue retry10sQueue() { return retryQueue(RETRY_10S_QUEUE, 10_000); }
+    @Bean public Queue retry30sQueue() { return retryQueue(RETRY_30S_QUEUE, 30_000); }
+    @Bean public Queue retry2mQueue()  { return retryQueue(RETRY_2M_QUEUE,  120_000); }
+    @Bean public Queue retry5mQueue()  { return retryQueue(RETRY_5M_QUEUE,  300_000); }
+    @Bean public Queue retry10mQueue() { return retryQueue(RETRY_10M_QUEUE, 600_000); }
+
+    @Bean public Binding retry10sBinding() { return BindingBuilder.bind(retry10sQueue()).to(retryExchange()).with(RETRY_10S_RK); }
+    @Bean public Binding retry30sBinding() { return BindingBuilder.bind(retry30sQueue()).to(retryExchange()).with(RETRY_30S_RK); }
+    @Bean public Binding retry2mBinding()  { return BindingBuilder.bind(retry2mQueue()).to(retryExchange()).with(RETRY_2M_RK); }
+    @Bean public Binding retry5mBinding()  { return BindingBuilder.bind(retry5mQueue()).to(retryExchange()).with(RETRY_5M_RK); }
+    @Bean public Binding retry10mBinding() { return BindingBuilder.bind(retry10mQueue()).to(retryExchange()).with(RETRY_10M_RK); }
+
+    @Bean
+    public Queue dlqQueue() { return QueueBuilder.durable(DLQ_QUEUE).build(); }
+
+    @Bean
+    public Binding dlqBinding() {
+        return BindingBuilder.bind(dlqQueue()).to(dlqExchange()).with(DLQ_RK);
+    }
+}
+```
+
+---
+
+## 4）消费者（最多重试 5 次，失败转延迟队列，否则入 DLQ）
+
+重点升级点：
+
+* `MAX_RETRY = 5`
+* 失败时 `nextAttempt = retryCount + 1`，`nextAttempt > 5` 就 DLQ
+* **先 publish 到 retry/DLQ 并 confirm，再 ack 原消息**（尽量不丢）
+* 给消息补上 `x_last_error`、`x_failed_at` 便于排障
+
+```java
+import com.rabbitmq.client.Channel;
+import org.springframework.amqp.core.Message;
+import org.springframework.amqp.core.MessageBuilder;
+import org.springframework.amqp.rabbit.connection.CorrelationData;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.stereotype.Component;
+
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+
+import static your.pkg.RabbitDlqConfig.*;
+
+@Component
+public class OrderCreatedConsumer {
+
+    private static final int MAX_RETRY = 5;
+
+    private final RabbitTemplate rabbitTemplate;
+
+    public OrderCreatedConsumer(RabbitTemplate rabbitTemplate) {
+        this.rabbitTemplate = rabbitTemplate;
+    }
+
+    @RabbitListener(queues = MAIN_QUEUE)
+    public void onMessage(Message message, Channel channel) throws Exception {
+        long tag = message.getMessageProperties().getDeliveryTag();
+
+        String eventId = headerStr(message, "event_id");
+        if (eventId == null || eventId.isBlank()) {
+            // 没有event_id=无法追踪&幂等，直接DLQ（也可以生成一个）
+            eventId = UUID.randomUUID().toString();
+        }
+
+        int retryCount = headerInt(message, "x_retry_count", 0);
+
+        try {
+            // ===== 你的业务处理（落库/调用下游等）=====
+            handleBusiness(message);
+
+            channel.basicAck(tag, false);
+
+        } catch (NonRetryableException nre) {
+            // 不可重试：直接DLQ
+            publishToDlqAndAckOriginal(message, nre, channel, tag, eventId, retryCount);
+
+        } catch (Exception ex) {
+            int nextAttempt = retryCount + 1;
+
+            if (nextAttempt > MAX_RETRY) {
+                publishToDlqAndAckOriginal(message, ex, channel, tag, eventId, retryCount);
+                return;
+            }
+
+            String retryRoutingKey = chooseRetryRoutingKey(nextAttempt);
+
+            Message retryMsg = rebuildForRetry(message, nextAttempt, ex);
+
+            boolean published = publishWithConfirm(
+                    RETRY_EXCHANGE,
+                    retryRoutingKey,
+                    retryMsg,
+                    new CorrelationData(eventId + "#retry#" + nextAttempt)
+            );
+
+            if (published) {
+                // 已安全转移到延迟队列，ACK原消息，避免requeue风暴
+                channel.basicAck(tag, false);
+            } else {
+                // 连重试队列都投递失败：不requeue，直接DLQ隔离并告警更稳
+                publishToDlqAndAckOriginal(message, ex, channel, tag, eventId, retryCount);
+            }
+        }
+    }
+
+    private void handleBusiness(Message message) {
+        String body = new String(message.getBody(), StandardCharsets.UTF_8);
+        // TODO: 真实业务逻辑
+        // throw new RuntimeException("downstream timeout");
+    }
+
+    private String chooseRetryRoutingKey(int attempt) {
+        return switch (attempt) {
+            case 1 -> RETRY_10S_RK;
+            case 2 -> RETRY_30S_RK;
+            case 3 -> RETRY_2M_RK;
+            case 4 -> RETRY_5M_RK;
+            case 5 -> RETRY_10M_RK;
+            default -> RETRY_10M_RK; // 理论上不会走到
+        };
+    }
+
+    private Message rebuildForRetry(Message origin, int newRetryCount, Exception ex) {
+        return MessageBuilder.withBody(origin.getBody())
+                .copyHeaders(origin.getMessageProperties().getHeaders())
+                // 你走自定义x_retry_count就够了，Rabbit的x-death头可清理避免越堆越大（可选）
+                .removeHeader("x-death")
+                .removeHeader("x-first-death-exchange")
+                .removeHeader("x-first-death-queue")
+                .removeHeader("x-first-death-reason")
+                .setHeader("x_retry_count", newRetryCount)
+                .setHeader("x_failed_at", Instant.now().toString())
+                .setHeader("x_last_error", ex.getClass().getSimpleName() + ":" + safeMsg(ex.getMessage()))
+                .build();
+    }
+
+    private void publishToDlqAndAckOriginal(
+            Message origin, Exception ex, Channel channel, long tag, String eventId, int retryCount) throws Exception {
+
+        Message dlqMsg = MessageBuilder.withBody(origin.getBody())
+                .copyHeaders(origin.getMessageProperties().getHeaders())
+                .setHeader("event_id", eventId)
+                .setHeader("x_retry_count", retryCount)
+                .setHeader("x_failed_at", Instant.now().toString())
+                .setHeader("x_last_error", ex.getClass().getSimpleName() + ":" + safeMsg(ex.getMessage()))
+                .build();
+
+        // 尽力投递DLQ；失败也要ACK原消息，避免主队列无限翻滚（靠告警+人工介入）
+        publishWithConfirm(
+                DLQ_EXCHANGE,
+                DLQ_RK,
+                dlqMsg,
+                new CorrelationData(eventId + "#dlq")
+        );
+
+        channel.basicAck(tag, false);
+    }
+
+    private boolean publishWithConfirm(String exchange, String routingKey, Message msg, CorrelationData cd) {
+        try {
+            rabbitTemplate.send(exchange, routingKey, msg, cd);
+            CorrelationData.Confirm confirm = cd.getFuture().get(3, TimeUnit.SECONDS);
+            return confirm.isAck();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private String headerStr(Message msg, String key) {
+        Object v = msg.getMessageProperties().getHeaders().get(key);
+        return v == null ? null : String.valueOf(v);
+    }
+
+    private int headerInt(Message msg, String key, int def) {
+        Object v = msg.getMessageProperties().getHeaders().get(key);
+        if (v instanceof Integer i) return i;
+        if (v instanceof Long l) return l.intValue();
+        if (v instanceof String s) {
+            try { return Integer.parseInt(s); } catch (Exception ignore) {}
+        }
+        return def;
+    }
+
+    private String safeMsg(String s) {
+        if (s == null) return "";
+        return s.length() > 300 ? s.substring(0, 300) : s;
+    }
+
+    /** 明确不可重试：参数不合法/业务状态冲突/版本不兼容等 */
+    public static class NonRetryableException extends RuntimeException {
+        public NonRetryableException(String message) { super(message); }
+    }
+}
+```
+
+---
+
+## 5）DLQ 消费者（建议：落库 + 告警 + 回放）
+
+```java
+import com.rabbitmq.client.Channel;
+import org.springframework.amqp.core.Message;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.stereotype.Component;
+
+import static your.pkg.RabbitDlqConfig.DLQ_QUEUE;
+
+@Component
+public class OrderDlqConsumer {
+
+    @RabbitListener(queues = DLQ_QUEUE)
+    public void onDlq(Message message, Channel channel) throws Exception {
+        long tag = message.getMessageProperties().getDeliveryTag();
+        try {
+            // TODO：落库（event_id、payload、headers、x_last_error、x_retry_count、时间）
+            // TODO：告警（DLQ增长速率、堆积量、最老消息年龄）
+            channel.basicAck(tag, false);
+        } catch (Exception ex) {
+            // DLQ 再失败：一般允许 requeue=true（压力小），但要有告警防止死循环
+            channel.basicNack(tag, false, true);
+        }
+    }
+}
+```
+
+---
+
+## 6）上线级注意事项（你真会在生产遇到）
+
+1. **重试次数=5 不等于最终一致窗口=固定**
+   因为队列堆积时实际延迟会更长。建议加监控：`最老未处理消息年龄`（lag）。
+
+2. **不可重试异常要“白名单化”**
+   建议你在业务里把错误分成两类：
+
+* `NonRetryableException`：直接 DLQ
+* 其他：走 1~5 次重试
+  否则“数据本来就错”的消息会把重试资源浪费掉。
+
+3. **极致不丢：Outbox 仍是上限解**
+   这里用 publish confirm 已经尽量降低丢失概率，但如果你要“写库成功=事件必达”，最终还是 Outbox 更硬。
+
