@@ -108,7 +108,7 @@ protected Object getSingleton(String beanName, boolean allowEarlyReference) {
 }
 ```
 
-### 1. 三级缓存的概念
+## 1. 三级缓存的概念
 
 Spring的三级缓存主要包括：
 
@@ -116,9 +116,9 @@ Spring的三级缓存主要包括：
 - **二级缓存**：即`earlySingletonObjects`，存储早期引用的单例Bean（未完全初始化）。
 - **三级缓存**：即`singletonFactories`，存储`ObjectFactory`的引用，用于创建Bean的早期引用。(使用`HashMap`，其他使用的为`ConcurrentHashMap`，原因为三级缓存使用时是被synchronized包围)
 
-### 2. 缓存机制详解
+## 2. 缓存机制详解
 
-#### 1) 创建Bean的流程
+### 1) 创建Bean的流程
 
 当请求一个单例Bean时，Spring的处理流程如下：
 
@@ -139,16 +139,130 @@ Spring的三级缓存主要包括：
 5. **完成初始化**：
    - 一旦所有依赖注入完成，Bean会被完全初始化，并放入一级缓存`singletonObjects`中。
 
-#### 2) 解决循环依赖
+### 2) 解决循环依赖
 
 通过三级缓存，Spring能够在创建Bean时允许依赖注入的部分进行引用，从而解决单例Bean的循环依赖问题。
 
-### 3. 注意事项
+## 3. 注意事项
 
 - **仅适用于单例Bean**：三级缓存机制只对单例Bean有效，原型Bean无法解决循环依赖。
 - **可能引入不完整的状态**：使用三级缓存可能导致某些Bean在未完全初始化时被引用，因此要谨慎使用，避免引入不一致的状态。
 
-### 4. 总结
+## 4.  重复读取2次的原因
+
+这段代码里 **“同一个 Map get 两遍”**不是手滑，而是一个非常典型的并发套路：**先无锁快速读（fast path），再在加锁后做一次“确认读”（double-check）**，用来同时满足 **性能** 和 **正确性**。
+
+Spring 的单例缓存又是“三层结构”（一级 singletonObjects、二级 earlySingletonObjects、三级 singletonFactories），所以锁外/锁内都要分别再查一次，避免在你抢锁的这段时间里，别的线程已经把对象放进缓存，导致你重复创建早期引用/重复升级缓存，甚至把生命周期搞乱。
+
+---
+
+### **1）为什么**  **singletonObjects.get(beanName)** **要查两遍？**
+
+#### **1.1 第一次：无锁快路径，省性能**
+
+```
+Object singletonObject = this.singletonObjects.get(beanName);
+```
+
+绝大多数情况下（Bean 已创建完成），直接从一级缓存拿到最终单例就返回。
+
+如果这里就加锁，会导致所有单例读取都竞争同一把锁（synchronized (this.singletonObjects)），启动期/高并发获取 Bean 时非常伤。
+#### **1.2 第二次：加锁后的“确认读”，保证正确性（Double-Check）**
+
+``` java
+synchronized (this.singletonObjects) {
+  singletonObject = this.singletonObjects.get(beanName);
+  ...
+}
+```
+
+原因：**在你第一次无锁读到 null 到你进入 synchronized 之间，有时间窗口**。
+
+别的线程可能已经完成了创建并把最终对象放进了 singletonObjects（一级缓存）。
+
+如果你不在锁内再读一次，你会继续走“早期引用/工厂创建”逻辑，产生两个问题：
+
+- **重复创建早期引用**：明明已经有最终对象了，你却又从 singletonFactory.getObject() 造一个 early reference（可能是代理对象），会造成“同名 Bean 出现多个不同实例引用”的风险。
+    
+- **破坏缓存升级顺序**：正常顺序是 singletonFactories → earlySingletonObjects → singletonObjects。别人已经升级到一级了，你这边还在从三级/二级折腾，会让状态机混乱（尤其是 AOP 提前暴露代理那种场景）。
+    
+
+所以锁内第二次读，是为了“以锁为边界”确认当前权威状态。
+
+---
+
+### **2）为什么**  **earlySingletonObjects.get(beanName)** **也要查两遍？**
+
+同理，但这里更关键，因为 **early 引用的创建本身有副作用**（会触发 singletonFactory.getObject()）。
+#### **2.1 第一次：无锁快路径**
+
+```
+singletonObject = this.earlySingletonObjects.get(beanName);
+```
+
+如果正在创建中（isSingletonCurrentlyInCreation），优先从二级缓存拿 early bean（解决循环依赖的核心）。无锁读取性能好。
+#### **2.2 第二次：锁内确认，避免重复“从三级工厂生成早期引用”**
+
+``` java
+synchronized (this.singletonObjects) {
+  singletonObject = this.earlySingletonObjects.get(beanName);
+  if (singletonObject == null) {
+    ObjectFactory<?> singletonFactory = this.singletonFactories.get(beanName);
+    if (singletonFactory != null) {
+      singletonObject = singletonFactory.getObject();
+      this.earlySingletonObjects.put(beanName, singletonObject);
+      this.singletonFactories.remove(beanName);
+    }
+  }
+}
+```
+
+这里必须锁内再读一次 early cache，因为：
+
+- 在你抢锁前，**另一个线程可能已经执行了** **singletonFactory.getObject()**，并把结果放进 earlySingletonObjects 了。
+    
+- singletonFactory.getObject() 可能会创建 **AOP 代理早期引用**（比如 getEarlyBeanReference），这是一次“不可重复且要一致”的动作：
+    
+    你不希望两个线程分别生成两个 early 引用（哪怕都长得像代理，也可能不是同一个对象实例）。
+    
+
+锁内确认读的目的就是：**保证 early 引用只会被提升一次**，且提升过程是原子的（生成 → put 二级 → remove 三级）。
+
+---
+### **3）为什么锁用的是** **singletonObjects** **这个 Map？**
+你会注意到 synchronized 锁的是 this.singletonObjects，但里面同时操作了三张表。原因是 Spring 把这三层缓存当成一个整体状态机：
+- 一级：最终单例
+    
+- 二级：提前暴露的单例引用
+    
+- 三级：提前暴露引用的工厂（用于延迟生成 early reference）
+    
+
+为了保证它们之间的“升级/迁移”一致性，必须用 **同一把全局锁**保护“跨 Map 的复合操作”，否则会出现：
+- 线程 A 把三级移到二级
+    
+- 线程 B 同时把二级移到一级
+    
+    最终导致重复实例或丢失引用。
+    
+---
+### **4）用一个具体竞态场景解释（不二次 get 会怎样）**
+
+假设两个线程 T1/T2 都在拿 bean A（A 正在创建中）：
+
+1. T1：无锁读 singletonObjects 为 null；读 earlySingletonObjects 为 null；准备进锁创建 early
+    
+2. **切换到 T2**：T2 抢到锁，执行 singletonFactory.getObject()，把 early A 放进 earlySingletonObjects，并移除 singletonFactories
+    
+3. 切回 T1：如果 T1 进锁后**不再读 earlySingletonObjects**，它会以为还是 null，然后去拿 singletonFactories.get()（可能已经被移除），要么拿不到导致返回 null，要么在别的实现里造成重复创建/状态错乱
+    
+
+所以锁内第二次读是为了在锁边界内看到“最新一致状态”。
+
+---
+### **5）小结（面试一句话）**
+这段代码两次 get 是典型的 **double-check + 状态机一致性**：第一次无锁读走快路径，避免每次取 Bean 都加锁；如果可能处于创建中，则进入全局锁后再次确认一级/二级缓存状态，避免在并发窗口里被其他线程更新导致重复生成 early reference 或破坏三级→二级→一级的升级过程，从而保证循环依赖场景下的单例一致性与性能。
+## 5. 总结
 
 Spring的三级缓存机制是处理单例Bean循环依赖的重要手段。通过合理利用这个机制，可以增强应用的稳定性，但在设计Bean之间的依赖关系时，仍需尽量避免循环依赖的出现。
 ![[Pasted image 20250305154153.png]]
@@ -509,7 +623,7 @@ Spring Bean 的生命周期是指从 Bean 实例化到销毁的完整过程，�
 
 #### **什么是 DI？**
 
-- DI 是 IOC 的具体实现方法，指的是容器将对象的依赖（通常是其他对象）注入到该对象中，而不是让对象自己主动获取依赖。
+- DI 是 IOC 的具体实现方法，指ta'm的是容器将对象的依赖（通常是其他对象）注入到该对象中，而不是让对象自己主动获取依赖。
 - **目标：** 解耦对象之间的依赖关系，使代码更易于扩展、测试和维护。
 
 ---
@@ -679,13 +793,13 @@ Spring 提供以下三种依赖注入方式：
 
 ### **3. `ApplicationContext` 的主要实现类**
 
-| 实现类                                                 | 描述                                                   |
-| ------------------------------------------------------ | ------------------------------------------------------ |
+| 实现类                                                    | 描述                               |
+| ------------------------------------------------------ | -------------------------------- |
 | **ClassPathXmlApplicationContext**                     | 从类路径下加载 XML 配置文件，适用于传统 XML 配置项目。 |
-| **FileSystemXmlApplicationContext**                    | 从文件系统加载 XML 配置文件。                          |
-| **AnnotationConfigApplicationContext**                 | 支持基于注解的配置类，适用于现代化 Spring 项目。       |
-| **AnnotationConfigServletWebServerApplicationContext** | Spring Boot 默认的 Web 应用容器。                      |
-| **GenericApplicationContext**                          | 通用实现类，可与其他上下文类型结合使用。               |
+| **FileSystemXmlApplicationContext**                    | 从文件系统加载 XML 配置文件。                |
+| **AnnotationConfigApplicationContext**                 | 支持基于注解的配置类，适用于现代化 Spring 项目。     |
+| **AnnotationConfigServletWebServerApplicationContext** | Spring Boot 默认的 Web 应用容器。        |
+| **GenericApplicationContext**                          | 通用实现类，可与其他上下文类型结合使用。             |
 
 ---
 
@@ -3306,3 +3420,237 @@ Spring AOP 的核心就是 **代理模式 + 责任链模式**，通过动态代�
 	为匹配的 Bean 创建代理对象（替换原始对象）
 	        ↓
 	你调用方法 → 实际调用代理 → 触发 TransactionInterceptor → 控制事务
+
+
+
+# 19. **Spring事务原理**
+## 1. Spring 事务到底是什么
+Spring 事务的本质是：Spring 通过 AOP（代理 + 拦截器链）把“开启事务/提交/回滚”的控制逻辑织入到方法调用边界；数据库事务仍由底层数据库实现（如 MySQL InnoDB），Spring 负责正确地获取连接、设置事务属性、在方法前后调用 commit/rollback，并在执行完毕后清理线程上下文与释放连接。核心前提：调用必须经过 Spring 生成的代理对象（Proxy），否则事务不会生效。
+## 2. 核心组件与职责划分（面试必须能说清）
+### 2.1 PlatformTransactionManager（事务管理器：真正干活的人）
+常见实现：DataSourceTransactionManager（JDBC/MyBatis）、JpaTransactionManager（JPA/Hibernate）。职责：getTransaction() 创建或加入事务；commit() 提交；rollback() 回滚。
+### 2.2 TransactionDefinition（事务定义：配置载体）
+由 @Transactional 解析而来：传播行为、隔离级别、超时、只读、回滚规则等。
+### 2.3 TransactionStatus（事务状态：运行态载体）
+记录事务是否新建、是否 rollback-only、是否已完成、是否有保存点（NESTED）等。
+### 2.4 TransactionInterceptor（事务拦截器：AOP 入口）
+围绕目标方法执行“开启/执行/提交/回滚”模板逻辑，并基于回滚规则决策 commit/rollback。
+### 2.5 TransactionSynchronizationManager（线程级上下文：关键）
+基于 ThreadLocal 绑定 Connection/资源与事务同步回调；保证同线程 DAO 共享同一连接与事务。
+## 3. @Transactional 如何从注解变成可执行的事务逻辑
+@EnableTransactionManagement 会注册 TransactionInterceptor 与对应 Advisor（切点 + 通知）；容器启动时自动代理创建器扫描 Advisor，发现 Bean 方法匹配事务切点就创建代理；调用经过代理进入 TransactionInterceptor 执行事务模板。必要条件：Spring 管理的 Bean + 经过代理调用 + 拦截条件满足（常见要求 public）。
+## 4. 一次事务调用的完整执行链路（按时序拆解）
+进入代理→读取事务属性→getTransaction()（创建/加入）→执行目标方法→正常 commit/异常 rollback→清理线程绑定与释放连接→触发事务同步回调（afterCommit/afterCompletion）。
+## 5. 源码骨架 1：TransactionInterceptor / TransactionAspectSupport（事务模板的入口）
+TransactionInterceptor 主要逻辑是调用父类 TransactionAspectSupport 的 invokeWithinTransaction；你面试时讲“事务模板”就指它。
+```java
+public class TransactionInterceptor extends TransactionAspectSupport implements MethodInterceptor {
+  @Override
+  public Object invoke(MethodInvocation invocation) throws Throwable {
+    Class<?> targetClass = (invocation.getThis() != null ? invocation.getThis().getClass() : null);
+    return invokeWithinTransaction(invocation.getMethod(), targetClass, invocation::proceed);
+  }
+}
+public abstract class TransactionAspectSupport {
+  protected Object invokeWithinTransaction(Method method, Class<?> targetClass, InvocationCallback cb) throws Throwable {
+    TransactionAttribute txAttr = getTransactionAttributeSource().getTransactionAttribute(method, targetClass);
+    PlatformTransactionManager tm = determineTransactionManager(txAttr);
+    String joinpointId = method.toGenericString();
+    TransactionInfo txInfo = createTransactionIfNecessary(tm, txAttr, joinpointId);
+    Object retVal;
+    try {
+      retVal = cb.proceedWithInvocation(); // 这里才真正执行你的业务方法
+    } catch (Throwable ex) {
+      completeTransactionAfterThrowing(txInfo, ex); // 根据回滚规则决定 rollback/commit 或标记 rollback-only
+      throw ex;
+    } finally {
+      cleanupTransactionInfo(txInfo); // 恢复 ThreadLocal 上下文
+    }
+    commitTransactionAfterReturning(txInfo); // 正常返回：提交（或因 rollback-only 转回滚/抛 UnexpectedRollbackException）
+    return retVal;
+  }
+}
+````
+
+面试解释点：AOP 层只负责“模板与决策”，真正对 Connection 的操作在事务管理器（PlatformTransactionManager）里完成；rollback-only 可能导致“外层看似成功返回但最终提交失败/转回滚”的现象。
+## **6. 源码骨架 2：AbstractPlatformTransactionManager（传播行为与提交/回滚的总控）**
+Spring 把传播行为、挂起/恢复事务、保存点、同步回调等通用逻辑放在 AbstractPlatformTransactionManager。
+
+```java
+public abstract class AbstractPlatformTransactionManager implements PlatformTransactionManager {
+  @Override
+  public final TransactionStatus getTransaction(TransactionDefinition definition) throws TransactionException {
+    Object transaction = doGetTransaction(); // 子类返回“事务对象”（JDBC 场景通常是 DataSourceTransactionObject）
+    boolean existing = isExistingTransaction(transaction);
+    if (existing) {
+      return handleExistingTransaction(definition, transaction); // REQUIRED/REQUIRES_NEW/NESTED 等在这里分支
+    }
+    if (definition.getPropagationBehavior() == TransactionDefinition.PROPAGATION_MANDATORY) {
+      throw new IllegalTransactionStateException("No existing transaction found for propagation 'mandatory'");
+    }
+    SuspendedResourcesHolder suspended = suspend(null); // 某些场景会先挂起
+    try {
+      DefaultTransactionStatus status = newTransactionStatus(definition, transaction, true, suspended);
+      doBegin(transaction, definition); // 子类真正开启事务（JDBC: setAutoCommit(false) 等）
+      prepareSynchronization(status, definition); // 绑定 ThreadLocal、注册同步回调容器
+      return status;
+    } catch (RuntimeException | Error ex) {
+      resume(null, suspended);
+      throw ex;
+    }
+  }
+  @Override
+  public final void commit(TransactionStatus status) throws TransactionException {
+    DefaultTransactionStatus s = (DefaultTransactionStatus) status;
+    if (s.isCompleted()) throw new IllegalTransactionStateException("Transaction is already completed");
+    if (s.isRollbackOnly()) { // 包含 local/global rollback-only
+      processRollback(s, false);
+      return;
+    }
+    processCommit(s); // 触发 beforeCommit/beforeCompletion → doCommit → afterCommit/afterCompletion
+  }
+  @Override
+  public final void rollback(TransactionStatus status) throws TransactionException {
+    DefaultTransactionStatus s = (DefaultTransactionStatus) status;
+    if (s.isCompleted()) throw new IllegalTransactionStateException("Transaction is already completed");
+    processRollback(s, true); // 触发 beforeCompletion → doRollback → afterCompletion
+  }
+  protected abstract Object doGetTransaction();
+  protected abstract void doBegin(Object transaction, TransactionDefinition definition);
+  protected abstract void doCommit(DefaultTransactionStatus status);
+  protected abstract void doRollback(DefaultTransactionStatus status);
+}
+```
+
+面试解释点：传播行为的“加入/新开/挂起/保存点”是 Spring 控制流；真正数据库层 commit/rollback 仍是 connection.commit/rollback。
+## **7. 源码骨架 3：DataSourceTransactionManager（JDBC/MyBatis 场景最常考）**
+
+JDBC 场景关键是“拿连接、改 autoCommit、设置隔离级别、绑定到线程、用完还原并归还连接池”。
+
+``` java
+public class DataSourceTransactionManager extends AbstractPlatformTransactionManager {
+  @Override
+  protected Object doGetTransaction() {
+    DataSourceTransactionObject txObj = new DataSourceTransactionObject();
+    ConnectionHolder conHolder = (ConnectionHolder) TransactionSynchronizationManager.getResource(dataSource);
+    txObj.setConnectionHolder(conHolder, false);
+    return txObj;
+  }
+  @Override
+  protected void doBegin(Object transaction, TransactionDefinition definition) {
+    DataSourceTransactionObject txObj = (DataSourceTransactionObject) transaction;
+    if (txObj.getConnectionHolder() == null || txObj.getConnectionHolder().isSynchronizedWithTransaction() == false) {
+      Connection con = dataSource.getConnection(); // 来自连接池（如 Hikari）
+      txObj.setConnectionHolder(new ConnectionHolder(con), true);
+    }
+    Connection con = txObj.getConnectionHolder().getConnection();
+    Integer previousIsolation = DataSourceUtils.prepareConnectionForTransaction(con, definition); // 设置隔离级别/只读 hint
+    txObj.setPreviousIsolationLevel(previousIsolation);
+    if (con.getAutoCommit()) {
+      txObj.setMustRestoreAutoCommit(true);
+      con.setAutoCommit(false);
+    }
+    // 某些实现会根据 timeout 设置 statement/query timeout 的辅助配置
+    txObj.getConnectionHolder().setTransactionActive(true);
+    TransactionSynchronizationManager.bindResource(dataSource, txObj.getConnectionHolder()); // 绑定 ThreadLocal
+  }
+  @Override
+  protected void doCommit(DefaultTransactionStatus status) {
+    Connection con = ((DataSourceTransactionObject) status.getTransaction()).getConnectionHolder().getConnection();
+    con.commit();
+  }
+  @Override
+  protected void doRollback(DefaultTransactionStatus status) {
+    Connection con = ((DataSourceTransactionObject) status.getTransaction()).getConnectionHolder().getConnection();
+    con.rollback();
+  }
+  @Override
+  protected void doCleanupAfterCompletion(Object transaction) {
+    DataSourceTransactionObject txObj = (DataSourceTransactionObject) transaction;
+    TransactionSynchronizationManager.unbindResource(dataSource);
+    Connection con = txObj.getConnectionHolder().getConnection();
+    if (txObj.isMustRestoreAutoCommit()) con.setAutoCommit(true);
+    DataSourceUtils.resetConnectionAfterTransaction(con, txObj.getPreviousIsolationLevel());
+    DataSourceUtils.releaseConnection(con, dataSource); // 归还连接池
+    txObj.getConnectionHolder().clear();
+  }
+}
+```
+
+面试解释点：同线程共享连接的关键在 bindResource/unbindResource；事务“吃连接”的根因在于 connection 在事务期间一直被线程绑定不归还连接池。
+## **8. 源码骨架 4：TransactionSynchronizationManager（为什么事务与线程强绑定）**
+
+``` java
+public abstract class TransactionSynchronizationManager {
+  private static final ThreadLocal<Map<Object, Object>> resources = ThreadLocal.withInitial(HashMap::new);
+  private static final ThreadLocal<Boolean> synchronizationActive = new ThreadLocal<>();
+  public static void bindResource(Object key, Object value) {
+    resources.get().put(key, value);
+  }
+  public static Object getResource(Object key) {
+    return resources.get().get(key);
+  }
+  public static Object unbindResource(Object key) {
+    return resources.get().remove(key);
+  }
+  public static void initSynchronization() { synchronizationActive.set(true); }
+  public static void clearSynchronization() { synchronizationActive.remove(); }
+}
+```
+
+面试解释点：同线程事务上下文靠 ThreadLocal；因此跨线程（@Async、线程池、CompletableFuture）默认不会“自动传递事务”，这也是很多生产事故的根源。
+## **9. 生产级示例代码：演示“自调用导致事务失效”与正确改法**
+### **9.1 失效示例（同类 this 调用绕过代理）**
+
+``` java
+@Service
+public class OrderService {
+  public void placeOrder() {
+    // this.createOrder(); // 自调用：绕过代理，@Transactional 不生效
+    createOrder();
+  }
+  @Transactional
+  public void createOrder() {
+    // MyBatis update/insert
+  }
+}
+```
+
+### **9.2 正确改法（抽到独立 Bean，保证经过代理）**
+
+``` java
+@Service
+public class OrderService {
+  @Resource private OrderTxService orderTxService;
+  public void placeOrder() { orderTxService.createOrder(); }
+}
+@Service
+public class OrderTxService {
+  @Transactional
+  public void createOrder() { /* DB ops */ }
+}
+```
+
+## **10. 生产级示例代码：演示“异常被吞导致不回滚”与兜底**
+
+``` java
+@Service
+public class PaymentService {
+  @Transactional(rollbackFor = Exception.class)
+  public void pay() throws Exception {
+    try {
+      // 1) 扣款 2) 记账
+      throw new Exception("checked ex");
+    } catch (Exception e) {
+      // 只记录不抛：会提交（危险）
+      // 正确：要么 throw；要么标记回滚
+      TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+      throw e;
+    }
+  }
+}
+```
+
+## **11. 面试一句话总结（可直接背）**
+  
+Spring 事务通过 AOP 代理在方法边界织入 TransactionInterceptor，拦截器读取 @Transactional 事务属性并调用 AbstractPlatformTransactionManager 的通用控制流处理传播行为与回滚决策；在 JDBC 场景由 DataSourceTransactionManager 获取并配置 Connection（关闭 autocommit、设置隔离/只读等），并借助 TransactionSynchronizationManager 将连接绑定到线程以保证同线程 DAO 共享事务；方法正常提交、异常按规则回滚，最终清理 ThreadLocal 并归还连接池；常见失效原因是自调用绕过代理、非 public、异常规则不匹配/吞异常、多数据源事务管理器错误。
