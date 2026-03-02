@@ -37,7 +37,7 @@
     - 对单个 Bean：AbstractAutowireCapableBeanFactory#doCreateBean 典型流程：
       - 6.1 createBeanInstance（实例化 Instantiation）
         - 构造器注入发生在这里（autowireConstructor）
-      - 6.2 addSingletonFactory（三级缓存：允许提前暴露 early reference，用于循环依赖）
+      - 6.2 **addSingletonFactory（三级缓存：允许提前暴露 early reference，用于循环依赖）**
       - 6.3 populateBean（属性填充 Populate properties）
         - setter/字段注入发生在这里（AutowiredAnnotationBeanPostProcessor 参与）
       - 6.4 initializeBean（初始化 Initialization）
@@ -71,8 +71,8 @@
 
 - 追问：BeanFactoryPostProcessor vs BeanPostProcessor 的执行时机与典型用途？为什么能“改 Bean”？
   - 时机差异
-    - BFPP：Bean 实例化前，拿到的是“定义（BeanDefinition）”，所以能改属性值、Scope、依赖关系，甚至新增定义
-    - BPP：Bean 实例化过程中，拿到的是“对象实例”，所以能反射改字段、做包装代理、替换返回对象
+    - **BFPP：Bean 实例化前，拿到的是“定义（BeanDefinition）”，所以能改属性值、Scope、依赖关系，甚至新增定义**
+    - **BPP：Bean 实例化过程中，拿到的是“对象实例”，所以能反射改字段、做包装代理、替换返回对象**
   - 为什么能“改”
     - Spring 把“创建 Bean”拆成多步，并在每步暴露 hook；BFPP/BPP 是容器内建的 hook 链
     - BFPP 改的是“未来将如何创建这个 Bean”；BPP 改的是“这个 Bean 创建出来之后长什么样”
@@ -92,7 +92,7 @@
 
 ## 2. 解释 Spring 的三级缓存（singletonObjects / earlySingletonObjects / singletonFactories）各自存什么、解决什么问题？
 - 结论（标准答案）
-  - 三级缓存是 Spring 为了解决“单例 Bean 在创建过程中的可见性与循环依赖（主要是 setter/字段注入）”引入的分层状态机：一级放最终成品，二级放提前暴露的半成品引用，三级放生成早期引用的工厂（可延迟、可生成代理早期引用）。核心目标：在“实例化完成但尚未属性填充/初始化”这个窗口，把引用先暴露出去，打破 A→B→A 的依赖死结，同时避免不必要的提前暴露与重复代理。
+  - 三级缓存是 Spring 为了解决“单例 Bean 在创建过程中的可见性与循环依赖（主要是 setter/字段注入）”引入的分层状态机：一级放最终成品，二级放提前暴露的半成品引用，三级放生成早期引用的工厂（可延迟、可生成代理早期引用）。核心目标：**在“实例化完成但尚未属性填充/初始化”这个窗口，把引用先暴露出去，打破 A→B→A 的依赖死结，同时避免不必要的提前暴露与重复代理**。
 
 - 三层分别存什么（你得能一句话讲清）
   - 1) singletonObjects（一级缓存）
@@ -119,7 +119,7 @@
     - 三级缓存的 ObjectFactory 允许在 early 阶段生成“早期代理引用”，避免 B 拿到原始对象、最终 A 变成代理后出现“引用不一致”的尴尬
   - 解决问题 3：性能与并发正确性
     - 不在所有 Bean 创建时都提前暴露（否则开销大、生命周期更复杂）
-    - 仅在确实发生循环依赖时，通过三级工厂按需生成 early reference；并用全局锁与 double-check 保证只生成一次、状态迁移一致
+    - **仅在确实发生循环依赖时，通过三级工厂按需生成 early reference；并用全局锁与 double-check 保证只生成一次、状态迁移一致**
 
 - 三级缓存的典型状态迁移（你讲这个就很像懂行的）
   - 创建单例 A 的 doCreateBean 过程里（关键窗口：实例化后、属性填充前）：
@@ -137,7 +137,7 @@
   - 若只有二级“提前对象引用”，就意味着必须在实例化后立刻把对象引用放进二级——这会导致：
     - 无差别提前暴露（很多根本不会循环依赖的 Bean 也被提前暴露），增加复杂度与风险
     - AOP 场景更麻烦：你无法在“需要时”再决定生成代理引用，容易让依赖方拿到 raw bean，最终 bean 变代理后引用不一致
-  - 三级的意义就是“把是否生成 early reference 的决定推迟到真正需要的时候”，并且把“生成逻辑”抽象成工厂，便于插入 AOP 的 early reference 逻辑
+  - **三级的意义就是“把是否生成 early reference 的决定推迟到真正需要的时候”，并且把“生成逻辑”抽象成工厂，便于插入 AOP 的 early reference 逻辑**
 
 - 边界与不适用（一定要说，不然像背书）
   - 构造器循环依赖（constructor injection）通常无法解决
@@ -157,7 +157,7 @@
 
 ## 3. 为什么 setter 循环依赖能解决，而构造器循环依赖通常不行？“通常”在哪些条件下可以绕过？
 - 结论（标准答案）
-  - setter/字段注入的循环依赖之所以能解，是因为 Spring 能在“实例化之后、属性填充之前”把对象引用提前暴露（三级缓存 early reference），让另一个 Bean 先拿到引用继续创建；而构造器注入的循环依赖通常解不了，因为构造器在实例化阶段就必须拿到完整依赖，Spring 没机会在对象还没 new 出来前提前暴露引用。
+  - setter/字段注入的循环依赖之所以能解，是因为 Spring 能在“实例化之后、属性填充之前”把对象引用提前暴露（三级缓存 early reference），让另一个 Bean 先拿到引用继续创建；而构造器注入的循环依赖通常解不了，**因为构造器在实例化阶段就必须拿到完整依赖，Spring 没机会在对象还没 new 出来前提前暴露引用。**
   - “通常”之所以加引号，是因为有少数条件可以绕过：把其中一条依赖从“强依赖（构造器参数必须有）”变成“可延迟解析/可代理的依赖”，就能打破死结。
 
 - setter/字段循环依赖为什么能解（核心时序）
@@ -471,8 +471,8 @@
 
 - 选择条件（Spring 默认策略与可控开关）
   - 默认选择策略（常见语义）
-    - 目标类实现了至少一个接口：优先用 JDK 动态代理（只代理接口方法）
-    - 目标类没有接口：使用 CGLIB（生成子类代理）
+    - 目**标类实现了至少一个接口：优先用 JDK 动态代理（只代理接口方法）**
+    - **目标类没有接口：使用 CGLIB（生成子类代理）**
   - 强制使用 CGLIB 的常见方式
     - 开启类代理：如 @EnableAspectJAutoProxy(proxyTargetClass = true) 或 Boot 中相关配置
   - 何时更推荐哪个
@@ -715,7 +715,7 @@
   - REQUIRED：默认传播行为；“有事务就加入，没有就新开”，因此一条调用链上的多个 REQUIRED 方法通常共享同一个物理事务，成败同生共死。
   - REQUIRES_NEW：无论外层是否有事务，都“挂起外层事务，开启一个全新事务”；内外事务互不影响，内层可以独立提交/回滚。
   - NESTED：在同一个物理事务里创建保存点（Savepoint）；内层回滚只回到保存点，不影响外层继续执行（前提：底层支持保存点，且通常要求 JDBC/DataSourceTransactionManager 场景）。
-  - 选择原则：业务主链路用 REQUIRED 保证原子性；需要“独立落库”的副作用用 REQUIRES_NEW；需要“局部回滚但不拆物理事务”的少量场景可用 NESTED（但团队常规不推荐滥用）。
+  - 选择原则：**业务主链路用 REQUIRED 保证原子性；需要“独立落库”的副作用用 REQUIRES_NEW；需要“局部回滚但不拆物理事务”的少量场景可用 NESTED（但团队常规不推荐滥用）**。
 
 - 语义差异（用“外层事务存在”这一前提对比）
   - REQUIRED
@@ -795,7 +795,7 @@
       - 兜底：注入自身代理/ AopContext.currentProxy（不推荐，侵入且易踩坑）
   - 2) 方法非 public（protected/package/private）
     - 现象：看起来加了 @Transactional，但实际无事务或不回滚
-    - 原因：代理拦截通常以 public 方法为主要边界（尤其 JDK 代理只能拦接口 public 方法；CGLIB 也受可见性与代理策略影响）
+    - 原因：**代理拦截通常以 public 方法为主要边界（尤其 JDK 代理只能拦接口 public 方法；CGLIB 也受可见性与代理策略影响）**
     - 修复
       - 把事务方法改为 public，作为对外事务边界
       - 或把事务放到 public 的“应用服务层”方法上（更符合分层）

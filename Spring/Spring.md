@@ -817,30 +817,30 @@ MyService myService = context.getBean(MyService.class);
 1. **创建容器实例**
     
     - 通过 `AnnotationConfigApplicationContext` 的构造方法初始化容器。
-``` java
-public AnnotationConfigApplicationContext(Class<?>... componentClasses) {  
-    this();  
-    this.register(componentClasses);  
-    this.refresh();  
-}
-```
-1. **加载配置**
+		``` java
+		public AnnotationConfigApplicationContext(Class<?>... componentClasses) {  
+		    this();  
+		    this.register(componentClasses);  
+		    this.refresh();  
+		}
+		```
+2. **加载配置**
     
     - 调用 `register()` 方法注册配置类。
     - 解析注解 `@Component`、`@Bean` 等，生成 `BeanDefinition(包含Bean的定义信息:bean className,Bean scope等)`。
     - 添加到DefaultListableBeanFactory.BeanDefinitionMap<ClassName,BeanDefinition>
-``` java
-this.beanDefinitionMap.put(beanName, beanDefinition);  
-this.beanDefinitionNames.add(beanName);  
-this.removeManualSingletonName(beanName);
-```
-1. **刷新容器**
+		``` java
+		this.beanDefinitionMap.put(beanName, beanDefinition);  
+		this.beanDefinitionNames.add(beanName);  
+		this.removeManualSingletonName(beanName);
+		```
+3. **刷新容器**
     
     - 调用 `refresh()` 方法完成容器初始化。
-2. **注册后置处理器**
+4. **注册后置处理器**
     
     - 注册所有 `BeanPostProcessor` 和 `BeanFactoryPostProcessor`。
-3. **实例化单例 Bean**
+5. **实例化单例 Bean**
     
     - 调用 `preInstantiateSingletons()` 创建所有单例作用域的 Bean。
 
