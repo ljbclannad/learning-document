@@ -1,0 +1,4 @@
+interface:
+  display_name: "Interview Summary"
+  short_description: "Draft structured interview summaries"
+  default_prompt: "Use $interview-summary-doc to turn interview notes or transcripts into a structured hiring summary."
