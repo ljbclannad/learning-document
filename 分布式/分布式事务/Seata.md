@@ -1871,3 +1871,118 @@ TCC 幂等最好是“状态机 + 业务唯一键”双保险。只靠一个能�
 5. AT 的使用边界：
     - 只在院内某个服务内部、需要跨多张表但又在同一个库的场景下使用 AT，降低开发成本；
     - 不用 AT 去覆盖大粒度的支付/医保/开票全链路，以免长事务 + 全局锁拖垮性能。
+
+
+#  10. 记录下真实的调用链路
+按这个项目里一次“创建订单”的实际源码执行顺序，可以这样看 Seata。
+
+**入口**
+请求先到 `[OrderController.java](/Users/lejinbo/LLM/code-snippets/governance-suite/order-service/src/main/java/com/lx/governance/order/controller/OrderController.java)`，再进入 `[OrderAppService.java](/Users/lejinbo/LLM/code-snippets/governance-suite/order-service/src/main/java/com/lx/governance/order/service/OrderAppService.java#L79)` 的 `create(...)`。这里最关键的是：
+
+```java
+@GlobalTransactional(name = "create-order", rollbackFor = Exception.class)
+public OrderDto create(...)
+```
+
+这一步不是马上“开始数据库事务”，而是先被 Seata 的 AOP 拦截器拦住。源码阅读顺序你可以理解为：
+
+1. `@GlobalTransactional`
+2. `GlobalTransactionalInterceptor`
+3. `TransactionalTemplate`
+4. TM 向 Seata Server 申请全局事务，拿到一个 `xid`
+5. 把 `xid` 绑定到当前线程上下文
+6. 再真正执行 `create()` 方法体
+
+这就是为什么后面的方法明明只是普通 Feign 调用和普通数据库操作，却能被串成一个全局事务。
+
+**order-service 本地执行**
+进入 `create()` 后，先做幂等锁，然后生成订单号，接着调用：
+
+```java
+orderRepository.insert(...)
+```
+
+这时因为 `order-service` 开了 Seata AT，并且配置了自动数据源代理，真正执行 SQL 的不是裸数据源，而是 Seata 的 `DataSourceProxy`。它会做几件事：
+
+1. 拦截本地事务 SQL
+2. 记录前镜像 / 后镜像
+3. 向 Seata Server 注册当前分支事务
+4. 把回滚所需信息写到本库 `undo_log`
+
+所以这里订单插入虽然看起来是普通 SQL，但已经成为全局事务里的一个 branch。
+
+配置位置在 `[order-service application.yml](/Users/lejinbo/LLM/code-snippets/governance-suite/order-service/src/main/resources/application.yml#L67)`：
+- `enable-auto-data-source-proxy: true`
+- `data-source-proxy-mode: AT`
+
+**调用 inventory-service**
+然后 `create()` 调 `[InventoryClient.java](/Users/lejinbo/LLM/code-snippets/governance-suite/order-service/src/main/java/com/lx/governance/order/client/InventoryClient.java)` 的 Feign 接口：
+
+```java
+ApiResponse<String> inv = inventoryClient.deduct(deductReq);
+```
+
+关键点在于：Seata 会把刚才那个 `xid` 随着 RPC 调用往下传。你代码里没手写这个传递，是 Seata/Spring Cloud 集成层做的。于是下游 `inventory-service` 收到请求时，能知道“我现在是在某个全局事务里”。
+
+请求进入 `[InventoryController.java](/Users/lejinbo/LLM/code-snippets/governance-suite/inventory-service/src/main/java/com/lx/governance/inventory/controller/InventoryController.java)`，再到 `[InventoryAppService.java](/Users/lejinbo/LLM/code-snippets/governance-suite/inventory-service/src/main/java/com/lx/governance/inventory/service/InventoryAppService.java#L29)`：
+
+```java
+@Transactional
+public void deduct(DeductRequest req)
+```
+
+这里的执行顺序是：
+1. Spring 开本地事务
+2. 执行查库存、乐观锁扣库存
+3. Seata 代理数据源拦截 SQL
+4. 把这次库存修改注册成另一个 branch
+5. 记录 `undo_log`
+
+如果这里抛异常，比如你打开 `lab.fail.deduct`，异常会一路返回到 `order-service.create()`。
+
+**调用 payment-service**
+库存成功后，`create()` 继续调 `[PaymentClient.java](/Users/lejinbo/LLM/code-snippets/governance-suite/order-service/src/main/java/com/lx/governance/order/client/PaymentClient.java)`：
+
+```java
+ApiResponse<String> pay = paymentClient.prepare(payReq);
+```
+
+同样，`xid` 会透传到 `payment-service`。请求进入 `[PaymentController.java](/Users/lejinbo/LLM/code-snippets/governance-suite/payment-service/src/main/java/com/lx/governance/payment/controller/PaymentController.java)`，再进 `[PaymentAppService.java](/Users/lejinbo/LLM/code-snippets/governance-suite/payment-service/src/main/java/com/lx/governance/payment/service/PaymentAppService.java#L52)` 的 `prepare(...)`。
+
+这里虽然没显式写 `@Transactional`，但它的插入操作仍然走了 Seata 代理数据源，所以仍然能参与全局事务。执行插入支付预订单时，也会：
+1. 注册 branch
+2. 记录前后镜像
+3. 写 `undo_log`
+
+如果这里失败，比如打开 `lab.fail.prepare`，异常也会回抛给 `order-service.create()`。
+
+**全局提交**
+如果 `create()` 里的订单插入、库存扣减、支付预创建都成功，方法正常返回。此时 Seata 拦截器会在方法退出后做提交流程：
+
+1. TM 告诉 Seata Server：全局事务可以提交
+2. TC 通知各 branch 提交
+3. AT 模式下，本地事务其实已经提交过了
+4. 全局提交更多是清理 branch 状态和后续清理 `undo_log`
+
+所以你看到的“全局提交”不是最后才一次性提交三库 SQL，而是各库本地事务先提交，Seata 通过日志和协调机制保证失败时还能反向补偿回滚。
+
+**全局回滚**
+如果中间任一步异常，比如库存扣减失败，执行顺序就变成：
+
+1. 异常从 `inventory-service` 返回到 `order-service.create()`
+2. `create()` 抛出异常退出
+3. `GlobalTransactionalInterceptor` 捕获到异常
+4. TM 向 Seata Server 发起全局回滚
+5. TC 逐个通知各 branch 回滚
+6. 每个服务依据自己的 `undo_log` 反向恢复数据
+
+例如：
+- `order-service` 删掉刚插入的订单或恢复变更前状态
+- `inventory-service` 把扣掉的库存加回去
+- `payment-service` 回滚刚插入的支付记录
+
+这就是 Seata AT 的核心：不是靠你手写补偿逻辑，而是靠 SQL 镜像和 `undo_log` 自动回滚。
+
+**这条链路的边界**
+注意这个顺序只覆盖 `create()` 这条同步链路。后面的支付确认 `[PaymentAppService.java](/Users/lejinbo/LLM/code-snippets/governance-suite/payment-service/src/main/java/com/lx/governance/payment/service/PaymentAppService.java#L80)` 已经不是 Seata 事务了，而是发 MQ 事件给订单服务，再由订单服务本地事务更新状态。这部分属于最终一致性，不属于 Seata 的执行顺序。
+
