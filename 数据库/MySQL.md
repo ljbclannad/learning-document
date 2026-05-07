@@ -19,8 +19,18 @@
 - [17. MVCC、间隙锁、记录锁](#17-mvcc间隙锁记录锁)
 - [18. MVCC和version字段区别](#18-mvcc和version字段区别)
 - [19. MySQL 里 count(*)、count(1)、count(字段) 有什么区别？生产里怎么答才稳？](#19-MySQL-里countcount1count字段有什么区别？生产里怎么答才稳？)
-- [20. MySQL 里一条 update 语句到底加了什么锁？行锁真的是锁“行”吗？](#20-MySQL-里一条-update-语句到底加了什么锁？行锁真的是锁“行”吗？)
+- [20. MySQL 里一条 update 语句到底加了什么锁？行锁真的是锁”行”吗？](#20-MySQL-里一条-update-语句到底加了什么锁？行锁真的是锁”行”吗？)
 - [21. 为什么两个看起来不冲突的 insert / update 也可能死锁？](#21-为什么两个看起来不冲突的-insert-update-也可能死锁？)
+- [22. MySQL 里 select ... for update 到底锁住了什么？没查到数据会不会加锁？](#22-mysql-里-select--for-update-到底锁住了什么没查到数据会不会加锁)
+- [23. MySQL 里普通 select 为什么不加锁却还能做到可重复读？MVCC 到底是怎么工作的？](#23-mysql-里普通-select-为什么不加锁却还能做到可重复读mvcc-到底是怎么工作的)
+- [24. 为什么明明建了索引，SQL 还是可能很慢？](#24-为什么明明建了索引sql-还是可能很慢)
+- [25. 线上给大表加索引，怎么做才能尽量不影响业务？如果加完发现变慢了，你怎么回滚？](#25-线上给大表加索引怎么做才能尽量不影响业务如果加完发现变慢了你怎么回滚)
+- [26. MySQL 里长事务为什么危险？线上你怎么识别和处理长事务？](#26-mysql-里长事务为什么危险线上你怎么识别和处理长事务)
+- [27. 大批量 delete / update 为什么危险？线上怎么做才更稳？](#27-大批量-delete--update-为什么危险线上怎么做才更稳)
+- [28. MySQL 里主键为什么通常建议自增或趋势递增？UUID 做主键为什么在高并发写入下容易出问题？](#28-mysql-里主键为什么通常建议自增或趋势递增uuid-做主键为什么在高并发写入下容易出问题)
+- [29. MySQL 里 datetime 和 timestamp 怎么选？生产里为什么很多人会选错？](#29-mysql-里-datetime-和-timestamp-怎么选生产里为什么很多人会选错)
+- [30. MySQL 里 redo log 和 binlog 有什么区别？为什么两阶段提交是必须的？](#30-mysql-里-redo-log-和-binlog-有什么区别为什么两阶段提交是必须的)
+- [31. undo log 是干什么的？它和 redo log、binlog 分别是什么关系？](#31-undo-log-是干什么的它和-redo-logbinlog-分别是什么关系)
 
 
 # 1. 基础概念
@@ -245,7 +255,162 @@ SELECT name FROM employees WHERE department = 'Sales' ORDER BY hire_date;
 	1. 高效的查找性能
 	2. 树的高度增长不会过快，查询磁盘的I/O次数减少
 	3. 范围查询能力强
-## 6.5 #Mysql 索引失效
+## 6.5 联合索引结构与匹配原则完整图解
+
+### 6.5.1 联合索引的B+树结构
+假设有联合索引 `INDEX idx_abc (a, b, c)`，数据如下：
+
+```
+联合索引 B+树结构（简化版）：
+
+                    [Root Node]
+                         |
+        ┌────────────────┼────────────────┐
+        |                |                |
+   [a=1,b=1,c=1]   [a=2,b=1,c=1]   [a=3,b=1,c=1]
+        |                |                |
+   ┌────┴────┐      ┌────┴────┐      ┌────┴────┐
+   |         |      |         |      |         |
+[a=1     [a=1    [a=2     [a=2    [a=3     [a=3
+ b=1      b=2     b=1      b=2     b=1      b=2
+ c=1]     c=1]    c=1]     c=2]    c=1]     c=3]
+  ↓        ↓       ↓        ↓       ↓        ↓
+[主键]   [主键]  [主键]   [主键]  [主键]   [主键]
+
+排序规则：先按a排序 → a相同按b排序 → b相同按c排序
+```
+
+### 6.5.2 索引匹配原则与失效场景对照表
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    联合索引 (a, b, c) 使用规则                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ✅ 索引生效场景                    ❌ 索引失效场景                        │
+│  ─────────────────                  ─────────────────                   │
+│                                                                         │
+│  1️⃣ 最左前缀匹配                                                         │
+│  ✅ WHERE a = 1                     ❌ WHERE b = 1                       │
+│  ✅ WHERE a = 1 AND b = 2           ❌ WHERE c = 1                       │
+│  ✅ WHERE a = 1 AND b = 2 AND c=3   ❌ WHERE b = 1 AND c = 1            │
+│  ✅ WHERE a = 1 AND c = 3           ❌ WHERE a = 1 OR b = 2 (OR断开)    │
+│     (只用到a，c失效)                                                     │
+│                                                                         │
+│  原理：B+树按(a,b,c)顺序排序，跳过a直接查b/c无法定位                      │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│  2️⃣ 范围查询后索引截断                                                    │
+│  ✅ WHERE a = 1 AND b = 2 AND c=3   ❌ WHERE a > 1 AND b = 2            │
+│  ✅ WHERE a = 1 AND b > 2           ❌ WHERE a BETWEEN 1 AND 3 AND b=2  │
+│     (a用到，b范围查询，c失效)        ❌ WHERE a >= 1 AND b = 2 AND c=3   │
+│                                        (a用到范围，b/c失效)              │
+│                                                                         │
+│  原理：范围查询后的列无法保证有序，无法继续使用索引                        │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│  3️⃣ 函数/计算导致失效                                                     │
+│  ✅ WHERE a = 1                     ❌ WHERE YEAR(a) = 2024             │
+│  ✅ WHERE a = 1 AND b = 2           ❌ WHERE a + 1 = 2                  │
+│  ✅ WHERE a = 1 AND b*2 = 4         ❌ WHERE UPPER(a) = 'ABC'           │
+│     (a用到，b失效)                   ❌ WHERE a/10 = 1                   │
+│                                                                         │
+│  原理：索引存储的是原始值，函数/计算后的值不在索引树中                     │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│  4️⃣ 类型转换导致失效                                                      │
+│  ✅ WHERE a = 1 (a是int)            ❌ WHERE a = '1' (a是int，隐式转换)  │
+│  ✅ WHERE a = '1' (a是varchar)      ❌ WHERE a = 1 (a是varchar)         │
+│                                                                         │
+│  原理：类型不匹配时MySQL会对索引列做隐式转换，相当于函数操作                │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│  5️⃣ LIKE模糊匹配                                                         │
+│  ✅ WHERE a LIKE 'abc%'             ❌ WHERE a LIKE '%abc'              │
+│  ✅ WHERE a = 1 AND b LIKE 'x%'     ❌ WHERE a LIKE '%abc%'             │
+│                                    ❌ WHERE a LIKE '_abc'               │
+│                                                                         │
+│  原理：前缀匹配可以利用B+树有序性，中间/后缀匹配无法定位起始位置            │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│  6️⃣ 不等于操作                                                           │
+│  ✅ WHERE a = 1                     ❌ WHERE a != 1                     │
+│  ✅ WHERE a IN (1,2,3)              ❌ WHERE a <> 1                     │
+│  ✅ WHERE a = 1 AND b != 2          ❌ WHERE a NOT IN (1,2)             │
+│     (a用到，b失效)                                                       │
+│                                                                         │
+│  原理：不等于需要扫描大部分数据，优化器可能选择全表扫描                     │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│  7️⃣ OR条件                                                               │
+│  ✅ WHERE a = 1 OR a = 2            ❌ WHERE a = 1 OR d = 1 (d无索引)   │
+│  ✅ WHERE (a=1 AND b=2) OR (a=3)    ❌ WHERE a = 1 OR b = 2             │
+│                                       (b单独无法使用索引)                │
+│                                                                         │
+│  原理：OR连接的条件必须都能用上索引，否则全部失效                          │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│  8️⃣ IS NULL / IS NOT NULL                                               │
+│  ✅ WHERE a IS NULL (看情况)        ❌ WHERE a IS NOT NULL (可能失效)    │
+│  ✅ WHERE a = 1 AND b IS NULL                                           │
+│                                                                         │
+│  原理：NULL值不存储在索引中（部分数据库），IS NOT NULL可能导致全表扫描      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.5.3 实战案例分析
+
+```sql
+-- 表结构
+CREATE TABLE user (
+    id INT PRIMARY KEY,
+    name VARCHAR(50),
+    age INT,
+    city VARCHAR(50),
+    salary DECIMAL(10,2),
+    INDEX idx_name_age_city (name, age, city)
+);
+
+-- ✅ 案例1：完整使用索引
+SELECT * FROM user WHERE name = '张三' AND age = 25 AND city = '北京';
+-- 分析：完全符合最左前缀，三个字段都用上索引
+
+-- ✅ 案例2：部分使用索引
+SELECT * FROM user WHERE name = '张三' AND city = '北京';
+-- 分析：使用了name，跳过age，city失效（只用到name）
+
+-- ✅ 案例3：范围查询截断
+SELECT * FROM user WHERE name = '张三' AND age > 20 AND city = '北京';
+-- 分析：name用到，age范围查询，city失效
+
+-- ❌ 案例4：函数导致失效
+SELECT * FROM user WHERE UPPER(name) = '张三' AND age = 25;
+-- 分析：name上使用函数，整个索引失效，全表扫描
+
+-- ❌ 案例5：跳过最左列
+SELECT * FROM user WHERE age = 25 AND city = '北京';
+-- 分析：跳过name，索引完全失效
+
+-- ❌ 案例6：OR导致失效
+SELECT * FROM user WHERE name = '张三' OR salary > 10000;
+-- 分析：salary无索引，导致整个查询无法使用索引
+
+-- ✅ 案例7：覆盖索引优化
+SELECT name, age, city FROM user WHERE name = '张三' AND age = 25;
+-- 分析：查询字段都在索引中，无需回表，性能最优
+```
+
+### 6.5.4 记忆口诀
+
+```
+最左前缀要遵守，中间断了后面丢
+范围之后全失效，函数计算不能留
+类型转换要注意，模糊查询%在后
+不等OR要小心，NULL值索引难保留
+```
+
+## 6.6 #Mysql 索引失效详解
 1. **未遵循最左前缀匹配导致索引失效**
 2. **使用函数导致索引失效**
 3. **计算导致索引失效**
@@ -256,8 +421,8 @@ SELECT name FROM employees WHERE department = 'Sales' ORDER BY hire_date;
 8. **like模糊匹配以通配符开头导致索引失效**
 9. **OR 前后存在非索引的列，索引失效**
 
-## 6.6 #Mysql 覆盖索引
-1. 二级索引中包含了查询所需的所有字段，从而使查询可以仅通过访问二级索引而不需要访问实际的表数据
+## 6.7 #Mysql 覆盖索引
+1. 覆盖索引中包含了查询所需的所有字段，从而使查询可以仅通过访问二级索引而不需要访问实际的表数据
 2. 索引包含所有查询列：
     - 覆盖索引包含了查询中所有需要的列，包括 `SELECT` 语句中的列和 `WHERE` 子句中的列。
 3. 避免回表：
@@ -792,9 +957,286 @@ Doublewrite Buffer 是一种有效的数据保护机制，旨在提高数据库�
 在设计 MySQL 数据库表时，遵循一些基本原则可以帮助提高数据库的性能、可维护性和扩展性。以下是一些关键的表设计原则：
 
 ### 12.1 规范化（Normalization）
-- 第一范式（1NF）：确保每个字段只包含原子值，避免重复数据。
-- 第二范式（2NF）：确保每个非主属性完全依赖于主键，消除部分依赖。
-- 第三范式（3NF）：确保每个非主属性直接依赖于主键，消除传递依赖。
+
+数据库三范式是数据库设计的基础理论，目的是减少数据冗余、避免数据异常、提高数据一致性。
+
+**记忆口诀：**
+- 1NF: 列不可分（原子性）
+- 2NF: 不能部分依赖（完全依赖主键）
+- 3NF: 不能传递依赖（直接依赖主键）
+
+#### 12.1.1 第一范式（1NF）- 列不可分
+
+**定义：** 表中的每一列都是不可再分的原子数据项
+
+```sql
+-- ❌ 违反1NF的设计
+CREATE TABLE student_bad (
+    id INT PRIMARY KEY,
+    name VARCHAR(50),
+    contact VARCHAR(200)  -- 包含多个信息：电话+邮箱+地址
+);
+
+INSERT INTO student_bad VALUES 
+(1, '张三', '13800138000, zhangsan@qq.com, 北京市朝阳区');
+
+问题：
+1. 无法单独查询电话号码
+2. 无法对邮箱建立索引
+3. 更新某一项信息很困难
+
+
+-- ✅ 符合1NF的设计
+CREATE TABLE student_good (
+    id INT PRIMARY KEY,
+    name VARCHAR(50),
+    phone VARCHAR(20),      -- 拆分成独立的列
+    email VARCHAR(100),
+    address VARCHAR(200)
+);
+
+INSERT INTO student_good VALUES 
+(1, '张三', '13800138000', 'zhangsan@qq.com', '北京市朝阳区');
+```
+
+#### 12.1.2 第二范式（2NF）- 完全依赖主键
+
+**定义：** 在1NF基础上，非主键列必须完全依赖于主键，不能只依赖主键的一部分（针对联合主键）
+
+```sql
+-- ❌ 违反2NF的设计（存在部分依赖）
+CREATE TABLE order_detail_bad (
+    order_id INT,           -- 订单ID
+    product_id INT,         -- 商品ID
+    product_name VARCHAR(100),   -- 商品名称（只依赖product_id）
+    product_price DECIMAL(10,2), -- 商品价格（只依赖product_id）
+    quantity INT,           -- 购买数量（依赖完整主键）
+    PRIMARY KEY (order_id, product_id)
+);
+
+问题分析：
+- 主键是 (order_id, product_id)
+- product_name 只依赖 product_id，不依赖 order_id  ← 部分依赖！
+- product_price 只依赖 product_id，不依赖 order_id  ← 部分依赖！
+
+数据异常：
+1. 插入异常：如果没有订单，无法单独插入商品信息
+2. 更新异常：修改商品价格，需要更新所有包含该商品的订单
+3. 删除异常：删除订单，商品信息也被删除
+4. 数据冗余：同一商品在多个订单中，名称和价格重复存储
+
+
+-- ✅ 符合2NF的设计（拆分表）
+-- 商品表
+CREATE TABLE product (
+    product_id INT PRIMARY KEY,
+    product_name VARCHAR(100),
+    product_price DECIMAL(10,2)
+);
+
+-- 订单明细表
+CREATE TABLE order_detail_good (
+    order_id INT,
+    product_id INT,
+    quantity INT,
+    PRIMARY KEY (order_id, product_id),
+    FOREIGN KEY (product_id) REFERENCES product(product_id)
+);
+```
+
+**实际案例：学生选课**
+
+```sql
+-- ❌ 违反2NF
+CREATE TABLE student_course_bad (
+    student_id INT,
+    course_id INT,
+    student_name VARCHAR(50),    -- 只依赖student_id
+    student_age INT,             -- 只依赖student_id
+    course_name VARCHAR(100),    -- 只依赖course_id
+    teacher VARCHAR(50),         -- 只依赖course_id
+    score DECIMAL(5,2),          -- 依赖完整主键
+    PRIMARY KEY (student_id, course_id)
+);
+
+-- ✅ 符合2NF（拆分成三张表）
+CREATE TABLE student (
+    student_id INT PRIMARY KEY,
+    student_name VARCHAR(50),
+    student_age INT
+);
+
+CREATE TABLE course (
+    course_id INT PRIMARY KEY,
+    course_name VARCHAR(100),
+    teacher VARCHAR(50)
+);
+
+CREATE TABLE student_course (
+    student_id INT,
+    course_id INT,
+    score DECIMAL(5,2),
+    PRIMARY KEY (student_id, course_id),
+    FOREIGN KEY (student_id) REFERENCES student(student_id),
+    FOREIGN KEY (course_id) REFERENCES course(course_id)
+);
+```
+
+#### 12.1.3 第三范式（3NF）- 不能传递依赖
+
+**定义：** 在2NF基础上，非主键列必须直接依赖于主键，不能通过其他非主键列间接依赖（消除传递依赖）
+
+```sql
+-- ❌ 违反3NF的设计（存在传递依赖）
+CREATE TABLE employee_bad (
+    emp_id INT PRIMARY KEY,
+    emp_name VARCHAR(50),
+    dept_id INT,              -- 部门ID
+    dept_name VARCHAR(100),   -- 部门名称（依赖dept_id）
+    dept_manager VARCHAR(50)  -- 部门经理（依赖dept_id）
+);
+
+问题分析：
+- emp_name 直接依赖 emp_id ✅
+- dept_id 直接依赖 emp_id ✅
+- dept_name 依赖 dept_id，dept_id 依赖 emp_id  ← 传递依赖！
+- dept_manager 依赖 dept_id，dept_id 依赖 emp_id ← 传递依赖！
+
+依赖链：emp_id → dept_id → dept_name
+        emp_id → dept_id → dept_manager
+
+数据异常：
+1. 插入异常：新建部门但没有员工时，无法插入部门信息
+2. 更新异常：修改部门名称，需要更新所有该部门的员工记录
+3. 删除异常：删除部门最后一个员工，部门信息也丢失
+4. 数据冗余：同一部门的名称和经理在多个员工记录中重复
+
+
+-- ✅ 符合3NF的设计（拆分表）
+CREATE TABLE department (
+    dept_id INT PRIMARY KEY,
+    dept_name VARCHAR(100),
+    dept_manager VARCHAR(50)
+);
+
+CREATE TABLE employee_good (
+    emp_id INT PRIMARY KEY,
+    emp_name VARCHAR(50),
+    dept_id INT,
+    FOREIGN KEY (dept_id) REFERENCES department(dept_id)
+);
+```
+
+**实际案例：订单表**
+
+```sql
+-- ❌ 违反3NF
+CREATE TABLE order_bad (
+    order_id INT PRIMARY KEY,
+    customer_id INT,
+    customer_name VARCHAR(50),      -- 依赖customer_id
+    customer_phone VARCHAR(20),     -- 依赖customer_id
+    customer_address VARCHAR(200),  -- 依赖customer_id
+    order_date DATE,
+    total_amount DECIMAL(10,2)
+);
+
+-- 传递依赖链：
+-- order_id → customer_id → customer_name
+-- order_id → customer_id → customer_phone
+-- order_id → customer_id → customer_address
+
+
+-- ✅ 符合3NF
+CREATE TABLE customer (
+    customer_id INT PRIMARY KEY,
+    customer_name VARCHAR(50),
+    customer_phone VARCHAR(20),
+    customer_address VARCHAR(200)
+);
+
+CREATE TABLE order_good (
+    order_id INT PRIMARY KEY,
+    customer_id INT,
+    order_date DATE,
+    total_amount DECIMAL(10,2),
+    FOREIGN KEY (customer_id) REFERENCES customer(customer_id)
+);
+```
+
+#### 12.1.4 三范式对比总结
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        第一范式 (1NF)                        │
+├─────────────────────────────────────────────────────────────┤
+│ 要求: 列不可分（原子性）                                     │
+│ 口诀: 每一列都是最小单位                                     │
+│ 例子: 不能有"电话+邮箱"这样的复合列                          │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│                        第二范式 (2NF)                        │
+├─────────────────────────────────────────────────────────────┤
+│ 要求: 非主键列完全依赖主键（消除部分依赖）                   │
+│ 口诀: 不能只依赖主键的一部分                                 │
+│ 针对: 联合主键的表                                           │
+│ 例子: (订单ID, 商品ID) → 商品名称 ❌                         │
+│       商品ID → 商品名称 ✅                                   │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│                        第三范式 (3NF)                        │
+├─────────────────────────────────────────────────────────────┤
+│ 要求: 非主键列直接依赖主键（消除传递依赖）                   │
+│ 口诀: 不能通过其他列间接依赖主键                             │
+│ 例子: 员工ID → 部门ID → 部门名称 ❌                         │
+│       部门ID → 部门名称 ✅                                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 12.1.5 反范式化（实际应用中的权衡）
+
+**三范式并非绝对！** 实际开发中常常需要适度反范式化来提高性能。
+
+```sql
+-- 场景：订单表需要频繁显示用户名
+-- 如果严格遵守3NF，每次都要JOIN user表
+
+-- 方案1：严格3NF（性能较差）
+SELECT o.order_id, u.user_name, o.total_amount
+FROM `order` o
+JOIN user u ON o.user_id = u.user_id
+WHERE o.order_date > '2024-01-01';
+-- 每次查询都要JOIN
+
+
+-- 方案2：适度反范式化（性能更好）
+CREATE TABLE `order` (
+    order_id INT PRIMARY KEY,
+    user_id INT,
+    user_name VARCHAR(50),  -- 冗余字段！
+    order_date TIMESTAMP,
+    total_amount DECIMAL(10,2)
+);
+
+SELECT order_id, user_name, total_amount
+FROM `order`
+WHERE order_date > '2024-01-01';
+-- 无需JOIN，查询更快
+
+代价：
+1. 数据冗余
+2. 用户改名时需要更新所有订单记录
+3. 需要维护数据一致性
+
+适用场景：
+1. 读多写少的场景
+2. 对查询性能要求高
+3. 冗余字段不常变化（如用户名）
+```
+
+**总结：** 设计时遵守三范式（减少冗余），优化时适度反范式化（提高性能），根据业务场景权衡。
 
 ### 12.2 合理选择数据类型
 
