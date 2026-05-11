@@ -762,7 +762,7 @@ WHERE id = 100 AND count = 9;`
 那 AT 这套“透明增强”的魔法就没法玩了。
 
 所以：“先查后改”是 AT 能回滚的物理前提。
-
+ 
 ### 5.2.5 为什么 `update stock set count = count - 1` 在 AT 下被认为是“危险 SQL”？
 注意，这条 SQL 的危险点 不是 Seata 无法拦截它（Seata 是能拦截并生成镜像的），而是它在 分布式 + 重试 + 高并发 语境下，会放大一堆问题。
 
@@ -1986,3 +1986,154 @@ ApiResponse<String> pay = paymentClient.prepare(payReq);
 **这条链路的边界**
 注意这个顺序只覆盖 `create()` 这条同步链路。后面的支付确认 `[PaymentAppService.java](/Users/lejinbo/LLM/code-snippets/governance-suite/payment-service/src/main/java/com/lx/governance/payment/service/PaymentAppService.java#L80)` 已经不是 Seata 事务了，而是发 MQ 事件给订单服务，再由订单服务本地事务更新状态。这部分属于最终一致性，不属于 Seata 的执行顺序。
 
+# 11. Seata的3个核心表
+
+Seata 的 3 个核心表位于 TC（Transaction Coordinator）侧，用于管理全局事务和分支事务的协调。
+
+## 11.1 global_table（全局事务表）
+
+**作用：** 存储全局事务的元数据，记录全局事务的生命周期。
+
+**关键字段：**
+- `xid` - 全局事务唯一标识
+- `status` - 事务状态（Begin/Committing/Committed/Rollbacking/Rollbacked/TimeoutRollbacking/TimeoutRollbacked）
+- `application_id` - 应用 ID
+- `transaction_service_group` - 事务分组
+- `transaction_name` - 事务名称
+- `begin_time` - 事务开始时间
+- `timeout` - 超时时间（毫秒）
+
+**生命周期：**
+1. TM 调用 `GlobalTransaction.begin()` 时，TC 在此表创建记录，状态为 Begin
+2. TM 调用 `commit()` 时，状态变更为 Committing，所有分支提交后变为 Committed
+3. TM 调用 `rollback()` 或超时时，状态变更为 Rollbacking，所有分支回滚后变为 Rollbacked
+4. 事务完成后，记录会被异步清理（可配置保留时间）
+
+## 11.2 branch_table（分支事务表）
+
+**作用：** 存储分支事务的详细信息，每个参与全局事务的 RM 操作对应一条记录。
+
+**关键字段：**
+- `branch_id` - 分支事务 ID（全局唯一）
+- `xid` - 所属全局事务 ID
+- `resource_id` - 资源 ID（数据库连接标识，如 jdbc:mysql://localhost:3306/db）
+- `branch_type` - 分支类型（AT/TCC/SAGA/XA）
+- `status` - 分支状态（Registered/PhaseOne_Done/PhaseOne_Failed/PhaseTwo_Committed/PhaseTwo_Rollbacked）
+- `application_data` - 业务数据（TCC 模式存储上下文参数）
+- `gmt_create` / `gmt_modified` - 创建和修改时间
+
+**生命周期：**
+1. RM 执行业务 SQL 后，向 TC 注册分支事务，创建记录
+2. 一阶段完成后，状态更新为 PhaseOne_Done
+3. 二阶段提交或回滚后，记录被删除
+
+**关联关系：** 通过 `xid` 与 global_table 关联，一个全局事务可以有多个分支事务。
+
+## 11.3 lock_table（全局锁表）
+
+**作用：** 存储 AT 模式的全局锁信息，防止脏写问题。
+
+**关键字段：**
+- `row_key` - 行锁标识（格式：`resource_id^^^table_name^^^pk_value`）
+- `xid` - 持有锁的全局事务 ID
+- `transaction_id` - 全局事务的内部 ID
+- `branch_id` - 持有锁的分支事务 ID
+- `resource_id` - 资源 ID
+- `table_name` - 表名
+- `pk` - 主键值
+
+**工作机制：**
+1. **一阶段：** RM 本地事务提交前，向 TC 注册分支并申请全局锁
+   - 如果锁未被占用，注册成功，本地事务提交
+   - 如果锁被其他全局事务持有，则重试或失败
+2. **二阶段：** 全局事务提交或回滚完成后，TC 释放该事务持有的所有全局锁
+
+**防脏写示例：**
+```
+事务A（xid=1）更新 order 表 id=100 的记录
+  → 本地事务提交前，向 TC 申请全局锁
+  → lock_table 插入记录：row_key="jdbc:mysql://db^^^order^^^100", xid=1
+
+事务B（xid=2）也要更新 order 表 id=100 的记录
+  → 本地事务提交前，向 TC 申请全局锁
+  → 发现 row_key 已被 xid=1 占用，申请失败
+  → 事务B 重试或回滚，避免脏写
+```
+
+## 11.4 undo_log（回滚日志表）- RM 侧
+
+**注意：** 此表不在 TC 侧，而是在**业务数据库**中（RM 侧），AT 模式专用。
+
+**作用：** 存储数据修改前后的镜像（before image 和 after image），用于自动生成回滚 SQL。
+
+**关键字段：**
+- `branch_id` - 分支事务 ID
+- `xid` - 全局事务 ID
+- `context` - 上下文信息
+- `rollback_info` - 回滚数据（JSON 格式，包含 before/after image）
+- `log_status` - 日志状态（0-正常，1-防御性检测中）
+- `log_created` / `log_modified` - 创建和修改时间
+
+**工作流程：**
+1. **一阶段：** RM 执行业务 SQL 前，查询当前数据（before image），执行后查询新数据（after image），生成 undo_log 记录
+2. **二阶段提交：** 异步删除 undo_log 记录
+3. **二阶段回滚：** 根据 undo_log 的 before image 生成反向 SQL 并执行，恢复数据
+
+**示例：**
+```sql
+-- 业务 SQL
+UPDATE order SET status = 'PAID' WHERE id = 100;
+
+-- undo_log 存储的 rollback_info（简化）
+{
+  "beforeImage": {
+    "tableName": "order",
+    "rows": [{"id": 100, "status": "PENDING"}]
+  },
+  "afterImage": {
+    "tableName": "order", 
+    "rows": [{"id": 100, "status": "PAID"}]
+  }
+}
+
+-- 回滚时生成的反向 SQL
+UPDATE order SET status = 'PENDING' WHERE id = 100;
+```
+
+## 11.5 总结
+
+| 表名 | 位置 | 作用 | 关键场景 |
+|------|------|------|----------|
+| global_table | TC | 全局事务元数据 | 事务状态管理、超时检测 |
+| branch_table | TC | 分支事务信息 | 二阶段提交/回滚协调 |
+| lock_table | TC | 全局锁 | AT 模式防脏写 |
+| undo_log | RM（业务库） | 回滚日志 | AT 模式自动回滚 |
+
+**关系图：**
+```
+TM 开启全局事务
+  ↓
+TC 创建 global_table 记录（xid=1, status=Begin）
+  ↓
+RM1 执行业务 SQL
+  ↓
+RM1 生成 undo_log（业务库）
+  ↓
+RM1 向 TC 注册分支，TC 创建 branch_table 记录（branch_id=1001, xid=1）
+  ↓
+RM1 向 TC 申请全局锁，TC 创建 lock_table 记录（row_key=xxx, xid=1）
+  ↓
+RM1 本地事务提交
+  ↓
+RM2 执行业务 SQL（同样流程）
+  ↓
+TM 提交全局事务
+  ↓
+TC 更新 global_table（status=Committing）
+  ↓
+TC 通知 RM1/RM2 提交，删除 branch_table 和 lock_table 记录
+  ↓
+RM1/RM2 异步删除 undo_log
+  ↓
+TC 更新 global_table（status=Committed）
+```
