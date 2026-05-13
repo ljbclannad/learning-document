@@ -286,6 +286,88 @@ Redis支持多种数据类型，每种类型适合不同的应用场景。以下
     - 缓存（如用户信息、会话数据）。
     - 分布式锁（通过`SET key value NX PX <timeout>`实现）。
 
+5. 生产问题及解决方案：
+
+    **问题1：BigKey导致性能问题**
+    - 现象：单个String值过大（如存储大JSON、序列化对象），导致网络传输慢、内存占用高
+    - 影响：GET/SET操作耗时长，可能阻塞Redis主线程
+    - 解决方案：
+        ```java
+        // 错误做法：存储大对象
+        jedis.set("user:profile:123", largeJsonString);  // 可能几MB
+        
+        // 正确做法1：拆分存储
+        jedis.hset("user:profile:123", "basic", basicInfo);
+        jedis.hset("user:profile:123", "detail", detailInfo);
+        
+        // 正确做法2：压缩存储
+        byte[] compressed = compress(largeJsonString);
+        jedis.set("user:profile:123".getBytes(), compressed);
+        ```
+    - 监控：使用`MEMORY USAGE key`查看键占用内存
+    - 建议：单个String值不超过10KB，超过则考虑拆分或压缩
+
+    **问题2：INCR并发竞争导致计数不准**
+    - 现象：高并发下使用GET+计算+SET导致计数丢失
+    - 影响：库存扣减、限流计数等场景出现数据不一致
+    - 解决方案：
+        ```java
+        // 错误做法：非原子操作
+        String count = jedis.get("stock:item:123");
+        int newCount = Integer.parseInt(count) - 1;
+        jedis.set("stock:item:123", String.valueOf(newCount));
+        
+        // 正确做法：使用原子操作
+        Long remaining = jedis.decr("stock:item:123");
+        if (remaining < 0) {
+            jedis.incr("stock:item:123");  // 回滚
+            return "库存不足";
+        }
+        ```
+
+    **问题3：缓存穿透（查询不存在的key）**
+    - 现象：大量请求查询不存在的key，直接打到数据库
+    - 影响：数据库压力剧增，可能导致雪崩
+    - 解决方案：
+        ```java
+        // 方案1：缓存空值
+        String value = jedis.get(key);
+        if (value == null) {
+            value = queryFromDB(key);
+            if (value == null) {
+                jedis.setex(key, 60, "NULL");  // 缓存空值，短过期时间
+            } else {
+                jedis.setex(key, 3600, value);
+            }
+        }
+        
+        // 方案2：布隆过滤器
+        if (!bloomFilter.mightContain(key)) {
+            return null;  // 直接返回，不查数据库
+        }
+        ```
+
+    **问题4：热key导致单点压力**
+    - 现象：某个key被高频访问（如热门商品、明星动态），单Redis节点压力大
+    - 影响：响应变慢，可能导致Redis实例CPU打满
+    - 解决方案：
+        ```java
+        // 方案1：本地缓存
+        private LoadingCache<String, String> localCache = CacheBuilder.newBuilder()
+            .maximumSize(1000)
+            .expireAfterWrite(10, TimeUnit.SECONDS)
+            .build(new CacheLoader<String, String>() {
+                public String load(String key) {
+                    return jedis.get(key);
+                }
+            });
+        
+        // 方案2：key分片（读扩散）
+        int shard = ThreadLocalRandom.current().nextInt(10);
+        String shardKey = "hot:product:123:" + shard;
+        String value = jedis.get(shardKey);
+        ```
+
 ### *3.2 Hash（哈希）*
 1. 特点：
     - 存储键值对集合，类似于一个小型对象。
@@ -310,6 +392,105 @@ Redis支持多种数据类型，每种类型适合不同的应用场景。以下
     - 用户信息存储（如`user:{id}`存储用户详细信息）。
     - 配置管理。
 
+5. 生产问题及解决方案：
+
+    **问题1：HGETALL导致阻塞**
+    - 现象：Hash字段数过多（几千上万个），HGETALL一次性返回所有数据
+    - 影响：命令执行时间长，阻塞Redis主线程，网络传输压力大
+    - 解决方案：
+        ```java
+        // 错误做法：全量获取
+        Map<String, String> allFields = jedis.hgetAll("user:orders:123");  // 可能有上万个订单
+        
+        // 正确做法1：只获取需要的字段
+        List<String> fields = jedis.hmget("user:orders:123", "order1", "order2");
+        
+        // 正确做法2：使用HSCAN分批获取
+        String cursor = "0";
+        do {
+            ScanResult<Map.Entry<String, String>> result = 
+                jedis.hscan("user:orders:123", cursor, new ScanParams().count(100));
+            for (Map.Entry<String, String> entry : result.getResult()) {
+                // 处理每个字段
+            }
+            cursor = result.getCursor();
+        } while (!"0".equals(cursor));
+        ```
+    - 建议：单个Hash字段数不超过5000，超过则考虑拆分
+
+    **问题2：Hash无限增长成为BigKey**
+    - 现象：业务逻辑只添加不删除，Hash字段数持续增长
+    - 典型场景：`user:actions:{uid}` 存储用户所有行为，`order:status:{uid}` 存储所有订单
+    - 影响：内存占用高，删除时阻塞，主从同步慢
+    - 解决方案：
+        ```java
+        // 错误做法：无限增长
+        jedis.hset("user:actions:123", actionId, actionData);  // 永远只增不减
+        
+        // 正确做法1：设置字段数上限
+        if (jedis.hlen("user:actions:123") > 1000) {
+            // 删除最旧的字段或整体迁移
+            jedis.del("user:actions:123");
+        }
+        
+        // 正确做法2：按时间分片
+        String dateKey = "user:actions:123:" + LocalDate.now();
+        jedis.hset(dateKey, actionId, actionData);
+        jedis.expire(dateKey, 86400 * 7);  // 7天过期
+        
+        // 正确做法3：按hash分桶
+        int bucket = Math.abs(actionId.hashCode()) % 10;
+        jedis.hset("user:actions:123:bucket:" + bucket, actionId, actionData);
+        ```
+
+    **问题3：Hash字段级过期无法实现**
+    - 现象：需要不同字段有不同过期时间，但Redis不支持字段级TTL
+    - 影响：只能整个Hash过期，无法精细控制
+    - 解决方案：
+        ```java
+        // 方案1：字段值中包含过期时间
+        String value = System.currentTimeMillis() + 3600000 + "|" + actualValue;
+        jedis.hset("cache:data", field, value);
+        
+        // 读取时检查
+        String stored = jedis.hget("cache:data", field);
+        if (stored != null) {
+            String[] parts = stored.split("\\|", 2);
+            long expireTime = Long.parseLong(parts[0]);
+            if (System.currentTimeMillis() < expireTime) {
+                return parts[1];  // 未过期
+            } else {
+                jedis.hdel("cache:data", field);  // 已过期，删除
+            }
+        }
+        
+        // 方案2：改用String存储
+        jedis.setex("cache:data:" + field, 3600, value);
+        ```
+
+    **问题4：Hash内存编码切换导致内存突增**
+    - 现象：Hash从ziplist编码切换到hashtable编码，内存占用突然增加
+    - 触发条件：字段数超过512或单个value超过64字节（默认配置）
+    - 影响：内存使用量可能增加数倍
+    - 解决方案：
+        ```shell
+        # 调整编码切换阈值
+        CONFIG SET hash-max-ziplist-entries 1000  # 字段数阈值
+        CONFIG SET hash-max-ziplist-value 128     # 值大小阈值
+        ```
+        ```java
+        // 代码层面控制
+        // 1. 控制字段数量，超过阈值时拆分Hash
+        if (jedis.hlen(key) > 500) {
+            // 拆分为多个Hash
+        }
+        
+        // 2. 控制value大小，避免存储大对象
+        if (value.length() > 64) {
+            // 压缩或拆分
+        }
+        ```
+
 ### *3.3 List（列表）*
 1. 特点：
     - 双向链表，可以从两端插入和弹出元素。
@@ -333,6 +514,117 @@ LPOP tasks                      # 从左侧弹出，返回 "task2"
 4. 应用场景：
     - 消息队列。
     - 有序任务管理（如待办事项）。
+
+5. 生产问题及解决方案：
+
+    **问题1：List作为消息队列消息丢失**
+    - 现象：使用LPOP/RPOP消费消息，消费者宕机导致消息丢失
+    - 影响：消息未处理完就被删除，业务数据丢失
+    - 解决方案：
+        ```java
+        // 错误做法：直接POP
+        String message = jedis.rpop("queue:tasks");
+        processMessage(message);  // 如果这里异常，消息丢失
+        
+        // 正确做法1：使用RPOPLPUSH（可靠队列模式）
+        String message = jedis.rpoplpush("queue:tasks", "queue:processing");
+        try {
+            processMessage(message);
+            jedis.lrem("queue:processing", 1, message);  // 处理成功，删除
+        } catch (Exception e) {
+            // 处理失败，消息仍在processing队列，可重试
+        }
+        
+        // 正确做法2：使用BRPOPLPUSH（阻塞版本）
+        String message = jedis.brpoplpush("queue:tasks", "queue:processing", 0);
+        
+        // 正确做法3：改用Redis Stream（推荐）
+        // Stream支持消费组、ACK机制，更适合做消息队列
+        ```
+
+    **问题2：LRANGE大范围查询导致阻塞**
+    - 现象：List元素过多，使用LRANGE 0 -1获取全部元素
+    - 影响：命令执行时间长，阻塞Redis，内存和网络压力大
+    - 解决方案：
+        ```java
+        // 错误做法：全量获取
+        List<String> allItems = jedis.lrange("list:items", 0, -1);  // 可能有几万条
+        
+        // 正确做法1：分页获取
+        int pageSize = 100;
+        int page = 0;
+        List<String> items;
+        do {
+            items = jedis.lrange("list:items", page * pageSize, (page + 1) * pageSize - 1);
+            // 处理这一页数据
+            page++;
+        } while (items.size() == pageSize);
+        
+        // 正确做法2：限制List长度
+        jedis.lpush("list:items", newItem);
+        jedis.ltrim("list:items", 0, 999);  // 只保留最新1000条
+        ```
+
+    **问题3：List无限增长成为BigKey**
+    - 现象：只PUSH不POP，或POP速度慢于PUSH速度
+    - 典型场景：日志收集、消息积压
+    - 影响：内存占用高，操作变慢
+    - 解决方案：
+        ```java
+        // 方案1：设置长度上限（LTRIM）
+        jedis.lpush("logs:app", logMessage);
+        jedis.ltrim("logs:app", 0, 9999);  // 只保留最新10000条
+        
+        // 方案2：监控长度，超过阈值告警
+        long length = jedis.llen("queue:tasks");
+        if (length > 10000) {
+            // 告警：队列积压
+            // 可以增加消费者或限流
+        }
+        
+        // 方案3：按时间分片
+        String hourKey = "logs:app:" + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHH"));
+        jedis.lpush(hourKey, logMessage);
+        jedis.expire(hourKey, 86400);  // 24小时过期
+        ```
+
+    **问题4：BLPOP/BRPOP长时间阻塞占用连接**
+    - 现象：使用阻塞命令等待消息，大量连接长时间占用
+    - 影响：连接池耗尽，新请求无法获取连接
+    - 解决方案：
+        ```java
+        // 错误做法：无限阻塞
+        List<String> result = jedis.brpop(0, "queue:tasks");  // 永久阻塞
+        
+        // 正确做法1：设置合理超时
+        List<String> result = jedis.brpop(5, "queue:tasks");  // 5秒超时
+        if (result != null) {
+            processMessage(result.get(1));
+        }
+        
+        // 正确做法2：使用独立连接池
+        JedisPool blockingPool = new JedisPool(config, host, port);  // 专门用于阻塞操作
+        
+        // 正确做法3：改用Pub/Sub或Stream
+        ```
+
+    **问题5：List元素重复导致数据不一致**
+    - 现象：同一消息被多次PUSH到List
+    - 影响：消息重复消费，业务逻辑错误
+    - 解决方案：
+        ```java
+        // 方案1：消费端幂等处理
+        String messageId = extractMessageId(message);
+        if (jedis.setnx("processed:" + messageId, "1") == 1) {
+            jedis.expire("processed:" + messageId, 86400);
+            processMessage(message);  // 只处理一次
+        }
+        
+        // 方案2：生产端去重（使用Set检查）
+        if (jedis.sadd("message:ids", messageId) == 1) {
+            jedis.lpush("queue:tasks", message);  // 只有新消息才入队
+        }
+        ```
 
 ### *3.4 Set（集合）*
 1. 特点：
@@ -361,6 +653,113 @@ SREM fruits "apple"             # 删除元素
     - 黑名单管理。
     - 共同好友等集合操作。
 
+5. 生产问题及解决方案：
+
+    **问题1：SMEMBERS全量获取导致阻塞**
+    - 现象：Set元素过多（几万甚至几十万），SMEMBERS一次性返回所有元素
+    - 影响：命令执行时间长，阻塞Redis主线程，网络传输压力大
+    - 解决方案：
+        ```java
+        // 错误做法：全量获取
+        Set<String> allMembers = jedis.smembers("tags:article:123");  // 可能有几万个标签
+        
+        // 正确做法1：使用SSCAN分批获取
+        String cursor = "0";
+        Set<String> result = new HashSet<>();
+        do {
+            ScanResult<String> scanResult = jedis.sscan("tags:article:123", cursor, 
+                new ScanParams().count(100));
+            result.addAll(scanResult.getResult());
+            cursor = scanResult.getCursor();
+        } while (!"0".equals(cursor));
+        
+        // 正确做法2：只检查是否存在
+        boolean exists = jedis.sismember("tags:article:123", "java");
+        
+        // 正确做法3：随机获取部分元素
+        List<String> randomMembers = jedis.srandmember("tags:article:123", 10);
+        ```
+
+    **问题2：集合运算（SINTER/SUNION/SDIFF）性能问题**
+    - 现象：多个大Set进行交集、并集、差集运算，耗时长
+    - 影响：阻塞Redis主线程，影响其他请求
+    - 解决方案：
+        ```java
+        // 错误做法：直接运算大集合
+        Set<String> common = jedis.sinter("users:followers:1", "users:followers:2");  // 各有几十万粉丝
+        
+        // 正确做法1：先获取集合大小，小集合优先
+        long size1 = jedis.scard("users:followers:1");
+        long size2 = jedis.scard("users:followers:2");
+        if (size1 > 10000 || size2 > 10000) {
+            // 集合太大，改用异步计算或限制返回数量
+            return "集合过大，请缩小范围";
+        }
+        
+        // 正确做法2：使用SINTERSTORE存储结果，异步获取
+        jedis.sinterstore("temp:common:123", "users:followers:1", "users:followers:2");
+        jedis.expire("temp:common:123", 300);  // 5分钟过期
+        // 后续分批获取结果
+        
+        // 正确做法3：业务层面优化（提前计算）
+        // 定期计算共同好友，存储结果
+        ```
+
+    **问题3：Set无限增长成为BigKey**
+    - 现象：只添加不删除，Set元素持续增长
+    - 典型场景：用户标签、文章标签、黑名单
+    - 影响：内存占用高，操作变慢
+    - 解决方案：
+        ```java
+        // 方案1：设置元素数量上限
+        if (jedis.scard("user:tags:123") > 1000) {
+            // 删除最旧的或最不常用的标签
+            String oldTag = jedis.spop("user:tags:123");
+        }
+        
+        // 方案2：定期清理
+        // 使用定时任务清理过期或无效的元素
+        
+        // 方案3：分片存储
+        int shard = Math.abs(userId.hashCode()) % 10;
+        jedis.sadd("user:tags:" + userId + ":shard:" + shard, tag);
+        ```
+
+    **问题4：Set元素过大导致内存编码切换**
+    - 现象：Set从intset编码切换到hashtable编码
+    - 触发条件：元素数超过512或元素不是整数（默认配置）
+    - 影响：内存占用增加
+    - 解决方案：
+        ```shell
+        # 调整编码切换阈值
+        CONFIG SET set-max-intset-entries 1024
+        ```
+        ```java
+        // 代码层面：尽量使用整数作为Set元素
+        // 错误：存储字符串
+        jedis.sadd("user:ids", "user_123", "user_456");
+        
+        // 正确：存储整数
+        jedis.sadd("user:ids", "123", "456");
+        ```
+
+    **问题5：SPOP随机删除导致数据丢失**
+    - 现象：使用SPOP随机删除元素，但业务需要保留这些元素
+    - 影响：数据意外丢失
+    - 解决方案：
+        ```java
+        // 如果只是需要随机获取，不要删除
+        // 错误做法：
+        String randomMember = jedis.spop("lottery:users");  // 删除了
+        
+        // 正确做法：使用SRANDMEMBER
+        String randomMember = jedis.srandmember("lottery:users");  // 不删除
+        
+        // 或者先复制再删除
+        jedis.sunionstore("lottery:users:backup", "lottery:users");
+        String winner = jedis.spop("lottery:users");
+        ```
+
 ### *3.5 Sorted Set（有序集合）*
 
 1. 特点：
@@ -386,7 +785,146 @@ ZREM leaderboard "Alice"         # 删除元素
     - 排行榜（如游戏分数榜）。
     - 延迟队列。
     - 分桶而治。
-    
+
+5. 生产问题及解决方案：
+
+    **问题1：ZRANGE大范围查询导致阻塞**
+    - 现象：ZSet元素过多，使用ZRANGE 0 -1获取全部元素
+    - 影响：命令执行时间长，阻塞Redis主线程
+    - 解决方案：
+        ```java
+        // 错误做法：全量获取
+        Set<String> allMembers = jedis.zrange("leaderboard:global", 0, -1);  // 可能有几百万用户
+        
+        // 正确做法1：分页获取
+        Set<String> topUsers = jedis.zrevrange("leaderboard:global", 0, 99);  // 只获取前100名
+        
+        // 正确做法2：按分数范围获取
+        Set<String> highScoreUsers = jedis.zrangeByScore("leaderboard:global", 1000, 2000);
+        
+        // 正确做法3：使用ZSCAN分批获取
+        String cursor = "0";
+        do {
+            ScanResult<Tuple> result = jedis.zscan("leaderboard:global", cursor, 
+                new ScanParams().count(100));
+            // 处理结果
+            cursor = result.getCursor();
+        } while (!"0".equals(cursor));
+        ```
+
+    **问题2：ZSet作为延迟队列消息重复消费**
+    - 现象：多个消费者同时ZRANGEBYSCORE获取到期消息，导致重复处理
+    - 影响：消息被重复消费，业务逻辑错误
+    - 解决方案：
+        ```java
+        // 错误做法：直接查询+删除（非原子）
+        Set<String> messages = jedis.zrangeByScore("delay:queue", 0, System.currentTimeMillis());
+        for (String msg : messages) {
+            jedis.zrem("delay:queue", msg);  // 可能被多个消费者同时删除
+            processMessage(msg);
+        }
+        
+        // 正确做法1：使用Lua脚本保证原子性
+        String script = 
+            "local messages = redis.call('zrangebyscore', KEYS[1], 0, ARGV[1], 'LIMIT', 0, ARGV[2]) " +
+            "if #messages > 0 then " +
+            "    redis.call('zrem', KEYS[1], unpack(messages)) " +
+            "    return messages " +
+            "end " +
+            "return {}";
+        
+        List<String> messages = (List<String>) jedis.eval(script, 1, 
+            "delay:queue", 
+            String.valueOf(System.currentTimeMillis()), 
+            "10");  // 每次最多取10条
+        
+        // 正确做法2：使用ZPOPMIN（Redis 5.0+）
+        Set<Tuple> messages = jedis.zpopmin("delay:queue", 10);
+        ```
+
+    **问题3：ZSet排行榜分数并列导致排名不准**
+    - 现象：多个用户分数相同，排名顺序不确定
+    - 影响：用户体验差，排名不稳定
+    - 解决方案：
+        ```java
+        // 方案1：分数加时间戳（微调）
+        // 分数 = 实际分数 * 10^6 + (MAX_TIMESTAMP - 当前时间戳)
+        long score = actualScore * 1000000 + (9999999999999L - System.currentTimeMillis());
+        jedis.zadd("leaderboard", score, userId);
+        
+        // 方案2：使用复合分数（分数+时间）
+        String member = userId + ":" + System.currentTimeMillis();
+        jedis.zadd("leaderboard", actualScore, member);
+        
+        // 方案3：分数相同时按字典序排序（Redis 6.2+ ZRANGE支持BYLEX）
+        ```
+
+    **问题4：ZSet无限增长成为BigKey**
+    - 现象：排行榜、延迟队列等场景，元素持续增加
+    - 影响：内存占用高，操作变慢
+    - 解决方案：
+        ```java
+        // 方案1：限制排行榜长度（只保留Top N）
+        jedis.zadd("leaderboard:daily", score, userId);
+        long count = jedis.zcard("leaderboard:daily");
+        if (count > 10000) {
+            // 删除排名最低的元素
+            jedis.zremrangeByRank("leaderboard:daily", 0, count - 10001);
+        }
+        
+        // 方案2：按时间分片
+        String dateKey = "leaderboard:" + LocalDate.now();
+        jedis.zadd(dateKey, score, userId);
+        jedis.expire(dateKey, 86400 * 7);  // 7天过期
+        
+        // 方案3：定期清理过期数据（延迟队列）
+        long now = System.currentTimeMillis();
+        long expireTime = now - 86400000;  // 1天前
+        jedis.zremrangeByScore("delay:queue", 0, expireTime);
+        ```
+
+    **问题5：ZINTERSTORE/ZUNIONSTORE多个大ZSet运算性能问题**
+    - 现象：多个大ZSet进行交集、并集运算，耗时长
+    - 影响：阻塞Redis主线程
+    - 解决方案：
+        ```java
+        // 错误做法：直接运算大集合
+        jedis.zinterstore("result", "zset1", "zset2", "zset3");  // 各有几十万元素
+        
+        // 正确做法1：先检查集合大小
+        long size1 = jedis.zcard("zset1");
+        if (size1 > 10000) {
+            return "集合过大，请缩小范围";
+        }
+        
+        // 正确做法2：异步计算
+        jedis.zinterstore("temp:result:" + requestId, "zset1", "zset2");
+        jedis.expire("temp:result:" + requestId, 300);
+        // 返回任务ID，客户端轮询结果
+        
+        // 正确做法3：业务层面优化（提前计算）
+        // 定期计算常用的交集结果并缓存
+        ```
+
+    **问题6：ZSet分数精度丢失**
+    - 现象：使用浮点数作为分数，精度丢失导致排序错误
+    - 原因：Redis内部使用double存储分数，精度有限
+    - 解决方案：
+        ```java
+        // 错误做法：直接使用浮点数
+        jedis.zadd("scores", 0.123456789012345, "user1");  // 精度可能丢失
+        
+        // 正确做法：转换为整数
+        // 方案1：乘以倍数
+        double actualScore = 0.123456789;
+        long intScore = (long) (actualScore * 1000000000);  // 转为整数
+        jedis.zadd("scores", intScore, "user1");
+        
+        // 方案2：使用字符串存储精确值
+        jedis.hset("scores:detail", "user1", String.valueOf(actualScore));
+        jedis.zadd("scores:rank", intScore, "user1");
+        ```
+
 ### *3.6 Bitmap（位图）*
 1. 特点：
     - 用位操作存储布尔值（0和1）。
@@ -409,6 +947,131 @@ BITCOUNT user:active             # 返回1（只有1个位为1）
     - 活跃用户统计。
     - 用户签到记录。
 
+5. 生产问题及解决方案：
+
+    **问题1：Bitmap offset过大导致内存浪费**
+    - 现象：使用用户ID作为offset，ID不连续或过大（如UUID、雪花ID）
+    - 影响：Bitmap占用大量内存，中间大量位为0浪费空间
+    - 解决方案：
+        ```java
+        // 错误做法：直接使用大ID
+        long userId = 1234567890123L;  // 雪花ID
+        jedis.setbit("user:active", userId, true);  // 会创建超大Bitmap
+        
+        // 正确做法1：使用Hash映射
+        // 维护一个ID映射表
+        Long offset = jedis.hincrBy("user:id:mapping", String.valueOf(userId), 0);
+        if (offset == 0) {
+            offset = jedis.hlen("user:id:mapping");
+            jedis.hset("user:id:mapping", String.valueOf(userId), String.valueOf(offset));
+        }
+        jedis.setbit("user:active", offset, true);
+        
+        // 正确做法2：分片Bitmap
+        // 按ID范围分片：0-1000万一个Bitmap
+        long shardId = userId / 10000000;
+        long offset = userId % 10000000;
+        jedis.setbit("user:active:shard:" + shardId, offset, true);
+        
+        // 正确做法3：改用Set或HyperLogLog
+        jedis.sadd("user:active", String.valueOf(userId));
+        ```
+
+    **问题2：BITCOUNT全量统计性能问题**
+    - 现象：Bitmap过大（几百MB），BITCOUNT统计全部位耗时长
+    - 影响：阻塞Redis主线程
+    - 解决方案：
+        ```java
+        // 错误做法：全量统计
+        long count = jedis.bitcount("user:active:20260513");  // 可能有几亿位
+        
+        // 正确做法1：按范围统计
+        // Bitmap按字节存储，可以分段统计
+        long totalCount = 0;
+        long byteLength = jedis.strlen("user:active:20260513");
+        long chunkSize = 1000000;  // 每次统计100万字节
+        for (long start = 0; start < byteLength; start += chunkSize) {
+            long end = Math.min(start + chunkSize - 1, byteLength - 1);
+            totalCount += jedis.bitcount("user:active:20260513", start, end);
+        }
+        
+        // 正确做法2：实时累加计数
+        // 每次SETBIT时同时更新计数器
+        if (jedis.setbit("user:active", userId, true) == false) {
+            jedis.incr("user:active:count");  // 新增用户，计数+1
+        }
+        
+        // 正确做法3：分片统计
+        // 多个小Bitmap，分别统计后汇总
+        ```
+
+    **问题3：Bitmap多个key的AND/OR/XOR运算性能问题**
+    - 现象：使用BITOP对多个大Bitmap进行位运算
+    - 影响：运算耗时长，阻塞Redis
+    - 解决方案：
+        ```java
+        // 错误做法：直接运算大Bitmap
+        jedis.bitop(BitOP.AND, "result", "bitmap1", "bitmap2", "bitmap3");  // 各有几百MB
+        
+        // 正确做法1：先检查大小
+        long size1 = jedis.strlen("bitmap1");
+        if (size1 > 10 * 1024 * 1024) {  // 超过10MB
+            return "Bitmap过大，请缩小范围";
+        }
+        
+        // 正确做法2：分片运算
+        // 将大Bitmap拆分为多个小Bitmap，分别运算后合并
+        
+        // 正确做法3：异步运算
+        // 使用后台任务计算，返回任务ID
+        ```
+
+    **问题4：Bitmap无法表示负数或稀疏数据**
+    - 现象：业务需要存储负数ID或非常稀疏的数据
+    - 影响：Bitmap不适用，强行使用会浪费大量内存
+    - 解决方案：
+        ```java
+        // 不适合Bitmap的场景：
+        // 1. ID不连续且稀疏（如UUID）
+        // 2. 需要存储多状态（Bitmap只能0/1）
+        // 3. 需要频繁删除和查询
+        
+        // 改用其他数据结构：
+        // 场景1：稀疏数据 -> 使用Set
+        jedis.sadd("active:users", userId);
+        
+        // 场景2：多状态 -> 使用Hash
+        jedis.hset("user:status", userId, "online");
+        
+        // 场景3：大量去重统计 -> 使用HyperLogLog
+        jedis.pfadd("unique:visitors", userId);
+        ```
+
+    **问题5：Bitmap签到场景月底统计慢**
+    - 现象：使用Bitmap记录每日签到，月底统计连续签到天数
+    - 影响：需要遍历所有位，计算复杂
+    - 解决方案：
+        ```java
+        // 方案1：使用BITPOS查找
+        // 查找第一个签到日
+        long firstSignDay = jedis.bitpos("user:sign:202605:123", true);
+        
+        // 方案2：按周分片
+        String weekKey = "user:sign:202605:week1:123";
+        jedis.setbit(weekKey, dayOfWeek, true);
+        
+        // 方案3：实时维护签到统计
+        if (jedis.setbit("user:sign:202605:123", day, true) == false) {
+            // 今天首次签到
+            jedis.hincrBy("user:sign:stats:123", "total", 1);
+            // 检查连续签到
+            if (jedis.getbit("user:sign:202605:123", day - 1)) {
+                jedis.hincrBy("user:sign:stats:123", "continuous", 1);
+            } else {
+                jedis.hset("user:sign:stats:123", "continuous", "1");
+            }
+        }
+        ```
 
 ### *3.7 HyperLogLog*
 1. 特点：
@@ -430,6 +1093,141 @@ PFCOUNT unique_visitors           # 返回2
     - 网站UV（独立访客）统计。
     - 数据去重。
 
+5. 生产问题及解决方案：
+
+    **问题1：HyperLogLog误差导致统计不准确**
+    - 现象：统计结果与实际值有偏差（标准误差0.81%）
+    - 影响：对精确度要求高的场景不适用
+    - 解决方案：
+        ```java
+        // 场景判断：
+        // 1. 可接受误差（UV统计、去重计数）-> 使用HyperLogLog
+        long uv = jedis.pfcount("page:visitors:20260513");
+        
+        // 2. 需要精确值（订单数、金额）-> 使用Set或其他方式
+        jedis.sadd("orders:today", orderId);
+        long exactCount = jedis.scard("orders:today");
+        
+        // 3. 数据量小（<1万）-> 直接用Set，内存占用不大
+        // 4. 数据量大（>1万）且可接受误差 -> 用HyperLogLog
+        
+        // 误差评估：
+        // 基数100万，误差约±8100
+        // 基数1亿，误差约±81万
+        ```
+
+    **问题2：PFMERGE合并多个HLL导致误差累积**
+    - 现象：合并多个HyperLogLog，误差可能增大
+    - 影响：统计结果偏差更大
+    - 解决方案：
+        ```java
+        // 错误做法：频繁合并
+        for (int hour = 0; hour < 24; hour++) {
+            jedis.pfmerge("uv:daily", "uv:hour:" + hour);  // 多次合并
+        }
+        
+        // 正确做法1：一次性合并
+        String[] hourKeys = new String[24];
+        for (int i = 0; i < 24; i++) {
+            hourKeys[i] = "uv:hour:" + i;
+        }
+        jedis.pfmerge("uv:daily", hourKeys);  // 一次合并所有
+        
+        // 正确做法2：直接写入日维度
+        jedis.pfadd("uv:daily:20260513", userId);  // 不需要合并
+        
+        // 正确做法3：评估误差范围
+        long count = jedis.pfcount("uv:daily");
+        long errorRange = (long) (count * 0.0081);  // ±0.81%
+        System.out.println("UV: " + count + " (±" + errorRange + ")");
+        ```
+
+    **问题3：HyperLogLog无法获取具体元素**
+    - 现象：只能统计基数，无法知道具体有哪些元素
+    - 影响：无法满足"查看具体访客列表"等需求
+    - 解决方案：
+        ```java
+        // 方案1：HyperLogLog + Set组合
+        // HyperLogLog用于快速统计，Set用于存储明细
+        jedis.pfadd("uv:count", userId);  // 统计用
+        jedis.sadd("uv:detail", userId);  // 明细用（可设置较短过期时间）
+        jedis.expire("uv:detail", 3600);  // 1小时后删除明细
+        
+        // 方案2：根据数据量选择
+        long estimatedCount = jedis.pfcount("uv:count");
+        if (estimatedCount < 10000) {
+            // 数据量小，直接用Set
+            Set<String> visitors = jedis.smembers("uv:detail");
+        } else {
+            // 数据量大，只返回统计数
+            return "访客数：" + estimatedCount;
+        }
+        
+        // 方案3：分级存储
+        // 热点数据用Set，冷数据只用HyperLogLog
+        ```
+
+    **问题4：HyperLogLog内存占用固定但不小**
+    - 现象：每个HLL固定占用12KB，小基数时不如Set省内存
+    - 影响：数据量小时反而浪费内存
+    - 解决方案：
+        ```java
+        // 内存对比：
+        // Set: 每个元素约50-100字节（取决于值大小）
+        // HyperLogLog: 固定12KB
+        
+        // 临界点：约100-200个元素
+        // 少于100个 -> 用Set更省内存
+        // 多于200个 -> 用HyperLogLog更省内存
+        
+        // 动态选择策略：
+        String countKey = "uv:count:" + pageId;
+        String detailKey = "uv:detail:" + pageId;
+        
+        if (jedis.exists(detailKey)) {
+            long size = jedis.scard(detailKey);
+            if (size < 200) {
+                // 继续用Set
+                jedis.sadd(detailKey, userId);
+            } else {
+                // 迁移到HyperLogLog
+                Set<String> members = jedis.smembers(detailKey);
+                for (String member : members) {
+                    jedis.pfadd(countKey, member);
+                }
+                jedis.del(detailKey);  // 删除Set
+                jedis.pfadd(countKey, userId);
+            }
+        } else {
+            jedis.pfadd(countKey, userId);
+        }
+        ```
+
+    **问题5：HyperLogLog无法删除单个元素**
+    - 现象：PFADD只能添加，无法删除已添加的元素
+    - 影响：无法处理"取消访问"、"删除用户"等场景
+    - 解决方案：
+        ```java
+        // HyperLogLog不支持删除操作，需要其他方案：
+        
+        // 方案1：重建HyperLogLog
+        // 从源数据重新构建（适合有完整数据源的场景）
+        jedis.del("uv:count");
+        for (String validUserId : getValidUsers()) {
+            jedis.pfadd("uv:count", validUserId);
+        }
+        
+        // 方案2：使用Set代替
+        // 如果需要删除操作，就不要用HyperLogLog
+        jedis.sadd("uv:set", userId);
+        jedis.srem("uv:set", userId);  // 可以删除
+        
+        // 方案3：按时间分片，自然过期
+        String hourKey = "uv:" + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHH"));
+        jedis.pfadd(hourKey, userId);
+        jedis.expire(hourKey, 86400);  // 24小时后自动删除
+        ```
+
 ### *3.8 Geo（地理位置）*
 1. 特点：
     - 存储地理坐标数据，支持距离计算和范围查询。
@@ -449,6 +1247,221 @@ GEODIST locations "Palermo" "Catania" km       # 返回距离，单位公里
 4. 应用场景：
     - 附近地点查询。
     - 距离计算。
+
+5. 生产问题及解决方案：
+
+    **问题1：GEORADIUS大范围查询性能问题**
+    - 现象：查询半径过大（如100公里），返回大量结果
+    - 影响：命令执行时间长，阻塞Redis主线程
+    - 解决方案：
+        ```java
+        // 错误做法：大范围查询
+        List<GeoRadiusResponse> results = jedis.georadius("locations", 
+            116.404, 39.915, 100, GeoUnit.KM);  // 100公里，可能返回几万个点
+        
+        // 正确做法1：限制返回数量
+        GeoRadiusParam param = GeoRadiusParam.geoRadiusParam()
+            .withDist()
+            .sortAscending()
+            .count(20);  // 只返回最近的20个
+        List<GeoRadiusResponse> results = jedis.georadius("locations", 
+            116.404, 39.915, 5, GeoUnit.KM, param);  // 缩小半径到5公里
+        
+        // 正确做法2：分级查询
+        // 先查小范围，不够再扩大
+        List<GeoRadiusResponse> results = queryNearby(116.404, 39.915, 1);  // 1公里
+        if (results.size() < 10) {
+            results = queryNearby(116.404, 39.915, 5);  // 扩大到5公里
+        }
+        
+        // 正确做法3：使用GEORADIUSBYMEMBER
+        // 以已知成员为中心查询，避免传递坐标
+        jedis.georadiusByMember("locations", "store:001", 5, GeoUnit.KM, param);
+        ```
+
+    **问题2：Geo数据量大导致性能下降**
+    - 现象：单个Geo key存储几十万个位置点
+    - 影响：查询变慢，内存占用高
+    - 解决方案：
+        ```java
+        // 方案1：按区域分片（GeoHash前缀）
+        // 将全国数据按省份或城市分片
+        String cityCode = getCityCode(longitude, latitude);
+        jedis.geoadd("locations:" + cityCode, longitude, latitude, storeId);
+        
+        // 查询时先确定城市
+        String cityCode = getCurrentCity(userLng, userLat);
+        List<GeoRadiusResponse> results = jedis.georadius("locations:" + cityCode, 
+            userLng, userLat, 5, GeoUnit.KM);
+        
+        // 方案2：按业务类型分片
+        jedis.geoadd("locations:restaurant", longitude, latitude, restaurantId);
+        jedis.geoadd("locations:hotel", longitude, latitude, hotelId);
+        
+        // 方案3：冷热分离
+        // 热点区域（市中心）单独存储，查询更快
+        if (isHotArea(longitude, latitude)) {
+            jedis.geoadd("locations:hot", longitude, latitude, storeId);
+        } else {
+            jedis.geoadd("locations:normal", longitude, latitude, storeId);
+        }
+        ```
+
+    **问题3：Geo坐标精度问题**
+    - 现象：Redis Geo使用GeoHash编码，精度有限
+    - 影响：距离计算可能有误差（约0.5米）
+    - 解决方案：
+        ```java
+        // Redis Geo精度：
+        // 经纬度精度：小数点后6位（约0.1米）
+        // 距离计算误差：约0.5米
+        
+        // 对于高精度要求的场景：
+        // 方案1：存储原始坐标
+        jedis.geoadd("locations", longitude, latitude, storeId);
+        jedis.hset("locations:detail", storeId, longitude + "," + latitude);
+        
+        // 查询时先用Geo粗筛，再用精确坐标计算
+        List<GeoRadiusResponse> candidates = jedis.georadius("locations", 
+            userLng, userLat, 1, GeoUnit.KM);
+        
+        for (GeoRadiusResponse candidate : candidates) {
+            String[] coords = jedis.hget("locations:detail", candidate.getMemberByString()).split(",");
+            double exactDist = calculateDistance(userLng, userLat, 
+                Double.parseDouble(coords[0]), Double.parseDouble(coords[1]));
+            // 使用精确距离
+        }
+        
+        // 方案2：使用专业GIS数据库（PostGIS、MongoDB）
+        ```
+
+    **问题4：Geo无法按其他条件过滤**
+    - 现象：GEORADIUS只能按距离查询，无法同时按价格、评分等过滤
+    - 影响：需要在应用层二次过滤，效率低
+    - 解决方案：
+        ```java
+        // 方案1：多条件组合查询
+        // 先用Geo查询附近，再用其他数据结构过滤
+        List<GeoRadiusResponse> nearby = jedis.georadius("locations", 
+            userLng, userLat, 5, GeoUnit.KM);
+        
+        List<String> filtered = new ArrayList<>();
+        for (GeoRadiusResponse loc : nearby) {
+            String storeId = loc.getMemberByString();
+            // 检查价格
+            String price = jedis.hget("store:info:" + storeId, "price");
+            if (Integer.parseInt(price) <= maxPrice) {
+                filtered.add(storeId);
+            }
+        }
+        
+        // 方案2：预先分类存储
+        // 按价格区间分别存储Geo数据
+        if (price <= 50) {
+            jedis.geoadd("locations:cheap", longitude, latitude, storeId);
+        } else if (price <= 100) {
+            jedis.geoadd("locations:medium", longitude, latitude, storeId);
+        } else {
+            jedis.geoadd("locations:expensive", longitude, latitude, storeId);
+        }
+        
+        // 查询时直接查对应价格区间
+        List<GeoRadiusResponse> results = jedis.georadius("locations:cheap", 
+            userLng, userLat, 5, GeoUnit.KM);
+        
+        // 方案3：使用Elasticsearch Geo查询
+        // 支持复杂的地理位置+业务条件组合查询
+        ```
+
+    **问题5：Geo位置更新频繁导致性能问题**
+    - 现象：外卖骑手、出租车等位置频繁更新（每秒多次）
+    - 影响：Redis写入压力大，可能影响其他操作
+    - 解决方案：
+        ```java
+        // 方案1：降低更新频率
+        // 客户端限流，只在位置变化超过一定距离时更新
+        double lastLng = getLastLng(riderId);
+        double lastLat = getLastLat(riderId);
+        double distance = calculateDistance(lastLng, lastLat, newLng, newLat);
+        
+        if (distance > 50) {  // 移动超过50米才更新
+            jedis.geoadd("riders:location", newLng, newLat, riderId);
+            saveLastLocation(riderId, newLng, newLat);
+        }
+        
+        // 方案2：批量更新
+        // 收集多个位置更新，批量写入
+        Map<String, GeoCoordinate> batch = new HashMap<>();
+        batch.put(riderId1, new GeoCoordinate(lng1, lat1));
+        batch.put(riderId2, new GeoCoordinate(lng2, lat2));
+        jedis.geoadd("riders:location", batch);
+        
+        // 方案3：使用本地缓存
+        // 位置数据先写本地缓存，定期同步到Redis
+        localCache.put(riderId, new Location(lng, lat));
+        // 每5秒批量同步一次
+        
+        // 方案4：分离实时位置和历史轨迹
+        // 实时位置用Redis Geo（只保留最新）
+        jedis.geoadd("riders:current", lng, lat, riderId);
+        // 历史轨迹存时序数据库（InfluxDB、TimescaleDB）
+        ```
+
+    **问题6：GEODIST计算大量距离导致性能问题**
+    - 现象：需要计算用户到多个地点的距离
+    - 影响：多次调用GEODIST，网络开销大
+    - 解决方案：
+        ```java
+        // 错误做法：循环调用GEODIST
+        for (String storeId : storeIds) {
+            Double distance = jedis.geodist("locations", "user:123", storeId, GeoUnit.KM);
+            // 处理距离
+        }
+        
+        // 正确做法1：使用GEORADIUS一次性获取
+        GeoRadiusParam param = GeoRadiusParam.geoRadiusParam()
+            .withDist()  // 返回距离
+            .withCoord();  // 返回坐标
+        List<GeoRadiusResponse> results = jedis.georadius("locations", 
+            userLng, userLat, 10, GeoUnit.KM, param);
+        
+        // 正确做法2：使用Pipeline批量查询
+        Pipeline pipeline = jedis.pipelined();
+        List<Response<Double>> responses = new ArrayList<>();
+        for (String storeId : storeIds) {
+            responses.add(pipeline.geodist("locations", "user:123", storeId, GeoUnit.KM));
+        }
+        pipeline.sync();
+        
+        for (Response<Double> response : responses) {
+            Double distance = response.get();
+            // 处理距离
+        }
+        ```
+
+### 3.9 数据类型选择建议
+
+根据业务场景选择合适的数据类型：
+
+| 场景 | 推荐类型 | 原因 |
+|------|---------|------|
+| 简单KV缓存 | String | 最简单，性能最好 |
+| 对象存储 | Hash | 结构化，节省内存 |
+| 消息队列 | List/Stream | List简单，Stream功能更强 |
+| 去重/标签 | Set | 自动去重，支持集合运算 |
+| 排行榜 | Sorted Set | 自动排序，范围查询快 |
+| 签到/状态 | Bitmap | 内存占用极小（大量用户） |
+| UV统计 | HyperLogLog | 内存固定12KB，可接受误差 |
+| 附近的人 | Geo | 地理位置专用 |
+
+**性能优化通用原则：**
+1. 避免BigKey（单个key过大）
+2. 避免全量操作（KEYS、SMEMBERS、HGETALL等）
+3. 使用SCAN代替全量查询
+4. 合理设置过期时间
+5. 监控key数量和内存使用
+6. 大集合考虑分片存储
+7. 热key考虑本地缓存或分片
 
 ## 4. 跳表
 ### *4.1 Redis中的跳表详解*
@@ -948,24 +1961,70 @@ public class RedissonTransactionExample {
 ## 7. Redis的过期删除策略
 Redis数据过期后，采用了多种策略来删除过期键，以平衡性能和资源利用。这些策略分为主动删除和被动删除两种类型。参数名为`maxmemory-policy`
 
-### 7.1 被动删除（惰性删除）
+### 7.1 过期键的存储结构
+
+1. 过期字典（expires dict）
+    - Redis为每个数据库维护一个过期字典，专门存储键的过期时间。
+    - 结构：
+        ```
+        redisDb {
+            dict *dict;           // 键空间，存储所有键值对
+            dict *expires;        // 过期字典，存储键的过期时间
+            ...
+        }
+        ```
+    - 过期字典的键是指向键空间中键对象的指针。
+    - 过期字典的值是long long类型的整数，保存键的过期时间（Unix时间戳，毫秒精度）。
+
+2. 过期时间的设置
+    - EXPIRE key seconds：设置秒级过期时间
+    - PEXPIRE key milliseconds：设置毫秒级过期时间
+    - EXPIREAT key timestamp：设置Unix时间戳过期时间
+    - PEXPIREAT key milliseconds-timestamp：设置毫秒级Unix时间戳
+    - 所有命令最终都转换为PEXPIREAT执行
+
+3. 查看过期时间
+    ```shell
+    TTL key        # 返回剩余秒数，-1表示永不过期，-2表示键不存在
+    PTTL key       # 返回剩余毫秒数
+    ```
+
+### 7.2 被动删除（惰性删除 Lazy Expiration）
+
 1. 机制：
     - Redis会在访问键时，检查该键是否已经过期。
     - 如果键过期，会立即删除并返回空值或错误。
+    - 实现位置：所有读写命令执行前都会调用expireIfNeeded()函数。
 
-2. 优点：
+2. 执行流程：
+    ```
+    1. 客户端执行GET key
+    2. Redis调用expireIfNeeded(key)
+    3. 检查expires字典中key的过期时间
+    4. 如果已过期：
+       - 删除键空间中的key
+       - 删除expires字典中的key
+       - 返回NULL
+    5. 如果未过期：
+       - 返回键的值
+    ```
+
+3. 优点：
     - 只有在访问过期键时才进行删除操作，不会额外占用CPU资源。
+    - 删除操作分散在各个命令中，不会造成集中的性能抖动。
 
-3. 缺点：
+4. 缺点：
     - 如果没有访问过期键，这些键仍然会占用内存，可能导致内存被浪费。
+    - 对于大量过期但不再访问的键，会造成内存泄漏。
 
-4. 示例：
+5. 示例：
 ```shell
 SET key "value" EX 10     # 设置键的过期时间为10秒
 GET key                   # 如果在10秒后访问，将发现键已过期并被删除
 ```
 
-### 7.2 主动删除（定期删除）
+### 7.3 主动删除（定期删除 Active Expiration）
+
 1. 机制：
     - Redis周期性地检查数据库中是否有过期键，并主动删除这些键。  
     - 通过配置参数`hz`（默认10），Redis定期执行以下任务：
@@ -973,38 +2032,87 @@ GET key                   # 如果在10秒后访问，将发现键已过期并�
         - 如果发现过期键，立即删除。
         - 限制删除操作的时间占用，避免阻塞主线程。
 
-2. 优点：
+2. 执行流程（activeExpireCycle函数）：
+    ```
+    1. 每隔1000/hz毫秒执行一次（默认100ms）
+    2. 遍历所有数据库（默认16个）
+    3. 对每个数据库：
+       a. 从expires字典中随机抽取20个键
+       b. 删除其中所有已过期的键
+       c. 如果过期键比例>25%，重复步骤a
+       d. 单次执行时间不超过25ms（避免阻塞）
+    4. 如果超时，下次继续从当前数据库开始
+    ```
+
+3. 两种模式：
+    - SLOW模式：
+        - 执行频率：每秒10次（由hz参数控制）
+        - 执行时长：最多25ms
+        - 触发时机：Redis定时任务
+    - FAST模式：
+        - 执行频率：每次事件循环前
+        - 执行时长：最多1ms
+        - 触发时机：beforeSleep()函数
+        - 条件：距离上次FAST模式执行超过2ms
+
+4. 优点：
     - 可以及时清理过期键，减少内存占用。
+    - 通过限制执行时间，避免长时间阻塞。
 
-1. 缺点：
+5. 缺点：
     - 定期检查可能会浪费CPU资源，尤其在键较多时。
+    - 采样机制可能遗漏部分过期键。
 
-4. 细节：
-    - Redis采用分区采样机制：
-        - 随机选择一定数量的键进行检查。
-        - 如果发现过期键，删除并继续抽样。
-        - 限制每次检查的时间，避免对其他操作产生影响。
+6. 细节：
+    - Redis采用自适应的采样机制：
+        - 如果过期键比例高，会增加采样次数。
+        - 如果过期键比例低，会减少采样次数。
+        - 通过时间限制，保证不会长时间阻塞主线程。
 
-### 7.3 内存淘汰策略
+### 7.4 内存淘汰策略（Eviction Policy）
+
 1. 机制：
     - 当内存不足时，Redis会触发内存淘汰策略，删除一些键（包括过期键和未过期键）。  
     - 这种策略通常用于防止内存溢出。
+    - 触发时机：写入命令执行前，检查内存使用量是否超过maxmemory。
 
 2. 内存淘汰策略：
     - *noeviction*：禁止淘汰，当内存满时返回错误（默认）。
     - *volatile-lru*：从设置了过期时间的键中，淘汰最近最少使用的键。
     - *allkeys-lru*：从所有键中，淘汰最近最少使用的键。
+    - *volatile-lfu*：从设置了过期时间的键中，淘汰最不经常使用的键（Redis 4.0+）。
+    - *allkeys-lfu*：从所有键中，淘汰最不经常使用的键（Redis 4.0+）。
     - *volatile-random*：从设置了过期时间的键中，随机淘汰键。
     - *allkeys-random*：从所有键中，随机淘汰键。
     - *volatile-ttl*：从设置了过期时间的键中，优先淘汰存活时间最短的键。
 
-3. 配置方法：
+3. LRU vs LFU：
+    - LRU（Least Recently Used）：淘汰最近最少使用的键
+        - 适合：访问模式随时间变化的场景
+        - 缺点：可能淘汰偶尔访问但很重要的键
+    - LFU（Least Frequently Used）：淘汰访问频率最低的键
+        - 适合：热点数据相对固定的场景
+        - 优点：更准确地识别热点数据
+        - 实现：Redis使用Morris计数器近似统计访问频率
+
+4. 配置方法：
 ```shell
 # 配置内存淘汰策略
 CONFIG SET maxmemory-policy allkeys-lru
+
+# 查看当前策略
+CONFIG GET maxmemory-policy
 ```
 
-### 7.4 参数配置与优化
+### 7.5 三种策略的对比
+
+| 策略类型 | 执行时机 | CPU开销 | 内存效率 | 适用场景 |
+|---------|---------|---------|---------|---------|
+| 惰性删除 | 访问键时 | 低 | 低（可能有内存泄漏） | 访问频繁的键 |
+| 定期删除 | 周期性执行 | 中 | 中（采样机制） | 通用场景 |
+| 内存淘汰 | 内存不足时 | 高 | 高（强制释放） | 内存受限场景 |
+
+### 7.6 参数配置与优化
 
 1. `hz`参数：
     - 控制Redis的全局频率，影响过期键检查的频率。
@@ -1013,15 +2121,255 @@ CONFIG SET maxmemory-policy allkeys-lru
     ```shell
     CONFIG SET hz 20
     ```
+    - 建议：
+        - 一般场景：保持默认值10
+        - 过期键较多：可设置为20-50
+        - 不建议超过100（CPU开销过大）
     
 2. `maxmemory`：
     - 设置Redis的最大内存限制，防止内存无限增长。
     ```shell
     CONFIG SET maxmemory 512mb
     ```
+    - 建议：
+        - 设置为物理内存的60%-70%
+        - 为系统和其他进程预留足够内存
     
 3. `maxmemory-policy`：
     - 配置内存淘汰策略，适配业务场景。
+    - 建议：
+        - 缓存场景：allkeys-lru或allkeys-lfu
+        - 持久化场景：noeviction（避免数据丢失）
+        - 混合场景：volatile-lru或volatile-lfu
+
+4. `maxmemory-samples`：
+    - LRU/LFU算法的采样数量，默认5。
+    - 值越大，淘汰越精确，但CPU开销越大。
+    ```shell
+    CONFIG SET maxmemory-samples 10
+    ```
+
+### 7.7 实际应用场景和最佳实践
+
+1. 会话管理（Session）
+    - 场景：用户登录后的会话信息
+    - 策略：设置合理的过期时间（如30分钟）
+    - 示例：
+    ```shell
+    SET session:user123 "session_data" EX 1800  # 30分钟过期
+    ```
+
+2. 验证码
+    - 场景：短信/邮箱验证码
+    - 策略：设置短过期时间（如5分钟）
+    - 示例：
+    ```shell
+    SET captcha:phone:13800138000 "123456" EX 300  # 5分钟过期
+    ```
+
+3. 缓存数据
+    - 场景：数据库查询结果缓存
+    - 策略：根据数据更新频率设置过期时间
+    - 示例：
+    ```shell
+    SET cache:user:123 "user_data" EX 3600  # 1小时过期
+    ```
+
+4. 限流计数
+    - 场景：API限流
+    - 策略：使用INCR+EXPIRE实现滑动窗口
+    - 示例：
+    ```shell
+    INCR rate:limit:user123:20260513120000
+    EXPIRE rate:limit:user123:20260513120000 60  # 1分钟窗口
+    ```
+
+### 7.8 常见问题和解决方案
+
+1. 问题：大量键同时过期导致Redis卡顿
+    - 原因：定期删除在短时间内处理大量过期键
+    - 解决方案：
+        - 为过期时间添加随机值，避免集中过期
+        ```java
+        // Java示例
+        int expireTime = 3600 + new Random().nextInt(300);  // 3600-3900秒
+        jedis.setex(key, expireTime, value);
+        ```
+        - 增大hz值，分散删除压力
+        - 使用UNLINK代替DEL（异步删除）
+
+2. 问题：过期键占用大量内存
+    - 原因：惰性删除无法及时清理不再访问的键
+    - 解决方案：
+        - 增大hz值，提高定期删除频率
+        - 设置maxmemory和合适的淘汰策略
+        - 定期使用SCAN命令清理过期键
+
+3. 问题：内存淘汰导致重要数据被删除
+    - 原因：淘汰策略选择不当
+    - 解决方案：
+        - 重要数据不设置过期时间
+        - 使用volatile-*策略，只淘汰设置了过期时间的键
+        - 增加Redis内存或使用集群分片
+
+4. 问题：过期时间不准确
+    - 原因：主从复制延迟或时钟不同步
+    - 解决方案：
+        - 使用NTP同步服务器时间
+        - 主从架构中，从库不会主动删除过期键（等待主库的DEL命令）
+        - 使用Redis Cluster避免主从延迟问题
+
+### 7.9 性能优化建议
+
+1. 合理设置过期时间
+    - 避免设置过短的过期时间（增加删除频率）
+    - 避免设置过长的过期时间（浪费内存）
+    - 为过期时间添加随机抖动（避免集中过期）
+
+2. 监控过期键数量
+    ```shell
+    INFO stats | grep expired_keys  # 查看已删除的过期键数量
+    INFO keyspace                   # 查看各数据库的键数量和过期键数量
+    ```
+
+3. 使用SCAN代替KEYS
+    - KEYS命令会阻塞Redis
+    - SCAN命令是增量迭代，不会阻塞
+    ```shell
+    SCAN 0 MATCH user:* COUNT 100
+    ```
+
+4. 大键处理
+    - 大键过期时可能造成阻塞
+    - 使用UNLINK异步删除大键
+    - 或将大键拆分为多个小键
+
+5. 监控内存使用
+    ```shell
+    INFO memory                     # 查看内存使用情况
+    MEMORY STATS                    # 查看详细内存统计
+    ```
+
+### 7.10 Java代码示例
+
+1. 设置带随机过期时间的键
+```java
+import redis.clients.jedis.Jedis;
+import java.util.Random;
+
+public class RedisExpireExample {
+    private static final Jedis jedis = new Jedis("localhost", 6379);
+    private static final Random random = new Random();
+    
+    /**
+     * 设置键值，带随机过期时间
+     */
+    public static void setWithRandomExpire(String key, String value, int baseExpire) {
+        // 添加0-10%的随机抖动
+        int randomExpire = baseExpire + random.nextInt(baseExpire / 10);
+        jedis.setex(key, randomExpire, value);
+    }
+    
+    /**
+     * 获取键值，自动续期
+     */
+    public static String getWithRenewal(String key, int renewExpire) {
+        String value = jedis.get(key);
+        if (value != null) {
+            // 访问时自动续期
+            jedis.expire(key, renewExpire);
+        }
+        return value;
+    }
+    
+    /**
+     * 批量清理过期键（使用SCAN）
+     */
+    public static void cleanExpiredKeys(String pattern) {
+        String cursor = "0";
+        do {
+            redis.clients.jedis.ScanResult<String> result = 
+                jedis.scan(cursor, new redis.clients.jedis.ScanParams().match(pattern).count(100));
+            
+            for (String key : result.getResult()) {
+                Long ttl = jedis.ttl(key);
+                if (ttl != null && ttl == -1) {
+                    // 没有设置过期时间的键，根据业务逻辑处理
+                    jedis.expire(key, 86400);  // 设置默认1天过期
+                }
+            }
+            cursor = result.getCursor();
+        } while (!"0".equals(cursor));
+    }
+    
+    public static void main(String[] args) {
+        // 示例1：设置带随机过期时间的缓存
+        setWithRandomExpire("user:123", "user_data", 3600);
+        
+        // 示例2：获取并自动续期
+        String value = getWithRenewal("session:abc", 1800);
+        
+        // 示例3：清理过期键
+        cleanExpiredKeys("temp:*");
+        
+        jedis.close();
+    }
+}
+```
+
+2. 使用Redisson处理过期事件
+```java
+import org.redisson.Redisson;
+import org.redisson.api.RBucket;
+import org.redisson.api.RedissonClient;
+import org.redisson.api.listener.MessageListener;
+import org.redisson.config.Config;
+
+import java.util.concurrent.TimeUnit;
+
+public class RedissonExpireExample {
+    public static void main(String[] args) {
+        Config config = new Config();
+        config.useSingleServer().setAddress("redis://127.0.0.1:6379");
+        RedissonClient redisson = Redisson.create(config);
+        
+        // 设置键值和过期时间
+        RBucket<String> bucket = redisson.getBucket("mykey");
+        bucket.set("myvalue", 10, TimeUnit.SECONDS);
+        
+        // 监听过期事件（需要Redis配置notify-keyspace-events Ex）
+        redisson.getTopic("__keyevent@0__:expired")
+            .addListener(String.class, new MessageListener<String>() {
+                @Override
+                public void onMessage(CharSequence channel, String key) {
+                    System.out.println("键已过期: " + key);
+                    // 处理过期后的业务逻辑
+                }
+            });
+        
+        redisson.shutdown();
+    }
+}
+```
+
+### 7.11 总结
+
+1. Redis使用三种策略组合删除过期键：
+    - 惰性删除：访问时检查，CPU开销低但可能浪费内存
+    - 定期删除：周期性采样删除，平衡CPU和内存
+    - 内存淘汰：内存不足时强制删除，保证系统稳定
+
+2. 最佳实践：
+    - 为过期时间添加随机抖动，避免集中过期
+    - 根据业务场景选择合适的淘汰策略
+    - 监控过期键数量和内存使用情况
+    - 使用SCAN代替KEYS，避免阻塞
+    - 大键使用UNLINK异步删除
+
+3. 配置建议：
+    - hz：默认10，过期键多时可增大到20-50
+    - maxmemory：设置为物理内存的60%-70%
+    - maxmemory-policy：缓存场景用allkeys-lru，持久化场景用noeviction
 
 ![[Pasted image 20250304140222.png]]
 
