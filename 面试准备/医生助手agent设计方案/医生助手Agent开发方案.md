@@ -1,19 +1,28 @@
-# 医生助手Agent开发方案
+# 医生助手ReAct Agent开发方案
 
 ## 一、项目概述
 
 ### 1.1 背景
-基于现有的智能体重健康管家项目，为医生端开发AI助手Agent，提升医生工作效率，优化患者管理流程。
+
+基于现有的智能体重健康管家项目，为医生端开发**真正的AI Agent系统**，实现自主推理、多步决策和智能行动执行。
+
+**与传统方案的区别：**
+- ❌ **传统方案**：LLM + Function Calling（固定流程，被动响应）
+- ✅ **Agent方案**：ReAct Agent（自主决策，主动推理）
 
 ### 1.2 核心价值
-- **效率提升**：自动生成患者摘要，节省医生80%的信息查阅时间
-- **决策辅助**：基于历史数据和相似病例，提供处方建议
-- **风险预警**：智能识别高风险患者，优先级排序
-- **质量保障**：标准化回复模板，减少医疗差错
+
+- **自主推理**：Agent自己决定查询什么、分析什么、做什么
+- **多步决策**：根据观察结果动态调整策略，不是固定流程
+- **智能行动**：不只是查询数据，还能发送消息、创建任务、起草处方
+- **完全透明**：每一步Thought、Action、Observation都可见
+- **医疗安全**：高风险操作需医生确认，低风险操作直接执行
 
 ### 1.3 技术栈
-- **AI模型**：Claude API (Opus/Sonnet)
-- **后端框架**：Spring Boot + MyBatis Plus
+
+- **AI模型**：Claude Opus 4.7（支持复杂推理）
+- **Agent架构**：ReAct (Reasoning + Acting)
+- **后端框架**：Spring Boot 3.x + MyBatis Plus
 - **数据存储**：MySQL + Redis + Milvus
 - **消息队列**：RabbitMQ
 - **并发处理**：CompletableFuture + ThreadPoolTaskExecutor
@@ -27,281 +36,258 @@
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                    医生后台前端                          │
-│  [患者列表] [患者详情] [AI助手面板] [处方编辑器]        │
+│  [患者列表] [AI助手对话] [任务确认面板] [执行日志]      │
 └────────────────────┬────────────────────────────────────┘
                      │ HTTP/WebSocket
 ┌────────────────────▼────────────────────────────────────┐
-│              DoctorAssistantController                   │
-│  POST /api/assistant/patient-summary                     │
-│  POST /api/assistant/prescription-suggest                │
-│  POST /api/assistant/risk-analysis                       │
-│  POST /api/assistant/reply-draft                         │
+│              AgentController                             │
+│  POST /api/agent/execute                                 │
+│  GET  /api/agent/pending-tasks                           │
+│  POST /api/agent/tasks/{id}/approve                      │
+│  GET  /api/agent/sessions/{id}                           │
 └────────────────────┬────────────────────────────────────┘
                      │
 ┌────────────────────▼────────────────────────────────────┐
-│           DoctorAssistantService (核心)                  │
+│           ReActAgentEngine (核心引擎)                    │
 │  ┌──────────────────────────────────────────────┐       │
-│  │  AgentOrchestrator (Agent编排器)             │       │
-│  │  - 任务分解                                   │       │
-│  │  - 并发执行                                   │       │
-│  │  - 结果聚合                                   │       │
-│  │  - 错误处理                                   │       │
+│  │  ReAct循环：                                  │       │
+│  │  1. Thought (思考下一步)                      │       │
+│  │  2. Action (决定调用什么工具)                 │       │
+│  │  3. Observation (观察工具执行结果)            │       │
+│  │  4. 重复或Finish                              │       │
 │  └──────────────────────────────────────────────┘       │
 │                                                           │
 │  ┌──────────────────────────────────────────────┐       │
-│  │  ToolRegistry (工具注册中心)                 │       │
-│  │  - query_patient_data                         │       │
-│  │  - query_prescription_history                 │       │
-│  │  - query_similar_cases                        │       │
-│  │  - calculate_bmi_trend                        │       │
+│  │  ActionExecutor (行动执行器)                 │       │
+│  │  - 低风险行动：直接执行                       │       │
+│  │  - 高风险行动：创建待确认任务                 │       │
 │  └──────────────────────────────────────────────┘       │
 └─────┬────────┬────────┬────────┬────────┬───────────────┘
       │        │        │        │        │
    ┌──▼──┐ ┌──▼──┐ ┌───▼──┐ ┌──▼──┐ ┌───▼────┐
-   │MySQL│ │Claude│ │Redis │ │Milvus│ │RabbitMQ│
-   │ DB  │ │ API  │ │Cache │ │Vector│ │  MQ    │
-   └─────┘ └──────┘ └──────┘ └──────┘ └────────┘
+   │Tool │ │Tool │ │Tool  │ │Tool │ │Tool    │
+   │查询 │ │分析 │ │发送  │ │创建 │ │修改    │
+   │数据 │ │计算 │ │消息  │ │任务 │ │处方    │
+   └─────┘ └─────┘ └──────┘ └─────┘ └────────┘
 ```
 
 ### 2.2 核心模块
 
-#### 2.2.1 AgentOrchestrator（编排器）
-负责任务分解、并发执行、结果聚合
+#### 2.2.1 ReActAgentEngine（Agent引擎）
+负责ReAct循环的执行、状态管理、暂停/恢复机制
 
 #### 2.2.2 ToolRegistry（工具注册中心）
-管理Agent可调用的工具函数（Function Calling）
+管理13个工具：查询、分析、通知、医疗决策
 
-#### 2.2.3 PromptBuilder（提示词构建器）
-根据不同场景动态生成Prompt
+#### 2.2.3 ActionExecutor（行动执行器）
+根据风险等级决定执行策略（直接执行 vs 需要确认）
 
-#### 2.2.4 ResponseParser（响应解析器）
-解析Claude API返回的结构化数据
+#### 2.2.4 ReActPromptBuilder（Prompt构建器）
+构建ReAct格式的System Prompt和对话历史
 
----
-
-## 三、核心功能设计
-
-### 3.1 功能一：患者健康摘要生成
-
-#### 3.1.1 功能描述
-医生点击患者卡片，AI自动生成包含以下内容的摘要：
-- 基本信息（年龄、性别、目标体重）
-- 健康状况（BMI、慢性病、风险评估）
-- 近期动态（体重趋势、打卡频率、聊天活跃度）
-- 关键事件（最近处方、支付订单、异常指标）
-- 医生建议（基于历史数据和相似病例）
-
-#### 3.1.2 数据流程
-
-```
-医生点击患者
-    ↓
-前端调用 /api/assistant/patient-summary
-    ↓
-AgentOrchestrator 并发查询5个数据源：
-    - 用户画像（Redis缓存）
-    - 问卷数据（MySQL）
-    - 体重记录（MySQL，最近30天）
-    - 评估报告（MySQL）
-    - 聊天记录（MySQL，最近20条）
-    ↓
-PromptBuilder 构建Prompt（包含所有数据）
-    ↓
-调用 Claude API（带Tool Use）
-    ↓
-Claude 可能调用工具：
-    - query_prescription_history（查询历史处方）
-    - query_similar_cases（查询相似病例）
-    ↓
-ResponseParser 解析结构化输出
-    ↓
-返回 PatientSummaryVO 给前端
-```
-
-#### 3.1.3 性能优化
-- **并发查询**：使用CompletableFuture，5个数据源并行查询
-- **缓存策略**：用户画像优先从Redis读取
-- **增量更新**：摘要缓存5分钟，期间直接返回缓存
-- **异步生成**：首次生成较慢，可先返回"生成中"，通过WebSocket推送结果
+#### 2.2.5 ReActResponseParser（响应解析器）
+解析Claude的Thought、Action、Observation
 
 ---
 
-### 3.2 功能二：智能处方建议
+## 三、ReAct工作流程
 
-#### 3.2.1 功能描述
-医生编辑处方时，AI根据患者情况推荐：
-- 推荐的产品/服务
-- 建议的用量和周期
-- 注意事项和禁忌
-- 历史处方参考
+### 3.1 完整执行示例
 
-#### 3.2.2 核心逻辑
-
-**输入：**
-- customerId
-- 当前症状/需求（可选）
-
-**处理流程：**
-1. 查询患者画像（疾病、过敏史、用药史）
-2. 查询历史处方（本患者 + 相似患者）
-3. 调用Claude API生成建议
-4. 返回结构化处方模板
-
-**输出：**
-```json
-{
-  "recommendations": [
-    {
-      "productName": "膳食纤维补充剂",
-      "dosage": "每日2次，每次5g",
-      "duration": "30天",
-      "reason": "患者便秘问题明显，膳食纤维摄入不足",
-      "contraindications": "无已知过敏史",
-      "confidence": 0.85
-    }
-  ],
-  "historicalReference": [
-    {
-      "date": "2024-01-15",
-      "prescription": "...",
-      "effect": "患者反馈良好，体重下降2kg"
-    }
-  ]
+```
+医生："分析患者张三的健康状况"
+    ↓
+【第1步】Agent思考
+Thought: "我需要先了解患者的基本信息"
+Action: get_patient_profile
+Action Input: {"customerId": "张三"}
+    ↓
+Observation: {"age": 35, "gender": "女", "bmi": 22.5, "chronicDiseases": ["高血压"]}
+    ↓
+【第2步】Agent根据发现决定下一步
+Thought: "患者有高血压，需要查看用药情况"
+Action: get_prescription_history
+Action Input: {"customerId": "张三"}
+    ↓
+Observation: [历史处方数据]
+    ↓
+【第3步】Agent继续探索
+Thought: "体重目标是减重，需要查看进展"
+Action: get_weight_history
+Action Input: {"customerId": "张三", "days": 30}
+    ↓
+Observation: [体重下降3kg，但最近反弹1kg]
+    ↓
+【第4步】Agent发现异常
+Thought: "反弹可能有原因，查看聊天记录"
+Action: get_chat_history
+Action Input: {"customerId": "张三"}
+    ↓
+Observation: [患者说"有点焦虑"、"是不是方法不对"]
+    ↓
+【第5步】Agent决定采取行动（高风险）
+Thought: "患者有焦虑情绪，建议心理咨询"
+Action: draft_prescription
+Action Input: {
+  "customerId": "张三",
+  "recommendations": [{"productName": "心理咨询服务"}]
 }
+    ↓
+⚠️ 高风险操作 → 创建待确认任务 → Agent暂停
+    ↓
+【医生审批】
+医生查看详情 → 批准执行
+    ↓
+Agent恢复执行
+    ↓
+Observation: "处方草稿已创建"
+    ↓
+【第6步】Agent完成任务
+Thought: "现在我有足够信息生成完整分析了"
+Final Answer: [完整的患者分析报告]
 ```
+
+### 3.2 关键特性
+
+**Agent自主决策：**
+- ✅ Agent自己决定查询顺序（不是固定的5个数据源）
+- ✅ 根据发现动态调整策略（发现焦虑 → 查聊天记录）
+- ✅ 主动采取行动（起草处方、发送提醒）
+- ✅ 每一步推理过程透明可见
+
+**与传统方案对比：**
+
+| 特性 | 传统方案 | ReAct Agent |
+|------|---------|------------|
+| 决策方式 | 固定流程 | 自主决策 |
+| 数据查询 | 预先查询所有 | 按需查询 |
+| 推理过程 | 黑盒 | 透明可见 |
+| 灵活性 | 低 | 高 |
+| 扩展性 | 需改代码 | 注册新工具 |
 
 ---
 
-### 3.3 功能三：风险患者识别
+## 四、工具系统设计
 
-#### 3.3.1 功能描述
-自动扫描所有患者，识别高风险情况：
-- 体重异常波动（7天内±5%）
-- 长期未打卡（>14天）
-- 指标恶化（血糖、血压超标）
-- 负面情绪（聊天记录情感分析）
+### 4.1 工具分类
 
-#### 3.3.2 实现方式
-
-**定时任务：**
 ```java
-@Scheduled(cron = "0 0 9 * * ?") // 每天9点执行
-public void scanRiskPatients() {
-    // 1. 查询所有活跃患者
-    List<String> customerIds = customerService.listActiveCustomers();
-    
-    // 2. 批量分析（每批50个）
-    List<RiskPatientVO> riskPatients = new ArrayList<>();
-    for (List<String> batch : Lists.partition(customerIds, 50)) {
-        List<CompletableFuture<RiskPatientVO>> futures = batch.stream()
-            .map(id -> CompletableFuture.supplyAsync(
-                () -> analyzePatientRisk(id), 
-                dbExecutor
-            ))
-            .collect(Collectors.toList());
-        
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-            .join();
-        
-        futures.stream()
-            .map(CompletableFuture::join)
-            .filter(vo -> vo.getRiskLevel() >= 3) // 风险等级>=3
-            .forEach(riskPatients::add);
-    }
-    
-    // 3. 发送通知给医生
-    notifyDoctors(riskPatients);
+public enum ToolRiskLevel {
+    LOW,      // 低风险：查询、分析 - 直接执行
+    MEDIUM,   // 中风险：发消息、创建任务 - 直接执行但记录
+    HIGH      // 高风险：修改处方、诊断建议 - 需要医生确认
 }
 ```
 
----
+### 4.2 13个工具清单
 
-### 3.4 功能四：智能回复草稿
+#### 低风险工具（查询类）
+1. **get_patient_profile** - 查询患者基本信息
+2. **get_weight_history** - 查询体重历史
+3. **get_chat_history** - 查询聊天记录
+4. **get_prescription_history** - 查询历史处方
+5. **search_similar_cases** - 搜索相似病例（Milvus）
 
-#### 3.4.1 功能描述
-医生查看患者消息时，AI生成回复建议：
-- 专业且温暖的语气
-- 基于患者画像个性化
-- 包含具体建议（饮食、运动）
-- 医生可编辑后发送
+#### 低风险工具（分析类）
+6. **analyze_weight_trend** - 分析体重趋势并预测
+7. **analyze_sentiment** - 分析聊天情感倾向
+8. **calculate_risk_score** - 计算患者风险评分
 
-#### 3.4.2 Prompt设计
+#### 中风险工具（通知类）
+9. **send_reminder** - 给患者发送提醒消息
+10. **create_followup_task** - 创建随访任务
+11. **flag_high_risk_patient** - 标记高风险患者
 
-```
-你是一位资深健康管理医生，正在回复患者的咨询。
-
-## 患者信息
-- 姓名：张三
-- 年龄：35岁
-- 目标：减重10kg
-- 当前进展：已减重3kg
-
-## 患者最新消息
-"医生，我这两天体重反弹了1kg，是不是我的方法不对？有点焦虑..."
-
-## 要求
-1. 语气温暖、专业、鼓励
-2. 解释体重波动的正常性
-3. 给出具体建议（饮食/运动）
-4. 字数控制在100-150字
-
-请生成回复草稿。
-```
+#### 高风险工具（医疗决策类）
+12. **draft_prescription** - 起草处方建议（需医生确认）
+13. **suggest_diagnosis** - 提供诊断建议（需医生确认）
 
 ---
 
-## 四、数据库设计
+## 五、数据库设计
 
-### 4.1 新增表
+### 5.1 新增表
 
-#### 4.1.1 assistant_conversation（助手对话记录）
+#### 5.1.1 agent_session（Agent会话）
 
 ```sql
-CREATE TABLE assistant_conversation (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    doctor_id VARCHAR(64) NOT NULL COMMENT '医生ID',
+CREATE TABLE agent_session (
+    id VARCHAR(64) PRIMARY KEY,
     customer_id VARCHAR(64) NOT NULL COMMENT '患者ID',
-    function_type VARCHAR(32) NOT NULL COMMENT '功能类型：SUMMARY/PRESCRIPTION/RISK/REPLY',
-    request_data JSON COMMENT '请求数据',
-    response_data JSON COMMENT '响应数据',
-    claude_request_id VARCHAR(128) COMMENT 'Claude请求ID',
-    tokens_used INT COMMENT '消耗Token数',
-    latency_ms INT COMMENT '响应耗时(ms)',
-    status VARCHAR(16) COMMENT '状态：SUCCESS/FAILED',
-    error_message TEXT COMMENT '错误信息',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_doctor_customer (doctor_id, customer_id),
-    INDEX idx_created_at (created_at)
-) COMMENT='医生助手对话记录';
-```
-
-#### 4.1.2 assistant_cache（助手缓存表）
-
-```sql
-CREATE TABLE assistant_cache (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    cache_key VARCHAR(128) UNIQUE NOT NULL COMMENT '缓存键',
-    cache_value JSON NOT NULL COMMENT '缓存值',
-    expire_at DATETIME NOT NULL COMMENT '过期时间',
+    doctor_id VARCHAR(64) NOT NULL COMMENT '医生ID',
+    goal TEXT NOT NULL COMMENT '任务目标',
+    status VARCHAR(16) NOT NULL COMMENT '状态：RUNNING/PAUSED/COMPLETED/FAILED',
+    history_json JSON COMMENT '执行历史',
+    messages_json JSON COMMENT '对话消息',
+    current_step INT COMMENT '当前步数',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX idx_expire_at (expire_at)
-) COMMENT='医生助手缓存';
+    completed_at DATETIME,
+    INDEX idx_customer (customer_id),
+    INDEX idx_doctor (doctor_id),
+    INDEX idx_status (status)
+) COMMENT='Agent会话表';
+```
+
+#### 5.1.2 agent_pending_task（待确认任务）
+
+```sql
+CREATE TABLE agent_pending_task (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    agent_session_id VARCHAR(64) NOT NULL COMMENT 'Agent会话ID',
+    customer_id VARCHAR(64) NOT NULL COMMENT '患者ID',
+    doctor_id VARCHAR(64) NOT NULL COMMENT '医生ID',
+    tool_name VARCHAR(64) NOT NULL COMMENT '工具名称',
+    tool_description VARCHAR(255) COMMENT '工具描述',
+    input JSON NOT NULL COMMENT '输入参数',
+    reason TEXT COMMENT '执行原因',
+    status VARCHAR(16) NOT NULL COMMENT '状态：PENDING/APPROVED/REJECTED',
+    review_comment TEXT COMMENT '审核意见',
+    reviewed_at DATETIME COMMENT '审核时间',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    expire_at DATETIME COMMENT '过期时间（24小时）',
+    INDEX idx_session (agent_session_id),
+    INDEX idx_doctor_status (doctor_id, status),
+    INDEX idx_expire (expire_at)
+) COMMENT='Agent待确认任务表';
+```
+
+#### 5.1.3 agent_execution_log（执行日志）
+
+```sql
+CREATE TABLE agent_execution_log (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    session_id VARCHAR(64) NOT NULL COMMENT '会话ID',
+    customer_id VARCHAR(64) NOT NULL COMMENT '患者ID',
+    goal TEXT COMMENT '任务目标',
+    total_steps INT COMMENT '总步数',
+    tokens_used INT COMMENT '消耗Token数',
+    latency_ms BIGINT COMMENT '总耗时(ms)',
+    result_status VARCHAR(16) COMMENT '结果状态',
+    final_answer TEXT COMMENT '最终答案',
+    error_message TEXT COMMENT '错误信息',
+    execution_history_json JSON COMMENT '执行历史',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_session (session_id),
+    INDEX idx_customer (customer_id),
+    INDEX idx_created (created_at)
+) COMMENT='Agent执行日志表';
 ```
 
 ---
 
-## 五、API设计
+## 六、API设计
 
-### 5.1 患者摘要生成
+### 6.1 执行Agent任务
 
-**接口：** `POST /api/assistant/patient-summary`
+**接口：** `POST /api/agent/execute`
 
 **请求：**
 ```json
 {
   "customerId": "123456",
-  "forceRefresh": false
+  "doctorId": "doctor_001",
+  "goal": "分析患者健康状况，识别风险因素"
 }
 ```
 
@@ -310,152 +296,170 @@ CREATE TABLE assistant_cache (
 {
   "code": 0,
   "data": {
-    "customerId": "123456",
-    "summary": {
-      "basicInfo": {
-        "age": 35,
-        "gender": "女",
-        "targetWeight": 55.0,
-        "currentWeight": 62.0
+    "sessionId": "session_abc123",
+    "status": "SUCCESS",
+    "finalAnswer": "患者张三，35岁女性...",
+    "executionHistory": [
+      {
+        "type": "THOUGHT",
+        "content": "我需要先了解患者基本信息",
+        "timestamp": "2026-05-18T10:00:00"
       },
-      "healthStatus": {
-        "bmi": 22.5,
-        "bmiLevel": "正常",
-        "chronicDiseases": ["高血压"],
-        "riskLevel": 2
+      {
+        "type": "ACTION",
+        "toolName": "get_patient_profile",
+        "toolInput": {"customerId": "123456"},
+        "timestamp": "2026-05-18T10:00:01"
       },
-      "recentActivity": {
-        "weightTrend": "下降",
-        "weightChange7d": -0.5,
-        "checkInDays": 25,
-        "chatActivity": "活跃"
-      },
-      "keyEvents": [
-        {
-          "date": "2024-01-15",
-          "type": "处方",
-          "content": "开具膳食纤维补充剂"
-        }
-      ],
-      "doctorAdvice": "患者进展良好，建议继续当前方案..."
-    },
-    "generatedAt": "2024-01-20T10:30:00",
-    "cacheHit": false
+      {
+        "type": "OBSERVATION",
+        "content": "{...}",
+        "timestamp": "2026-05-18T10:00:02"
+      }
+    ],
+    "totalSteps": 6
+  }
+}
+```
+
+### 6.2 获取待确认任务
+
+**接口：** `GET /api/agent/pending-tasks?doctorId=doctor_001`
+
+**响应：**
+```json
+{
+  "code": 0,
+  "data": [
+    {
+      "taskId": 1,
+      "customerId": "123456",
+      "customerName": "张三",
+      "toolName": "draft_prescription",
+      "toolDescription": "起草处方建议",
+      "input": {...},
+      "reason": "患者出现焦虑情绪，建议心理咨询",
+      "createdAt": "2026-05-18T10:05:00",
+      "expireAt": "2026-05-19T10:05:00"
+    }
+  ]
+}
+```
+
+### 6.3 审批任务
+
+**接口：** `POST /api/agent/pending-tasks/{taskId}/approve`
+
+**请求：**
+```json
+{
+  "approved": true,
+  "comment": "同意执行"
+}
+```
+
+**响应：**
+```json
+{
+  "code": 0,
+  "data": {
+    "sessionId": "session_abc123",
+    "status": "SUCCESS",
+    "finalAnswer": "...",
+    "executionHistory": [...],
+    "totalSteps": 8
   }
 }
 ```
 
 ---
 
-## 六、核心代码实现（第一部分）
+## 七、性能与成本
 
-### 6.1 配置类
+### 7.1 性能指标
 
-```java
-@Configuration
-public class AssistantConfig {
-    
-    @Bean("assistantExecutor")
-    public ThreadPoolTaskExecutor assistantExecutor() {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(8);
-        executor.setMaxPoolSize(16);
-        executor.setQueueCapacity(1000);
-        executor.setThreadNamePrefix("assistant-");
-        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
-        executor.setWaitForTasksToCompleteOnShutdown(true);
-        executor.setAwaitTerminationSeconds(60);
-        executor.initialize();
-        return executor;
-    }
-    
-    @Bean
-    public ClaudeApiClient claudeApiClient(
-        @Value("${claude.api.key}") String apiKey,
-        @Value("${claude.api.base-url}") String baseUrl
-    ) {
-        return new ClaudeApiClient(apiKey, baseUrl);
-    }
-}
+| 指标 | 目标值 | 说明 |
+|------|--------|------|
+| **平均步数** | 5-8步 | 完成一次分析的平均步数 |
+| **总响应时间** | P95 < 15s | 包含所有ReAct循环 |
+| **单步延迟** | P95 < 2s | 单次Thought+Action的延迟 |
+| **并发能力** | 50 QPS | 单实例支持的并发Agent数 |
+
+### 7.2 成本估算
+
+**假设：**
+- 日活医生：100人
+- 每医生每日分析：10次
+- 平均每次：6步
+- 每步消耗：1500 tokens
+
+**计算：**
+```
+月总请求数 = 100 * 10 * 30 = 30,000次
+月总步数 = 30,000 * 6 = 180,000步
+月总tokens = 180,000 * 1500 = 270,000,000 tokens
+
+Input成本 = 180,000,000 * $0.015 / 1000 = $2,700
+Output成本 = 90,000,000 * $0.075 / 1000 = $6,750
+
+月总成本 = $9,450
 ```
 
-### 6.2 Claude API客户端
-
-```java
-@Slf4j
-public class ClaudeApiClient {
-    
-    private final String apiKey;
-    private final String baseUrl;
-    private final OkHttpClient httpClient;
-    private final ObjectMapper objectMapper;
-    
-    public ClaudeApiClient(String apiKey, String baseUrl) {
-        this.apiKey = apiKey;
-        this.baseUrl = baseUrl;
-        this.httpClient = new OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
-            .build();
-        this.objectMapper = new ObjectMapper();
-    }
-    
-    /**
-     * 调用Claude API（支持Tool Use）
-     */
-    public ClaudeResponse chat(String prompt, List<Tool> tools) {
-        try {
-            // 构建请求体
-            Map<String, Object> requestBody = new HashMap<>();
-            requestBody.put("model", "claude-opus-4-7");
-            requestBody.put("max_tokens", 4096);
-            requestBody.put("messages", List.of(
-                Map.of("role", "user", "content", prompt)
-            ));
-            
-            if (tools != null && !tools.isEmpty()) {
-                requestBody.put("tools", tools.stream()
-                    .map(Tool::toMap)
-                    .collect(Collectors.toList()));
-            }
-            
-            // 发送请求
-            Request request = new Request.Builder()
-                .url(baseUrl + "/v1/messages")
-                .header("x-api-key", apiKey)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .post(RequestBody.create(
-                    objectMapper.writeValueAsString(requestBody),
-                    MediaType.parse("application/json")
-                ))
-                .build();
-            
-            try (Response response = httpClient.newCall(request).execute()) {
-                if (!response.isSuccessful()) {
-                    throw new RuntimeException("Claude API调用失败: " + response.code());
-                }
-                
-                String responseBody = response.body().string();
-                return objectMapper.readValue(responseBody, ClaudeResponse.class);
-            }
-            
-        } catch (Exception e) {
-            log.error("Claude API调用异常", e);
-            throw new RuntimeException("AI服务异常", e);
-        }
-    }
-}
-```
+**优化后成本：约 $5,500/月（通过缓存、Prompt优化等）**
 
 ---
 
-**文档第一部分完成，包含：**
-- 项目概述
-- 整体架构
-- 核心功能设计（4个功能）
-- 数据库设计
-- API设计
-- 部分核心代码
+## 八、实施路线图
 
-是否继续输出第二部分（详细代码实现）？
+### Phase 1：核心引擎（2周）
+- [ ] ReActAgentEngine实现
+- [ ] ToolRegistry和基础工具
+- [ ] ActionExecutor和风险控制
+- [ ] 单元测试
+
+### Phase 2：工具扩展（2周）
+- [ ] 完成13个工具的实现
+- [ ] Milvus向量检索集成
+- [ ] 待确认任务流程
+- [ ] 集成测试
+
+### Phase 3：前端集成（1周）
+- [ ] Agent执行面板
+- [ ] 任务确认弹窗
+- [ ] 执行历史可视化
+
+### Phase 4：优化上线（2周）
+- [ ] 性能优化和成本控制
+- [ ] 监控告警
+- [ ] 灰度发布
+
+**总计：7周**
+
+---
+
+## 九、核心优势
+
+### 9.1 真正的Agent
+
+1. **自主性**：Agent自己决定每一步做什么
+2. **推理能力**：多步推理、根据发现调整策略
+3. **可解释性**：每一步Thought透明可见
+4. **扩展性**：只需注册新工具，无需修改核心逻辑
+
+### 9.2 适用场景
+
+✅ **适合ReAct Agent：**
+- 开放式任务（"帮我分析这个患者"）
+- 需要多步推理（"找出体重反弹的根本原因"）
+- 需要根据发现调整策略
+- 需要执行行动（发消息、创建任务、起草处方）
+
+❌ **不适合ReAct Agent：**
+- 固定流程的任务
+- 简单的数据聚合
+- 对成本极度敏感的场景
+
+---
+
+**最后更新：** 2026-05-18  
+**文档版本：** v2.0 (ReAct Agent版本)
