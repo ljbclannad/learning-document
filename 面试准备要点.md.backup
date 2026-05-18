@@ -1,0 +1,4086 @@
+# 一、自我介绍
+
+1. 我专注于Java生态系统，精通Spring全家桶（Spring Boot、Spring Cloud、SpringMVC），在微服务架构和分布式系统方面有丰富的实战经验。我熟练使用MySQL、Redis等数据存储方案，也掌握RabbitMQ消息中间件来构建高可用系统。
+
+2. 目前我在杭州树兰集团担任高级java开发工程师，主要负责
+   - 智能体重健康管家小程序的开发迭代，业务分为3大块，工具、问卷及AI对话。
+   - 设计并实现问卷-报告-评估-处方-付费-多师共管-AI介入-过期/续期的完整业务闭环
+   - 对接第三方AI API，实现个性化干预方案解析和智能对话功能
+   - 自研用户画像和对话记忆提取模块，突破第三方API的上下文限制
+   - 通过redis缓存和rabbitMQ优化系统性能
+   - 引入Outbox事件补偿机制，保障订单、处方、支付等关键业务的最终一致性
+
+3. 之前也担任过互联网医院项目和小分子合成项目的开发，主要负责
+   - 完成互联网项目的日常功能迭代，包括在线问诊、医生排班、患者预约等核心功能
+   - 优化微服务架构，使用Spring Cloud组件完善服务治理
+   - 通过分布式锁解决并发场景的冲突问题、完善补偿机制
+
+4. 日常使用AI辅助工具（如Claude Code和codex）进行代码审查和快速迭代，注重代码质量和开发效率的平衡
+
+---
+
+# 二、智能体重管家项目
+
+## 1. 面试知识优先级
+
+### ⭐⭐⭐⭐⭐ 最高优先级（60%）
+
+#### 1. 当前项目：智能体重健康管家（40%）
+
+**核心亮点（必问）：**
+- **自研用户画像和对话记忆模块**（最重要！）
+- **Outbox事件补偿机制**
+- **完整业务闭环设计**
+- **AI集成方案**
+
+**必须准备的问题：**
+1. 如何突破第三方API的上下文限制？
+2. Outbox模式如何保证最终一致性？
+3. 完整业务闭环如何设计？
+4. Redis和RabbitMQ如何优化性能？
+
+#### 2. 互联网医院项目（15%）
+
+**核心功能：**
+- 在线问诊、医生排班、患者预约
+- 微服务架构（Nacos、Sentinel、Gateway）
+- 分布式锁解决并发问题
+- 补偿机制（自动重试、人工重试）
+
+#### 3. 中间件（15%）
+- **Redis**：缓存设计、分布式锁、缓存三大问题
+- **RabbitMQ**：消息可靠性、幂等性、延迟队列
+- **MySQL**：索引优化、SQL优化、事务
+
+### ⭐⭐⭐⭐ 高优先级（30%）
+
+- **Spring Boot/MVC**：IOC/DI、AOP、事务、RESTful API
+- **Spring Cloud**：Nacos、Sentinel、Gateway
+
+### ⭐⭐⭐ 中优先级（10%）
+- 分布式事务、JVM、并发编程
+
+---
+
+## 2. 核心问题准备
+
+### 问题1：如何突破第三方API的上下文限制？
+
+**背景：**
+- 第三方API上下文限制（如4096 tokens）
+- 多轮对话需要保持上下文
+
+**解决方案：**
+1. **用户画像提取**
+   - 从问卷、历史对话中提取关键信息（年龄、体重、目标、饮食偏好）
+   - 存储到MySQL + Redis缓存
+   - 每次调用AI时注入画像，而不是完整历史
+
+2. **对话记忆管理**
+   - 只保留最近5轮对话
+   - 对更早的对话做摘要
+   - 重要信息提取到用户画像
+
+3. **Prompt优化**
+   - 使用模板化Prompt
+   - 精简系统提示词
+   - 动态调整上下文长度
+
+**技术实现：**
+```java
+@Service
+public class AiService {
+    public String chat(String userId, String message) {
+        // 1. 获取用户画像（Redis缓存）
+        UserProfile profile = getUserProfile(userId);
+        
+        // 2. 获取最近5轮对话
+        List<Message> history = getRecentHistory(userId, 5);
+        
+        // 3. 构建Prompt
+        String prompt = buildPrompt(profile, history, message);
+        
+        // 4. 调用AI API
+        String response = callAiApi(prompt);
+        
+        // 5. 保存对话 + 更新画像
+        saveChatHistory(userId, message, response);
+        updateUserProfile(userId, message, response);
+        
+        return response;
+    }
+}
+```
+
+**优化效果：**
+- Token消耗降低60%
+- 对话质量提升
+- 响应速度提升30%
+
+---
+
+### 问题2：Outbox事件补偿机制如何实现？
+
+**背景：**
+- 订单创建后需要通知多个服务
+- 直接发送MQ可能失败
+- 需要保证消息一定发送成功
+
+**解决方案：RabbitMQ + Outbox模式 + 消息确认机制**
+
+详细实现方案请参考：[[RabbitMQ+Outbox模式生产级实现方案]]
+
+**核心流程：**
+
+1. **订单创建（事务内）**
+   ```java
+   @Transactional
+   public void createOrder(Order order) {
+       // 1. 创建订单
+       orderMapper.insert(order);
+       
+       // 2. 插入outbox事件（同一事务）
+       outboxService.enqueue("ORDER_CREATED", order.getId(), 
+           JSON.toJSONString(order), exchange, routingKey);
+   }
+   ```
+
+2. **Outbox异步处理**
+   - 立即触发异步发送
+   - 使用乐观锁防止重复处理
+   - RabbitMQ生产者确认机制
+
+3. **定时补偿任务**
+   ```java
+   @Scheduled(fixedDelay = 30000)
+   public void retryFailedTasks() {
+       // 扫描PENDING/FAILED状态的任务
+       // 指数退避重试：1分钟、2分钟、3分钟
+       // 最多重试3次，超过则标记为GAVE_UP
+   }
+   ```
+
+4. **消费者手动确认**
+   ```java
+   @RabbitListener(queues = ORDER_QUEUE)
+   public void handleOrderCreated(Message message, Channel channel) {
+       try {
+           // 业务处理
+           notificationService.sendSms(order);
+           // 手动ACK
+           channel.basicAck(deliveryTag, false);
+       } catch (Exception e) {
+           // 重试或进入死信队列
+           channel.basicNack(deliveryTag, false, retryCount < 3);
+       }
+   }
+   ```
+
+**关键技术点：**
+
+| 技术点     | 实现方式                          | 作用                       |
+| ---------- | --------------------------------- | -------------------------- |
+| 事务一致性 | 订单+Outbox同一事务               | 保证要么都成功，要么都失败 |
+| 消息持久化 | 交换机、队列、消息三层持久化      | RabbitMQ重启不丢失         |
+| 生产者确认 | ConfirmCallback + CorrelationData | 确认消息到达Broker         |
+| 消费者确认 | 手动ACK模式                       | 确认消息被正确处理         |
+| 乐观锁     | version字段                       | 防止多实例重复处理         |
+| 死信队列   | x-dead-letter-exchange            | 处理失败消息               |
+| 指数退避   | 1分钟、2分钟、3分钟               | 避免频繁重试               |
+
+**优化效果：**
+- 消息可靠性：100%（三层持久化 + 确认机制）
+- 数据一致性：从95%提升到99.9%
+- 消息零丢失：Outbox + 生产者确认 + 消费者确认
+- 自动补偿：定时任务扫描失败任务
+
+---
+
+---
+
+## 3. 项目中间件实战应用
+
+### 1. Redis应用场景
+
+#### 1.1 AI对话延迟任务系统
+
+**业务逻辑**
+- 患者发送消息时如果艾特了医生或者医生在线，触发监控任务、删除可能存在的延迟任务。（60s后医生没回复再进行AI调用），执行完后删除任务并且删除任务数据hash。
+- 如果医生不在线，则在一定的时间窗口后触发延时任务。进行AI调用。执行完后删除任务并且删除任务数据hash。
+- 医生回复后保存医生最后回复时间戳，用于做幂等判断
+- 保存消息指纹，保存用户为AI会话的关联关系。
+- AI会话中采用AI消息数据流步骤，消息数据流预热用户画像
+- 业务存在几个关键特征：需要频繁取消延时任务、批量操作方便。
+- 业务允许一定的不稳定性。即用户可以重复发消息再次触发延迟队列。
+
+**AI消息数据流步骤**
+  1. 获取用户画像（Redis缓存，Hash结构，ai:profile:）（用户在处理完问卷和报告解析后拿到用户的指标、疾病、目标、标签定义等用户元数据。进行画像存储，进行缓存三大问题的预防）[[画像存储设计方案]]
+     ↓
+  2. 获取会话上下文（Redis，Hash结构，ai:session:context，如果不存在上下文则使用deepseek大模型进行用户意图处理并保存。上下文要求包括：指标、意图（询问饮食）、最近总结、问题详情、ai总结）[[会话上下文设计方案]]
+     ↓
+  3. 生成查询向量（Embedding）（采用千问embedding模型-text-embedding-v3，进行上下文+用户当前消息的向量化）[[千问Embedding+Milvus向量搜索集成文档]]
+     ↓
+  4. 检索相关记忆（Milvus向量搜索）（查询与当前消息最相似的向量）
+     ↓
+  5. 组装Prompt（画像 + 上下文 + 记忆）（动态生成）[[动态Prompt生成方案]]
+     ↓
+  6. 调用AI生成回复
+     ↓
+  7. 保存新记忆（MySQL + Milvus + Redis索引）
+     ↓
+  8. 更新会话上下文（Redis）（使用deepseek大模型进行用户意图处理并更新。）
+
+**数据流步骤优化逻辑**
+1. 步骤1和步骤2异步处理
+2. 步骤7、8并行且异步处理
+3. 用户第一次聊天比较慢，要新建缓存。
+4. TODO 分析下整个数据流可能存在的问题，添加redis的监控，归档，Milvus向量库、手动写一个跳表、agent助手实现
+
+**业务系统架构：**
+- ImTaskService - 延迟任务管理
+  - 延迟任务ZSet： ai:delay:zset - 60秒延迟的AI正式回复
+  - 监控任务ZSet： ai:monitor:zset - 15秒医生回复超时监控
+  - 任务数据Hash： ai:task:data:{taskId} - 存储任务详情
+  - 用户会话String: ai:conversation:id:{userId} - 存储用户和会话的绑定关系
+  - 用户发送消息过滤： （这块逻辑是否可以用记忆和画像优化）
+
+- AiTaskConsumer - 任务消费者
+  - 使用Redisson分布式锁：ai:lock:{taskId}，同时使用ok = lock.tryLock(0, TimeUnit.SECONDS);进行自动续期。
+  - 从ZSet中按时间范围查询到期任务
+  - 处理完成后删除任务数据
+
+- ReplyTrackerService - 回复追踪
+  - 最后回复时间： ai:reply:last:{groupId} - 记录最后回复时间戳
+
+- AiServiceMock - AI会话ID缓存
+  - 会话ID： ai:conversation:id:{groupId} - 存储会话标识
+
+- 已使用消息会话记录
+    - Set: ai:used:msg:{groupId}-消息的md5;
+    - redis.opsForSet().add(key, fingerprints.toArray(new String[0]));
+    - Boolean used = stringRedisTemplate.opsForSet().isMember(key, fingerprint);
+    - 采用Set的原因：是一个列表。自动去重、批量操作。
+
+##### 1.1.1 为什么用Redis而不是RabbitMQ实现延迟任务？
+
+这是个很好的问题。我们确实评估过RabbitMQ，它有延迟队列插件和完善的ACK机制。但在我们这个AI对话系统中，选择Redis是基于以下考虑：
+
+**业务特点：**
+我们的延迟任务有个特殊性：70%的任务会被取消。
+- 用户连续发消息，旧任务被覆盖
+- 医生回复了，AI任务立即取消
+- 只有30%的任务会真正触发
+
+**技术对比：**
+
+Redis的优势：
+1. 取消任务极简：ZREM命令，O(log N)，立即生效
+2. 查询状态方便：ZSCORE可以知道任务是否存在、何时触发
+3. 批量操作灵活：ZRANGEBYSCORE一次查询所有到期任务
+4. 零额外依赖：项目已有Redis，不需要引入新组件
+
+RabbitMQ的劣势（在这个场景）：
+1. 消息入队后无法直接删除，需要消费后判断"取消标记"
+2. 70%的消息会被浪费消费
+3. 需要额外存储维护任务状态
+4. 增加系统复杂度
+
+**权衡与应对：**
+我们也清楚Redis的不足：
+- 没有ACK机制 → 用Redisson分布式锁防重复消费
+- 可能丢失任务 → 我们的场景可接受，AI回复丢失用户可重发
+- 没有重试机制 → 在catch块中可以重新入队
+
+**追问1：Redis宕机怎么办？**
+1. 架构层面：Redis主从 + 哨兵，RDB+AOF持久化
+2. 业务层面：AI回复丢失可接受，不是核心业务
+3. 监控告警：任务堆积、Redis可用性监控
+4. 降级方案：Redis不可用时，直接同步调用AI（不延迟）
+
+**追问2：如何保证任务不重复执行？**
+1. Redisson分布式锁，锁key = "ai:lock:" + taskId
+2. 使用watchdog自动续期，防止长耗时任务锁过期
+3. 消费前检查任务数据是否存在（可能已被取消）
+4. 幂等性设计：AI回复前检查是否已回复过
+
+**追问3：定时扫描会不会有性能问题？**
+1. ZRANGEBYSCORE时间复杂度O(log(N)+M)，N是总任务数，M是返回数量
+2. 即使10万任务，查询也是毫秒级
+3. 可以优化：使用Redis Keyspace Notifications（需开启配置）
+4. 可以分片：按groupId hash到不同的ZSet
+
+##### 1.1.2 为什么使用ZSet,Zset的底层原理是什么
+
+1. Zset小数据量使用压缩列表，及zipList，当元素数据量大于128或者任一元素长度超过64字节的时候使用SKIPLIST+dict，参考Redis跳表
+2. Dict用于按member查找和删除。SKIPLIST用户进行范围查找
+3. 范围查找迅速，把任务的过期时间设置为score，跳表自动按照score进行升序排列。
+    - 【查询过程】rangeByScore(0, now) 分两步：
+        1. 定位起始位置（O(log N)）
+            - 从跳表顶层开始向下查找
+            - 利用多层索引快速跳跃
+            - 找到第一个 score >= 0 的节点
+            - 10000个任务只需13次比较
+        2. 顺序遍历（O(M)）
+            - 沿着最底层链表向右遍历
+            - 收集所有 score <= now 的任务
+            - 遇到 score > now 立即停止
+            - 如果有100个到期任务，遍历100次
+
+##### 1.1.3 使用Redission分布式锁解决重复消费的问题
+
+**核心代码：**
+```java
+boolean ok = lock.tryLock(0, TimeUnit.SECONDS);
+```
+
+这行代码有两个关键点：
+
+**【1. waitTime = 0，不阻塞等待】**
+如果获取锁失败，立即返回false，不等待。
+这样设计是因为：
+- 我们的任务消费是定时轮询（每秒一次）
+- 如果这次获取锁失败，说明其他实例正在处理
+- 没必要阻塞等待，下次轮询再试即可
+- 避免线程堆积
+
+**【2. 没有指定leaseTime，启动Watchdog自动续期】**
+完整签名是：`tryLock(waitTime, leaseTime, unit)`
+我们只传了waitTime，没传leaseTime，所以：
+- Redisson会启动Watchdog后台线程
+- 默认锁过期时间30秒
+- 每10秒自动续期到30秒
+- 直到手动unlock()或客户端宕机
+
+**【为什么需要Watchdog】**
+我们的任务执行时间不确定：
+- AI调用可能5秒，也可能60秒
+- 如果指定固定的leaseTime，可能：
+  - 设置太短：任务未完成锁就过期，导致重复执行
+  - 设置太长：客户端宕机后锁长时间不释放
+- 使用Watchdog，任务执行多久，锁就持有多久
+
+**【权衡】**
+Watchdog的代价：
+- 每10秒一次续期请求（性能影响可忽略）
+- 客户端宕机后，锁30秒后才释放（可接受）
+
+对于我们的场景，这是最优方案。
+
+
+#### 1.2 多师共管服务
+
+**业务背景：**
+多师共管服务是一个付费订阅服务，用户支付后可享受多位医生的共同管理。服务包含试用期和正式期，需要精确控制服务状态和到期时间。
+
+**Redis应用场景：**
+
+##### 1.2.1 已支付服务状态缓存
+
+**Redis Key:** `bh:multi-doctor:paid:customer:{customerId}`
+- **数据类型:** String
+- **存储内容:** recordId 或过期时间戳
+- **TTL:** 动态设置，等于服务剩余有效期
+- **用途:** 快速判断用户是否拥有已支付的多师共管服务
+
+**写入场景:**
+- 支付成功回调时 (BasicHealthAssessmentOrderService:431)
+- Redis补偿任务修复缓存时 (BasicHealthAssessmentOrderService:789)
+
+**读取场景:**
+- BasicHealthAssessmentCustomerController:124 - 客户端查询服务状态
+- OperationService:235,237,270,272,288 - 运营后台客户列表展示
+- DoctorBackendCustomerService:597,619 - 医生后台客户筛选
+
+##### 1.2.2 服务到期任务索引
+
+**Redis Key:** `bh:multi-doctor:expire:zset`
+- **数据类型:** Sorted Set (ZSet)
+- **Score:** 过期时间戳（毫秒）
+- **Member格式:**
+  - 已支付: `paid:{customerId}`
+  - 试用: `trial:{customerId}`
+- **用途:** 按时间顺序索引所有待过期的服务，支持定时任务扫描
+
+**写入场景:**
+- 试用服务激活时 (OpenImServiceImpl:556)
+- 支付成功时 (BasicHealthAssessmentMultiDoctorCacheService:124)
+- Redis补偿任务修复时 (BasicHealthAssessmentMultiDoctorCacheService:124)
+
+**读取场景:**
+- 定时任务每分钟扫描到期用户 (BasicHealthAssessmentOrderService:547)
+
+**删除场景:**
+- 试用转正时删除试用到期任务 (BasicHealthAssessmentOrderService:426)
+- 服务到期后删除对应member (BasicHealthAssessmentOrderService:556)
+- 已支付服务到期时清理 (BasicHealthAssessmentMultiDoctorCacheService:79)
+
+**采用redis的原因**
+- 可能存在续期。需要修改过期时间，这个操作zset更合适
+- 需要进行补偿任务。如果过期处理失败就需要反复调用
+- 需要按时间范围查询（批量查询多师共管过期状态，医生端列表），范围查询将要过期的内容发送短信通知
+
+##### 1.2.3 核心业务流程
+
+**试用服务激活流程:**
+```
+用户首次提交完整报告
+  → OpenImServiceImpl.afterCustomerCreated()
+  → 激活试用服务
+  → registerTrialExpireTaskAt()
+  → 写入 ZSet: trial:{customerId}
+```
+
+**支付成功流程:**
+```
+微信支付回调
+  → BasicHealthAssessmentOrderService.handlePaySuccess()
+  → removeTrialExpireTask() - 删除试用到期任务
+  → syncPaidMultiDoctorServiceCache()
+    → repairPaidServiceCache()
+      → 写入 String: bh:multi-doctor:paid:customer:{customerId}
+      → 写入 ZSet: paid:{customerId}
+```
+
+**服务到期处理流程:**
+```
+定时任务每分钟执行
+  → processExpiredMultiDoctorService()
+  → listExpiredMembers(now) - 从ZSet查询到期成员
+  → removeExpireMember() - 原子删除（防止多实例重复处理）
+  → handleMultiDoctorServiceExpired()
+    → 已支付: deletePaidService() - 删除String缓存和ZSet成员
+    → 试用: 仅记录日志
+    → 更新IM群状态为过期
+```
+
+##### 1.2.4 Redis补偿机制
+
+**定时任务:** 每5分钟执行一次 (`@Scheduled(cron = "0 */5 * * * ?")`)
+
+**补偿场景:**
+1. 支付回调成功落库，但Redis当时不可用导致缓存未写入
+2. 支付成功后试用到期任务未删除
+3. paid key写入成功但ZSet索引缺失
+
+**补偿逻辑:**
+```java
+// 查询最近30天内已支付/已关闭的多师共管订单
+// 排除最近1分钟的订单（避免与支付回调冲突）
+// 批量修复缓存：
+compensateMultiDoctorServiceCache()
+  → 查询订单表（包含"多师共管服务"关键字）
+  → repairPaidServiceCache()
+    → 检查缓存是否存在、TTL是否准确（容差5分钟）
+    → 不一致则重新写入String缓存
+    → 检查ZSet score是否准确（容差1秒）
+    → 不一致则重新注册到期任务
+```
+
+##### 1.2.5 缓存一致性保障
+
+**容错设计:**
+- TTL容差: 5分钟 (`MULTI_DOCTOR_CACHE_TTL_REPAIR_TOLERANCE_MILLIS`)
+- ZSet score容差: 1秒
+- 补偿任务保护窗口: 1分钟（避免与支付回调冲突）
+
+**多实例安全:**
+- 使用 `removeExpireMember()` 原子删除，只有删除成功的实例才执行后续处理
+- 避免多个实例重复触发到期逻辑
+
+##### 1.2.6 性能优化
+
+**批量处理:**
+- 补偿任务每批处理100条订单 (`MULTI_DOCTOR_CACHE_COMPENSATE_BATCH_SIZE`)
+- 使用ID分页避免深度分页问题
+
+**缓存命中率:**
+- 客户列表查询直接读Redis，避免数据库JOIN
+- 运营后台和医生后台都依赖此缓存提升查询性能
+
+##### 1.2.7 监控要点
+
+**建议关注的指标:**
+1. `bh:multi-doctor:paid:customer:*` key的数量和TTL分布
+2. `bh:multi-doctor:expire:zset` 的成员数量
+3. 补偿任务每次修复的订单数量（日志关键字: "多师共管缓存补偿"）
+4. 到期处理任务的执行频率（日志关键字: "多师共管服务.*到期"）
+
+---
+
+### 2. RabbitMQ应用场景
+
+#### 2.1 Outbox事件发送
+参考
+
+#### 2.2 AI消息数据流异步更新
+- 参考[[使用mq更新上下文方案]]
+
+---
+
+## 4. 项目中线程池实战应用、
+
+### 1. 批量处理线程池的完整使用逻辑（需要知道CompletableFuture）,另有批量推送、批量调用第三方等
+
+#### 一、业务背景
+
+**功能**：医生后台查询患者管理列表
+
+**核心问题**：每个患者需要聚合多个数据源的信息（问卷、体重、评估报告、处方、支付订单等），串行查询非常慢
+
+#### 二、使用场景
+
+```java
+// 在分页查询中使用
+List<CustomerManagementVO> list = records.stream()
+    .map(this::convertToCustomerManagementVO)  // 每个患者都要转换
+    .collect(Collectors.toList());
+```
+
+**问题**：如果有20个患者，每个患者需要查询5个数据源，串行执行需要 20 × 5 = 100 次数据库查询
+
+#### 三、线程池配置
+
+```java
+ExecutorService dbPool = new ThreadPoolExecutor(
+    16,                                      // 核心线程数
+    16,                                      // 最大线程数
+    60, TimeUnit.SECONDS,                    // 空闲线程存活时间
+    new LinkedBlockingQueue<>(2000),         // 队列容量
+    namedFactory("cf-db-"),                  // 线程命名工厂
+    new ThreadPoolExecutor.CallerRunsPolicy() // 拒绝策略
+);
+```
+
+#### 四、核心优化逻辑：CompletableFuture 并发查询
+
+**对比：串行 vs 并行**
+
+**串行版本** (convertToCustomerManagementVO - 第303行)：
+
+```java
+// 1. 查询问卷数据
+ChronicDiseaseAssessmentQuestionnaireContentDTO questionnaire =
+    questionResultService.getChronicDiseaseQuestionnaire(customerId);
+
+// 2. 查询最新体重
+Float latestWeight = checkInCustomerWeightService.getLatest(customerId, null);
+
+// 3. 查询深度评估报告
+InDepthAssessmentReportEntity report =
+    inDepthAssessmentReportService.selectByCustomerId(customerId);
+
+// 4. 查询处方列表
+List<ProductServicePrescriptionEntity> prescriptions =
+    productServicePrescriptionService.getProductServicePrescriptionListByRecordId(recordId);
+
+// 5. 查询支付订单
+InDepthAssessmentReportPayOrderEntity payOrder =
+    inDepthAssessmentReportPayOrderMapper.selectOne(wrapper);
+
+// 总耗时 = T1 + T2 + T3 + T4 + T5 (假设每个200ms，总共1000ms)
+```
+
+**并行版本** (convertToCustomerManagementVOByCompletableFuture - 第148行)：
+
+```java
+// 第一阶段：并发发起所有查询任务
+CompletableFuture<QuestionnaireDTO> future1 = CompletableFuture.supplyAsync(() ->
+    questionResultService.getChronicDiseaseQuestionnaire(customerId), dbPool);
+
+CompletableFuture<ReportEntity> future2 = CompletableFuture.supplyAsync(() ->
+    inDepthAssessmentReportService.selectByCustomerId(customerId), dbPool);
+
+CompletableFuture<Float> future3 = CompletableFuture.supplyAsync(() ->
+    checkInCustomerWeightService.getLatest(customerId, null), dbPool); 
+
+CompletableFuture<List<String>> future4 = CompletableFuture.supplyAsync(() ->
+    interventionPlanService.fetchAndCacheUserProfileTags(customerId, ...), dbPool);
+
+// 总耗时 = max(T1, T2, T3, T4) ≈ 200ms (最慢的那个)
+```
+
+#### 五、详细执行流程图
+
+**时间轴对比（串行 vs 并行）**
+
+串行执行：
+```
+|--问卷查询(200ms)--|--体重查询(200ms)--|--报告查询(200ms)--|--处方查询(200ms)--|--支付查询(200ms)--|
+0ms               200ms              400ms              600ms              800ms              1000ms
+```
+
+并行执行：
+```
+|--问卷查询(200ms)--|
+|--体重查询(200ms)--|
+|--报告查询(200ms)--|  ← 所有任务同时执行
+|--处方查询(200ms)--|
+|--支付查询(200ms)--|
+0ms               200ms
+```
+
+**性能提升**：1000ms → 200ms（5倍提升）
+
+#### 六、CompletableFuture 编排逻辑
+
+```java
+// 步骤1：并发发起4个独立查询
+CompletableFuture<QuestionnaireDTO> f1 = supplyAsync(() -> queryQuestionnaire(), dbPool);
+CompletableFuture<ReportEntity> f2 = supplyAsync(() -> queryReport(), dbPool);
+CompletableFuture<Float> f3 = supplyAsync(() -> queryWeight(), dbPool);
+CompletableFuture<List<String>> f4 = supplyAsync(() -> queryTags(), dbPool);
+
+// 步骤2：每个查询完成后，填充VO对象
+CompletableFuture<Void> fill1 = f1.thenAccept(data -> vo.setQuestionnaire(data));
+CompletableFuture<Void> fill2 = f3.thenAccept(data -> vo.setWeight(data));
+
+// 步骤3：报告查询完成后，再并发发起4个子查询
+CompletableFuture<Void> fill3 = f2.thenCompose(report -> {
+    // 基于 report.recordId，再并发查询4个子任务
+    CompletableFuture<Void> sub1 = runAsync(() -> parseJSON(report), dbPool);
+    CompletableFuture<Void> sub2 = runAsync(() -> setRiskInterpretation(report), dbPool);
+    CompletableFuture<Void> sub3 = supplyAsync(() -> queryPrescriptions(report.getRecordId()), dbPool)
+        .thenAccept(prescriptions -> vo.setPrescriptions(prescriptions));
+    CompletableFuture<Void> sub4 = supplyAsync(() -> queryPayOrder(report.getRecordId()), dbPool)
+        .thenAccept(payOrder -> vo.setPayOrder(payOrder));
+
+    return allOf(sub1, sub2, sub3, sub4);
+});
+
+// 步骤4：等待所有任务完成
+CompletableFuture.allOf(fill1, fill2, fill3, fill4)
+    .thenApply(v -> customerManagementVO)
+    .join();
+```
+
+#### 七、关键技术点
+
+**1. supplyAsync vs runAsync**
+
+```java
+// supplyAsync：有返回值
+CompletableFuture<Float> future = CompletableFuture.supplyAsync(() -> {
+    return checkInCustomerWeightService.getLatest(customerId, null);
+}, dbPool);
+
+// runAsync：无返回值
+CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+    customerManagementVO.setRiskInterpretation(riskInterpretation);
+}, dbPool);
+```
+
+**2. thenAccept：消费结果并填充 VO**
+
+```java
+latestWeightFuture.thenAccept(latestWeight -> {
+    if (latestWeight == null || latestWeight <= 0f) return;
+    customerManagementVO.setWeight(String.valueOf(latestWeight));
+    // 直接操作共享的VO对象（线程安全，因为每个字段只被一个任务写入）
+});
+```
+
+**3. thenCompose：级联异步任务**
+
+```java
+// 先查报告，再根据报告ID查处方和支付单
+inDepthAssessmentReportFuture.thenCompose(report -> {
+    if (report == null) {
+        return CompletableFuture.completedFuture(null);
+    }
+
+    // 基于 report.recordId，再发起新的异步查询
+    CompletableFuture<Void> f1 = supplyAsync(() ->
+        productServicePrescriptionService.getProductServicePrescriptionListByRecordId(
+            report.getRecordId()), dbPool)
+        .thenAccept(prescriptions -> vo.setPrescriptions(prescriptions));
+
+    return allOf(f1, ...);
+});
+```
+
+**4. allOf：等待所有任务完成**
+
+```java
+CompletableFuture.allOf(
+    fillFromQuestionnaireF,  // 填充问卷数据
+    fillLatestWeightF,       // 填充体重数据
+    fillFromReportF,         // 填充报告数据（包含4个子任务）
+    fillTagsF                // 填充标签数据
+).thenApply(v -> customerManagementVO)
+ .join();
+```
+
+#### 八、线程池的作用
+
+```java
+// 指定线程池执行异步任务
+CompletableFuture.supplyAsync(() -> {
+    // 这段代码在 dbPool 的线程中执行
+    return questionResultService.getChronicDiseaseQuestionnaire(customerId);
+}, dbPool); // ← 关键：指定线程池
+```
+
+**如果不指定线程池**：
+
+```java
+// 使用默认的 ForkJoinPool.commonPool()
+CompletableFuture.supplyAsync(() -> ...);
+```
+
+**差距**：
+ 1. 线程数不匹配
+  - commonPool默认线程数 = CPU核心数-1，适合CPU密集型
+  - 数据库查询是I/O密集型，需要更多线程（我们配置了16个）
+  - 13个线程 vs 16个线程，在高并发下差异明显
+
+  1. 资源隔离
+  - commonPool是全局共享的，所有未指定线程池的异步任务都用它
+  - 如果其他模块（如AI推理、图片处理）也用commonPool，会互相抢占资源
+  - 独立线程池保证了患者查询的性能不受其他模块影响
+
+  1. 故障隔离
+  - 如果某个模块的任务死锁，会占满commonPool，导致整个应用瘫痪
+  - 独立线程池限制了爆炸半径，一个模块故障不影响其他模块
+
+  1. 可监控和可调优
+  - 独立线程池可以精确监控（队列长度、活跃线程数、拒绝次数）
+  - 可以根据压测结果动态调整线程数，不影响其他模块
+  - 线程命名（cf-db-）便于问题排查
+
+#### 九、实际性能对比
+
+假设查询一个患者列表（20个患者）：
+
+| 方案               | 单个患者耗时 | 20个患者总耗时 | 说明                               |
+| ------------------ | ------------ | -------------- | ---------------------------------- |
+| 串行查询           | 1000ms       | 20秒           | 每个患者5个串行查询                |
+| 并行查询（单患者） | 200ms        | 4秒            | 每个患者内部并行，但患者间串行     |
+| 并行查询（多患者） | 200ms        | ~1秒           | 患者间也并行（通过 Stream 并行流） |
+
+#### 十、面试回答要点
+
+**面试官**："场景二中批量处理线程池的使用逻辑是什么？"
+
+**参考答案**：
+
+"这是一个典型的聚合查询优化场景：
+
+**业务背景**：
+医生后台查询患者列表，每个患者需要聚合5个数据源（问卷、体重、评估报告、处方、支付单），串行查询一个患者需要1秒。
+
+**优化方案**：使用 CompletableFuture + 自定义线程池实现并发查询
+
+1. **第一层并发**：对单个患者的5个数据源并发查询
+   - 使用 `CompletableFuture.supplyAsync(查询任务, dbPool)`
+   - 耗时从 1000ms 降到 200ms（最慢的那个查询）
+
+2. **第二层编排**：使用 `thenCompose` 处理依赖关系
+   - 先查评估报告，再根据 reportId 查处方和支付单
+   - 保证数据依赖的同时最大化并发
+
+3. **线程池配置**：16个线程 + 2000容量队列
+   - 16个线程：根据数据库连接池大小和压测结果确定
+   - I/O 密集型任务，线程数可以大于 CPU 核心数
+   - CallerRunsPolicy 提供背压保护
+
+4. **最终效果**：
+   - 单患者查询：1000ms → 200ms（5倍提升）
+   - 20个患者列表：20秒 → 4秒（5倍提升）
+
+**关键技术点**：
+- `supplyAsync`：有返回值的异步任务
+- `thenAccept`：消费结果填充 VO
+- `thenCompose`：级联异步任务（处理依赖）
+- `allOf`：等待所有任务完成
+- 指定线程池避免使用默认的 ForkJoinPool"
+
+### 2. 定时线程池（@Scheduled + 分布式锁）
+
+### 3. 使用ThreadPoolTaskExecutor替代ExecutorService
+1. 生命周期管理
+  - ExecutorService：需要手动shutdown，容易忘记导致线程泄漏
+  - ThreadPoolTaskExecutor：Spring自动管理，配置WaitForTasksToCompleteOnShutdown实现优雅关闭
+
+2. 与@Async集成
+  - ExecutorService：无法与@Async集成
+  - ThreadPoolTaskExecutor：完美集成，实现AsyncConfigurer即可
+
+3. 上下文传递
+  - ExecutorService：需要手动传递ThreadLocal（如TraceId、用户信息）
+  - ThreadPoolTaskExecutor：通过TaskDecorator自动传递
+
+4. 配置方式
+  - ExecutorService：硬编码，修改需要重新编译
+  - ThreadPoolTaskExecutor：支持配置文件，运维友好
+
+5. 监控
+  - ExecutorService：需要手动暴露指标
+  - ThreadPoolTaskExecutor：自动暴露到Actuator
+
+6. 实际应用：
+  在我们项目中，我会配置多个ThreadPoolTaskExecutor：
+  - taskExecutor：默认异步任务（@Async）
+  - dbExecutor：数据库操作（16线程，I/O密集型）
+  - apiExecutor：外部API调用（20线程，控制并发避免限流）
+  - aiExecutor：AI推理（5线程，API有限制
+
+## 5. 并发锁的使用场景
+
+### 一、锁的分类（30秒速记）
+
+| 锁类型          | 核心思想               | 实现方式               | 适用场景     |
+| --------------- | ---------------------- | ---------------------- | ------------ |
+| **乐观锁**      | 假设冲突少，提交时检查 | 版本号/CAS             | 低冲突场景   |
+| **悲观锁**      | 假设冲突多，操作前加锁 | synchronized/Lock      | 高冲突场景   |
+| **读写锁**      | 读共享、写独占         | ReentrantReadWriteLock | 读多写少     |
+| **StampedLock** | 支持乐观读，性能最高   | Java 8+                | 读极多写极少 |
+
+---
+
+### 二、选型决策（核心，必背）⭐⭐⭐⭐⭐
+
+| 场景         | 冲突率       | 推荐方案     | 原因                |
+| ------------ | ------------ | ------------ | ------------------- |
+| 用户信息更新 | 低（<10%）   | 乐观锁       | 无锁开销，性能高2倍 |
+| 秒杀扣库存   | 高（>90%）   | 悲观锁/Redis | 避免大量重试        |
+| 账户余额     | 中（10-30%） | 悲观锁       | 涉及金钱，不能重试  |
+| 配置缓存     | 极低         | StampedLock  | 读多写少，性能高3倍 |
+
+**口诀：**
+- 冲突低 → 乐观锁（性能高）
+- 冲突高 → 悲观锁（避免重试）
+- 读多写少 → StampedLock（乐观读）
+
+---
+
+### 三、代码模板（必会）
+
+#### 1. 乐观锁（数据库版本号）
+
+```java
+// 实体类
+@Data
+public class Customer {
+    private String id;
+    private String name;
+    @Version  // MyBatis Plus 自动处理版本号
+    private Integer version;
+}
+
+// 更新逻辑（带重试）
+public void update(String id, String name) {
+    int maxRetries = 3;
+    for (int i = 0; i < maxRetries; i++) {
+        // 1. 查询当前数据（带版本号）
+        Customer customer = mapper.selectById(id);
+        customer.setName(name);
+        
+        // 2. 更新（WHERE 条件包含版本号）
+        int updated = mapper.updateById(customer);
+        if (updated == 1) {
+            log.info("更新成功，版本号：{}", customer.getVersion());
+            return;
+        }
+        
+        // 3. 冲突重试
+        log.warn("乐观锁冲突，第{}次重试", i + 1);
+        if (i < maxRetries - 1) {
+            Thread.sleep(50);  // 避免立即重试
+        }
+    }
+    throw new BizException("更新失败，请稍后重试");
+}
+
+// 底层 SQL（MyBatis Plus 自动生成）
+UPDATE customer
+SET name = #{name}, version = version + 1
+WHERE id = #{id} AND version = #{version}
+```
+
+**适用场景：** 用户信息、订单状态、Outbox任务
+
+**注意事项：**
+- 重试次数不宜过多（3次为宜）
+- 重试间隔避免固定值（加随机抖动）
+- 记录冲突日志，监控冲突率
+
+---
+
+#### 2. 悲观锁（分布式锁）
+
+```java
+public void refund(String orderId) {
+    String lockKey = "order:refund:" + orderId;
+    RLock lock = redissonClient.getLock(lockKey);
+    
+    try {
+        // 等待5秒，持锁30秒自动释放（防止死锁）
+        boolean acquired = lock.tryLock(5, 30, TimeUnit.SECONDS);
+        if (!acquired) {
+            throw new BizException("系统繁忙，请稍后重试");
+        }
+        
+        // 业务逻辑
+        Order order = orderMapper.selectById(orderId);
+        if ("REFUNDED".equals(order.getStatus())) {
+            throw new BizException("订单已退款");
+        }
+        
+        // 调用支付网关退款
+        paymentGateway.refund(orderId);
+        
+        // 更新订单状态
+        order.setStatus("REFUNDED");
+        orderMapper.updateById(order);
+        
+        log.info("退款成功，订单：{}", orderId);
+        
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new BizException("操作被中断");
+    } finally {
+        // 只释放自己持有的锁
+        if (lock.isHeldByCurrentThread()) {
+            lock.unlock();
+        }
+    }
+}
+```
+
+**适用场景：** 退款、转账、秒杀
+
+**注意事项：**
+- 必须设置超时时间（避免死锁）
+- finally 中检查锁持有者再释放
+- 锁粒度尽量小（订单级，不是用户级）
+
+---
+
+#### 3. StampedLock（读多写少）
+
+```java
+public class ConfigCache {
+    private final StampedLock lock = new StampedLock();
+    private Map<String, String> cache = new HashMap<>();
+    
+    // 读操作（乐观读，零开销）
+    public String get(String key) {
+        // 1. 尝试乐观读（不加锁）
+        long stamp = lock.tryOptimisticRead();
+        String value = cache.get(key);
+        
+        // 2. 验证期间是否有写操作
+        if (!lock.validate(stamp)) {
+            // 3. 有写操作，升级为悲观读锁
+            stamp = lock.readLock();
+            try {
+                value = cache.get(key);
+            } finally {
+                lock.unlockRead(stamp);
+            }
+        }
+        return value;
+    }
+    
+    // 写操作（独占锁）
+    public void put(String key, String value) {
+        long stamp = lock.writeLock();
+        try {
+            cache.put(key, value);
+            log.info("配置更新：{} = {}", key, value);
+        } finally {
+            lock.unlockWrite(stamp);
+        }
+    }
+    
+    // 批量更新（写锁）
+    public void putAll(Map<String, String> configs) {
+        long stamp = lock.writeLock();
+        try {
+            cache.putAll(configs);
+        } finally {
+            lock.unlockWrite(stamp);
+        }
+    }
+}
+```
+
+**适用场景：** 配置缓存、统计数据、医生在线状态
+
+**注意事项：**
+- 不支持重入（同一线程不能重复加锁）
+- 不支持条件变量（Condition）
+- 读操作必须验证 stamp
+
+---
+
+### 四、性能对比（必记数据）
+
+#### 场景1：低冲突（1000线程更新1000条不同数据）
+
+```
+乐观锁：QPS 10000，冲突率 1%，平均响应 100ms
+悲观锁：QPS 5000，冲突率 0%，平均响应 200ms
+```
+
+**结论：** 低冲突场景，乐观锁快 **2倍**
+
+---
+
+#### 场景2：高冲突（1000线程抢10个库存）
+
+```
+乐观锁：QPS 100，冲突率 99%，大量重试，CPU 90%
+悲观锁：QPS 1000，冲突率 0%，排队执行，CPU 30%
+```
+
+**结论：** 高冲突场景，悲观锁快 **10倍**
+
+---
+
+#### 场景3：读多写少（10000读/秒，10写/秒）
+
+```
+ReentrantReadWriteLock：QPS 30000
+StampedLock（乐观读）：QPS 90000
+```
+
+**结论：** 读多写少场景，StampedLock 快 **3倍**
+
+---
+
+### 五、常见问题（必背）
+
+#### Q1: 乐观锁 vs 悲观锁如何选择？
+
+**看冲突率：**
+- 低（<10%）→ 乐观锁
+- 高（>30%）→ 悲观锁
+
+**看业务特性：**
+- 能重试 → 乐观锁
+- 不能重试（涉及金钱）→ 悲观锁
+
+---
+
+#### Q2: 什么时候用 StampedLock？
+
+**条件：** 读多写少 + 读操作极快（纯内存）
+
+**示例：** 配置缓存、统计数据、在线状态
+
+**优势：** 乐观读不加锁，性能高 3倍
+
+**注意：** 不支持重入，代码复杂度高
+
+---
+
+#### Q3: 分布式场景如何加锁？
+
+| 方案                       | 是否有效 | 说明                |
+| -------------------------- | -------- | ------------------- |
+| synchronized               | ❌        | 只在单个 JVM 内有效 |
+| ReentrantLock              | ❌        | 只在单个 JVM 内有效 |
+| 数据库乐观锁（version）    | ✅        | 跨实例有效          |
+| Redis 分布式锁（Redisson） | ✅        | 跨实例有效          |
+
+**推荐：** Redisson（支持锁续期、红锁）
+
+---
+
+#### Q4: 如何避免死锁？
+
+**方法1：按固定顺序加锁**
+
+```java
+// 转账：A → B
+public void transfer(String fromId, String toId, BigDecimal amount) {
+    // 按 ID 字典序加锁，避免循环等待
+    String lock1 = fromId.compareTo(toId) < 0 ? fromId : toId;
+    String lock2 = fromId.compareTo(toId) < 0 ? toId : fromId;
+    
+    RLock firstLock = redissonClient.getLock("account:" + lock1);
+    RLock secondLock = redissonClient.getLock("account:" + lock2);
+    
+    firstLock.lock();
+    try {
+        secondLock.lock();
+        try {
+            // 转账逻辑
+        } finally {
+            secondLock.unlock();
+        }
+    } finally {
+        firstLock.unlock();
+    }
+}
+```
+
+**方法2：使用 tryLock 设置超时**
+
+```java
+boolean acquired = lock.tryLock(5, TimeUnit.SECONDS);
+if (!acquired) {
+    throw new BizException("获取锁超时");
+}
+```
+
+**方法3：避免嵌套锁**
+- 尽量一次只持有一个锁
+- 必须嵌套时，按固定顺序
+
+---
+
+### 六、项目实战（面试必说）
+
+#### 1. Outbox 任务处理
+- **方案：** 乐观锁（version 字段）
+- **原因：** 冲突率低，多实例处理不同任务
+- **性能：** QPS 5000+
+- **代码：**
+  ```sql
+  UPDATE outbox_task
+  SET status = 'PROCESSING', version = version + 1
+  WHERE id = #{id} AND status = 'PENDING' AND version = #{version}
+  ```
+
+---
+
+#### 2. 退款操作
+- **方案：** 分布式锁（Redisson）
+- **原因：** 涉及金钱，防止重复退款
+- **配置：** 等待5秒，持锁30秒
+- **代码：** 见上方"悲观锁"示例
+
+---
+
+#### 3. 支付回调
+- **方案：** 乐观锁（状态检查）
+- **原因：** 数据库保证原子性，性能高
+- **代码：**
+  ```sql
+  UPDATE payment_order
+  SET status = 'PAID', paid_at = NOW()
+  WHERE order_id = #{orderId} AND status = 'PENDING'
+  ```
+
+---
+
+#### 4. 配置缓存（优化点）
+- **方案：** StampedLock
+- **原因：** 读多写少，性能提升 3倍
+- **代码：** 见上方"StampedLock"示例
+
+---
+
+### 七、常见坑点与解决方案
+
+#### 坑1：乐观锁重试风暴
+
+**问题：** 高并发下，大量线程同时重试，CPU 飙升
+
+**解决：**
+```java
+// 加随机退避
+int backoff = new Random().nextInt(100);
+Thread.sleep(50 + backoff);
+```
+
+---
+
+#### 坑2：分布式锁未释放
+
+**问题：** 业务异常导致 unlock 未执行
+
+**解决：**
+```java
+// 1. 设置自动过期时间
+lock.tryLock(5, 30, TimeUnit.SECONDS);
+
+// 2. finally 中释放
+finally {
+    if (lock.isHeldByCurrentThread()) {
+        lock.unlock();
+    }
+}
+```
+
+---
+
+#### 坑3：StampedLock 死锁
+
+**问题：** 同一线程重复加锁（不支持重入）
+
+**解决：**
+```java
+// 避免嵌套调用
+public String get(String key) {
+    // 不要在这里调用其他需要锁的方法
+}
+```
+
+---
+
+### 八、面试回答模板（1分钟版）
+
+> "锁的选择主要看 **冲突率** 和 **业务特性**：
+>
+> **乐观锁**：假设冲突少，提交时检查版本号。  
+> 适用：用户信息更新、订单状态变更。  
+> 优势：无锁开销，性能高 2倍。
+>
+> **悲观锁**：假设冲突多，操作前加锁。  
+> 适用：秒杀、退款、转账。  
+> 优势：避免大量重试，高冲突场景快 10倍。
+>
+> **StampedLock**：支持乐观读，读操作不加锁。  
+> 适用：配置缓存、统计数据。  
+> 优势：读多写少场景，性能高 3倍。
+>
+> **我们项目中：**
+> - Outbox 任务用乐观锁（version 字段）
+> - 退款用分布式锁（Redisson）
+> - 支付回调用乐观锁（状态检查）
+>
+> **选型原则：**
+> 1. 优先数据库原子操作
+> 2. 低冲突用乐观锁
+> 3. 高冲突用悲观锁
+> 4. 读多写少用 StampedLock"
+
+# 三、医院分布式项目
+
+> 📄 **详细版文档**：[医院分布式项目详细版](面试准备/医院分布式项目详细版.md)
+
+## 项目背景
+
+互联网医院项目采用Spring Cloud微服务架构，主要负责在线问诊、医生排班、患者预约等核心功能。
+
+**技术栈：** Nacos、Gateway、Sentinel、OpenFeign、Redisson、RabbitMQ、Outbox模式、MySQL读写分离、Redis
+
+**服务架构：** consultation-service（问诊）、doctor-service（医生）、schedule-service（排班）、appointment-service（预约）、notification-service（通知）
+
+---
+
+## 一、Spring Cloud 组件实战
+
+### 1.1 Nacos - 服务注册与发现
+
+**核心机制：**
+- 服务注册：启动时自动注册
+- 健康检查：5秒心跳，15秒不健康，30秒剔除
+- AP模式（Distro协议）：优先可用性，适合临时实例
+
+**高频问题：**
+
+**Q1: Nacos的AP模式和CP模式有什么区别？**
+
+| 模式       | 一致性协议 | 适用场景         | 特点                           |
+| ---------- | ---------- | ---------------- | ------------------------------ |
+| **AP模式** | Distro协议 | 临时实例（默认） | 优先保证可用性，允许数据不一致 |
+| **CP模式** | Raft协议   | 持久化实例       | 优先保证一致性，可能牺牲可用性 |
+
+**我们的选择：AP模式（临时实例）**
+- 理由：服务实例是临时的，宕机后应该立即剔除
+- 可用性优先：即使Nacos集群部分节点故障，服务发现仍可用
+- 最终一致性：短暂的数据不一致可接受
+
+**Q2: 服务如何实现健康检查？**
+
+Nacos支持两种健康检查方式：
+1. **客户端心跳（默认）**：服务每5秒主动发送心跳
+2. **服务端探测**：Nacos主动调用健康检查接口
+
+```java
+// 自定义健康检查
+@Component
+public class CustomHealthIndicator implements HealthIndicator {
+    @Override
+    public Health health() {
+        // 检查数据库连接、Redis连接等
+        if (checkDatabaseConnection() && checkRedisConnection()) {
+            return Health.up().build();
+        }
+        return Health.down().withDetail("reason", "依赖服务不可用").build();
+    }
+}
+```
+
+---
+
+### 1.2 Gateway - 服务网关
+
+**核心功能：**
+- 统一入口：所有请求先到Gateway
+- 路由转发：根据路径转发到不同服务
+- 认证鉴权：JWT Token验证
+- 限流熔断：保护后端服务
+- 日志记录：统一记录请求日志
+
+**路由配置：**
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        # 问诊服务路由
+        - id: consultation-service
+          uri: lb://consultation-service  # lb表示负载均衡
+          predicates:
+            - Path=/api/consultation/**
+          filters:
+            - StripPrefix=1  # 去掉/api前缀
+            - name: RequestRateLimiter  # 默认采用令牌桶算法
+            - name: RequestRateLimiter  # 默认采用令牌桶算法
+              args:
+                redis-rate-limiter.replenishRate: 10  # 每秒生成10个令牌
+                redis-rate-limiter.burstCapacity: 20  # 令牌桶容量20
+                key-resolver: "#{@userKeyResolver}"   # 按用户限流
+        
+        # 医生服务路由
+        - id: doctor-service
+          uri: lb://doctor-service
+          predicates:
+            - Path=/api/doctor/**
+          filters:
+            - StripPrefix=1
+```
+
+**认证鉴权过滤器：**
+```java
+@Component
+public class AuthFilter implements GlobalFilter, Ordered {
+    
+    @Autowired
+    private JwtUtil jwtUtil;
+    
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        ServerHttpRequest request = exchange.getRequest();
+        
+        // 白名单：登录、注册等接口不需要认证
+        if (isWhiteList(request.getPath().value())) {
+            return chain.filter(exchange);
+        }
+        
+        // 获取Token
+        String token = request.getHeaders().getFirst("Authorization");
+        if (token == null || !token.startsWith("Bearer ")) {
+            return unauthorized(exchange);
+        }
+        
+        try {
+            // 验证Token
+            String jwt = token.substring(7);
+            Claims claims = jwtUtil.parseToken(jwt);
+            String userId = claims.getSubject();
+            
+            // 将用户信息传递给下游服务
+            ServerHttpRequest newRequest = request.mutate()
+                .header("X-User-Id", userId)
+                .header("X-User-Role", claims.get("role", String.class))
+                .build();
+            
+            return chain.filter(exchange.mutate().request(newRequest).build());
+            
+        } catch (Exception e) {
+            return unauthorized(exchange);
+        }
+    }
+    
+    private Mono<Void> unauthorized(ServerWebExchange exchange) {
+        exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+        return exchange.getResponse().setComplete();
+    }
+    
+    @Override
+    public int getOrder() {
+        return -100;  // 优先级最高
+    }
+}
+```
+
+**限流实现（令牌桶算法）：**
+```java
+@Configuration
+public class RateLimiterConfig {
+    
+    // 按用户ID限流
+    @Bean
+    public KeyResolver userKeyResolver() {
+        return exchange -> {
+            String userId = exchange.getRequest().getHeaders().getFirst("X-User-Id");
+            return Mono.just(userId != null ? userId : "anonymous");
+        };
+    }
+    
+    // 按IP限流
+    @Bean
+    public KeyResolver ipKeyResolver() {
+        return exchange -> {
+            String ip = exchange.getRequest().getRemoteAddress().getAddress().getHostAddress();
+            return Mono.just(ip);
+        };
+    }
+}
+```
+
+**面试高频问题：**
+
+**Q1: Gateway如何实现限流？**
+
+使用Redis + 令牌桶算法：
+1. **令牌生成**：每秒生成N个令牌放入桶中
+2. **令牌消费**：每个请求消费1个令牌
+3. **桶满丢弃**：桶满时新令牌丢弃
+4. **无令牌拒绝**：无令牌时请求被拒绝（429状态码）
+
+**优势：**
+- 允许突发流量（桶容量 > 生成速率）
+- 分布式限流（基于Redis）
+- 灵活配置（按用户、IP、接口限流）
+
+**Q2: 如何传递用户信息到下游服务？**
+
+通过请求头传递：
+```java
+// Gateway添加请求头
+request.mutate()
+    .header("X-User-Id", userId)
+    .header("X-User-Role", role)
+    .build();
+
+// 下游服务获取
+@RestController
+public class ConsultationController {
+    
+    @GetMapping("/my-consultations")
+    public List<Consultation> getMyConsultations(
+        @RequestHeader("X-User-Id") String userId) {
+        return consultationService.getByUserId(userId);
+    }
+}
+```
+
+**Q3: Gateway和Nginx的区别？**
+
+| 对比项   | Gateway                | Nginx              |
+| -------- | ---------------------- | ------------------ |
+| 层级     | 应用层网关             | 反向代理           |
+| 功能     | 路由、限流、熔断、认证 | 负载均衡、静态资源 |
+| 动态路由 | 支持（从Nacos获取）    | 需要重启           |
+| 集成     | 与Spring Cloud无缝集成 | 独立组件           |
+| 适用场景 | 微服务网关             | 入口负载均衡       |
+
+**实际架构：**
+```
+用户请求 → Nginx（负载均衡） → Gateway集群 → 微服务
+```
+
+---
+
+### 1.3 Sentinel - 服务熔断降级
+
+**核心功能：**
+- 流量控制：QPS限流、并发线程数限流
+- 熔断降级：异常比例、慢调用比例
+- 热点参数限流：针对特定参数限流
+- 系统自适应保护：根据系统负载自动限流
+
+**配置示例：**
+```yaml
+spring:
+  cloud:
+    sentinel:
+      transport:
+        dashboard: localhost:8080  # Sentinel控制台
+        port: 8719
+      datasource:
+        ds1:
+          nacos:
+            server-addr: localhost:8848
+            dataId: sentinel-rules
+            groupId: DEFAULT_GROUP
+            rule-type: flow  # 流控规则
+```
+
+**流控规则（代码方式）：**
+```java
+@Configuration
+public class SentinelConfig {
+    
+    @PostConstruct
+    public void initFlowRules() {
+        List<FlowRule> rules = new ArrayList<>();
+        
+        // 规则1：查询医生排班，QPS限流
+        FlowRule rule1 = new FlowRule();
+        rule1.setResource("queryDoctorSchedule");
+        rule1.setGrade(RuleConstant.FLOW_GRADE_QPS);
+        rule1.setCount(100);  // 每秒最多100次
+        rules.add(rule1);
+        
+        // 规则2：创建预约，并发线程数限流
+        FlowRule rule2 = new FlowRule();
+        rule2.setResource("createAppointment");
+        rule2.setGrade(RuleConstant.FLOW_GRADE_THREAD);
+        rule2.setCount(20);  // 最多20个线程同时执行
+        rules.add(rule2);
+        
+        FlowRuleManager.loadRules(rules);
+    }
+}
+```
+
+**熔断降级规则：**
+```java
+@PostConstruct
+public void initDegradeRules() {
+    List<DegradeRule> rules = new ArrayList<>();
+    
+    // 规则1：异常比例熔断
+    DegradeRule rule1 = new DegradeRule();
+    rule1.setResource("queryDoctorInfo");
+    rule1.setGrade(RuleConstant.DEGRADE_GRADE_EXCEPTION_RATIO);
+    rule1.setCount(0.5);  // 异常比例超过50%
+    rule1.setTimeWindow(10);  // 熔断10秒
+    rule1.setMinRequestAmount(5);  // 最少5个请求才统计
+    rules.add(rule1);
+    
+    // 规则2：慢调用比例熔断
+    DegradeRule rule2 = new DegradeRule();
+    rule2.setResource("sendNotification");
+    rule2.setGrade(RuleConstant.DEGRADE_GRADE_RT);
+    rule2.setCount(1000);  // 响应时间超过1秒算慢调用
+    rule2.setSlowRatioThreshold(0.6);  // 慢调用比例超过60%
+    rule2.setTimeWindow(10);  // 熔断10秒
+    rules.add(rule2);
+    
+    DegradeRuleManager.loadRules(rules);
+}
+```
+
+**业务代码使用：**
+```java
+@Service
+public class DoctorService {
+    
+    @Autowired
+    private DoctorMapper doctorMapper;
+    
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+    
+    // 方式1：注解方式
+    @SentinelResource(
+        value = "queryDoctorSchedule",
+        blockHandler = "handleBlock",      // 限流/熔断时调用
+        fallback = "handleFallback"        // 业务异常时调用
+    )
+    public List<Schedule> queryDoctorSchedule(String doctorId, String date) {
+        // 查询医生排班
+        return scheduleMapper.selectByDoctorAndDate(doctorId, date);
+    }
+    
+    // 限流/熔断降级方法
+    public List<Schedule> handleBlock(String doctorId, String date, BlockException e) {
+        log.warn("查询排班被限流，doctorId: {}, 异常: {}", doctorId, e.getClass().getSimpleName());
+        
+        // 返回缓存数据
+        String cacheKey = "schedule:" + doctorId + ":" + date;
+        List<Schedule> cached = (List<Schedule>) redisTemplate.opsForValue().get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+        
+        // 返回空列表或默认数据
+        return Collections.emptyList();
+    }
+    
+    // 业务异常降级方法
+    public List<Schedule> handleFallback(String doctorId, String date, Throwable e) {
+        log.error("查询排班异常，doctorId: {}, 异常: {}", doctorId, e.getMessage());
+        
+        // 返回缓存数据
+        String cacheKey = "schedule:" + doctorId + ":" + date;
+        return (List<Schedule>) redisTemplate.opsForValue().get(cacheKey);
+    }
+}
+```
+
+**热点参数限流：**
+```java
+// 场景：防止某个热门医生被刷
+@SentinelResource(value = "queryDoctorInfo")
+public DoctorDTO queryDoctorInfo(String doctorId) {
+    return doctorMapper.selectById(doctorId);
+}
+
+// 热点参数规则
+ParamFlowRule rule = new ParamFlowRule();
+rule.setResource("queryDoctorInfo");
+rule.setParamIdx(0);  // 第0个参数（doctorId）
+rule.setCount(10);    // 每秒最多10次
+
+// 特殊参数：某个医生ID可以放宽限制
+ParamFlowItem item = new ParamFlowItem();
+item.setObject("doctor_001");  // 特定医生ID
+item.setCount(50);  // 每秒50次
+rule.setParamFlowItemList(Collections.singletonList(item));
+```
+
+**面试高频问题：**
+
+**Q1: Sentinel和Hystrix的区别？**
+
+| 对比项   | Sentinel             | Hystrix                 |
+| -------- | -------------------- | ----------------------- |
+| 维护状态 | 活跃维护             | 已停止维护              |
+| 隔离策略 | 信号量隔离           | 线程池隔离 + 信号量隔离 |
+| 熔断策略 | 异常比例、慢调用比例 | 异常比例                |
+| 实时监控 | 支持（控制台）       | 需要额外组件            |
+| 规则配置 | 动态配置（Nacos）    | 静态配置                |
+| 性能     | 更好（无线程池开销） | 线程池有开销            |
+
+**我们选择Sentinel的原因：**
+1. 官方推荐，Spring Cloud Alibaba生态
+2. 动态规则配置，无需重启
+3. 可视化控制台，实时监控
+4. 性能更好，资源消耗更低
+
+**Q2: 熔断后如何恢复？**
+
+Sentinel的熔断恢复机制（半开状态）：
+```
+正常状态 → 熔断状态（timeWindow秒） → 半开状态 → 正常状态/熔断状态
+```
+
+**流程：**
+1. **触发熔断**：异常比例/慢调用比例超过阈值
+2. **熔断期**：所有请求直接走降级方法，持续timeWindow秒
+3. **半开状态**：熔断期结束后，放行1个请求
+4. **恢复判断**：
+   - 请求成功 → 恢复正常状态
+   - 请求失败 → 继续熔断
+
+**Q3: 如何选择限流策略？**
+
+| 场景        | 策略           | 原因                       |
+| ----------- | -------------- | -------------------------- |
+| 查询接口    | QPS限流        | 保护数据库，防止慢查询堆积 |
+| 写入接口    | 并发线程数限流 | 控制数据库连接数           |
+| 外部API调用 | 并发线程数限流 | 避免占满线程池             |
+| 热点数据    | 热点参数限流   | 防止某个热点被刷           |
+
+**实际案例：**
+```java
+// 预约接口：并发线程数限流（控制数据库写入压力）
+@SentinelResource(value = "createAppointment")
+public void createAppointment(AppointmentDTO dto) {
+    // 最多20个线程同时执行
+}
+
+// 查询排班：QPS限流（保护数据库）
+@SentinelResource(value = "querySchedule")
+public List<Schedule> querySchedule(String doctorId) {
+    // 每秒最多100次查询
+}
+```
+
+**Q4: 写入接口做了限流，还需要加锁吗？**
+
+**答案：需要！限流和锁解决的是不同问题，不能互相替代。**
+
+**限流 vs 锁的区别：**
+
+| 维度 | 限流（Sentinel） | 锁（乐观锁/悲观锁） |
+|------|-----------------|-------------------|
+| **目的** | 保护系统资源（线程池、数据库连接） | 保证数据一致性 |
+| **作用范围** | 控制并发请求数量 | 控制数据修改的正确性 |
+| **解决问题** | 防止系统过载 | 防止并发修改冲突 |
+
+**典型场景分析：**
+
+**场景1：库存扣减（必须加锁）**
+```java
+// ❌ 只有限流，不够！
+@SentinelResource(value = "deductInventory")
+public void deductInventory(Long productId, int quantity) {
+    Inventory inv = inventoryMapper.selectById(productId);
+    if (inv.getStock() >= quantity) {
+        inv.setStock(inv.getStock() - quantity);
+        inventoryMapper.updateById(inv);  // 并发问题：超卖！
+    }
+}
+
+// ✅ 限流 + 乐观锁
+@SentinelResource(value = "deductInventory")
+public void deductInventory(Long productId, int quantity) {
+    Inventory inv = inventoryMapper.selectById(productId);
+    if (inv.getStock() >= quantity) {
+        inv.setStock(inv.getStock() - quantity);
+        // 乐观锁：WHERE id = ? AND version = ?
+        int updated = inventoryMapper.updateByIdWithVersion(inv);
+        if (updated == 0) {
+            throw new ConcurrentModificationException("库存已被修改");
+        }
+    }
+}
+```
+
+**为什么限流不够？**
+- 限流只控制了**20个线程同时执行**
+- 但这20个线程**仍然可能同时读取同一条库存记录**
+- 导致超卖问题
+
+**场景2：账户余额扣减（必须加锁）**
+```java
+// ✅ 限流 + 悲观锁
+@SentinelResource(value = "deductBalance")
+@Transactional
+public void deductBalance(Long userId, BigDecimal amount) {
+    // SELECT ... FOR UPDATE（悲观锁）
+    Account account = accountMapper.selectByIdForUpdate(userId);
+    if (account.getBalance().compareTo(amount) >= 0) {
+        account.setBalance(account.getBalance().subtract(amount));
+        accountMapper.updateById(account);
+    }
+}
+```
+
+**场景3：日志记录（可能不需要锁）**
+```java
+// ✅ 只需要限流
+@SentinelResource(value = "saveLog")
+public void saveLog(OperationLog log) {
+    logMapper.insert(log);  // 每条日志独立，无并发冲突
+}
+```
+
+**决策树：**
+```
+写入接口
+  ↓
+是否存在并发修改同一数据？
+  ↓ 是
+需要加锁（乐观锁/悲观锁）
+  ↓ 否
+只需要限流
+```
+
+**写入接口的完整保护方案：**
+```java
+@Service
+public class OrderService {
+    
+    // 1. Sentinel限流：保护系统资源
+    @SentinelResource(
+        value = "createOrder",
+        blockHandler = "handleBlock"
+    )
+    // 2. 分布式锁：防止重复提交
+    @RedisLock(key = "#userId + ':' + #productId")
+    // 3. 事务 + 乐观锁：保证数据一致性
+    @Transactional
+    public void createOrder(Long userId, Long productId) {
+        // 业务逻辑
+    }
+    
+    public void handleBlock(Long userId, Long productId, BlockException e) {
+        throw new BusinessException("系统繁忙，请稍后重试");
+    }
+}
+```
+
+**总结：限流是第一道防线（保护系统），锁是第二道防线（保护数据）。**
+
+---
+
+**Q5: 实战问题与解决方案 ⭐⭐⭐**
+
+**问题1：Sentinel限流后，用户体验差**
+
+**现象：**
+- 限流后直接返回"系统繁忙，请稍后重试"
+- 用户不理解为什么被拒绝，不断重试
+- 客服投诉量激增
+
+**解决方案：**
+```java
+@SentinelResource(
+    value = "queryDoctorSchedule",
+    blockHandler = "handleBlock"
+)
+public List<Schedule> queryDoctorSchedule(String doctorId, String date) {
+    return scheduleMapper.selectByDoctorAndDate(doctorId, date);
+}
+
+// 优化后的降级方法
+public List<Schedule> handleBlock(String doctorId, String date, BlockException e) {
+    // 1. 返回缓存数据
+    String cacheKey = "schedule:" + doctorId + ":" + date;
+    List<Schedule> cached = redisTemplate.opsForValue().get(cacheKey);
+    if (cached != null) {
+        log.info("限流降级，返回缓存数据");
+        return cached;
+    }
+    
+    // 2. 返回友好提示（带预估等待时间）
+    long waitingCount = getWaitingCount();  // 获取当前排队人数
+    int estimatedSeconds = (int) (waitingCount / 100);  // 假设每秒处理100个
+    
+    throw new BusinessException(
+        String.format("当前访问人数较多，预计等待%d秒，请稍后重试", estimatedSeconds)
+    );
+}
+```
+
+**效果：**
+- 用户投诉率下降 **60%**
+- 缓存命中率 **85%**
+- 用户重试间隔从平均2秒延长到10秒
+
+---
+
+**问题2：Outbox轮询导致数据库压力大**
+
+**现象：**
+- outbox表数据量达到 **100万条**
+- 每次扫描耗时 **5秒**
+- 数据库CPU使用率 **80%+**
+
+**原始实现：**
+```java
+@Scheduled(fixedDelay = 1000)
+public void pollOutbox() {
+    // ❌ 全表扫描，性能差
+    List<OutboxEvent> events = outboxMapper.selectList(
+        new QueryWrapper<OutboxEvent>()
+            .eq("status", "PENDING")
+            .last("LIMIT 100")
+    );
+    
+    for (OutboxEvent event : events) {
+        sendToMQ(event);
+    }
+}
+```
+
+**优化方案：**
+```java
+// 1. 增加复合索引
+CREATE INDEX idx_status_time ON outbox(status, create_time);
+
+// 2. 分片扫描
+@Scheduled(fixedDelay = 1000)
+public void pollOutbox() {
+    // 只扫描最近5分钟的数据
+    LocalDateTime fiveMinutesAgo = LocalDateTime.now().minusMinutes(5);
+    
+    List<OutboxEvent> events = outboxMapper.selectList(
+        new QueryWrapper<OutboxEvent>()
+            .eq("status", "PENDING")
+            .ge("create_time", fiveMinutesAgo)
+            .orderByAsc("create_time")
+            .last("LIMIT 100")
+    );
+    
+    for (OutboxEvent event : events) {
+        sendToMQ(event);
+    }
+}
+
+// 3. 定期归档（每天凌晨执行）
+@Scheduled(cron = "0 0 2 * * ?")
+public void archiveOutbox() {
+    // 将7天前已发送的消息移到历史表
+    LocalDateTime sevenDaysAgo = LocalDateTime.now().minusDays(7);
+    
+    outboxMapper.archiveOldEvents(sevenDaysAgo);
+    
+    log.info("Outbox归档完成");
+}
+```
+
+**效果：**
+- 扫描耗时从5秒降到 **200ms**
+- 数据库CPU使用率降到 **20%**
+- outbox表保持在 **10万条**以内
+
+---
+
+**问题3：热点医生被刷，导致正常用户无法访问**
+
+**现象：**
+- 某网红医生的排班接口被恶意刷新
+- QPS达到 **5000+**，远超正常值（100）
+- 正常用户访问超时
+
+**解决方案：**
+```java
+// 1. 热点参数限流
+@SentinelResource(value = "queryDoctorInfo")
+public DoctorDTO queryDoctorInfo(String doctorId) {
+    return doctorMapper.selectById(doctorId);
+}
+
+// 2. 配置热点参数规则
+ParamFlowRule rule = new ParamFlowRule();
+rule.setResource("queryDoctorInfo");
+rule.setParamIdx(0);  // 第0个参数（doctorId）
+rule.setCount(10);    // 默认每秒10次
+
+// 3. 特殊医生放宽限制
+ParamFlowItem item = new ParamFlowItem();
+item.setObject("doctor_001");  // 网红医生ID
+item.setCount(50);  // 每秒50次
+rule.setParamFlowItemList(Collections.singletonList(item));
+
+ParamFlowRuleManager.loadRules(Collections.singletonList(rule));
+
+// 4. 增加IP限流
+@Bean
+public KeyResolver ipKeyResolver() {
+    return exchange -> {
+        String ip = exchange.getRequest().getRemoteAddress()
+            .getAddress().getHostAddress();
+        return Mono.just(ip);
+    };
+}
+```
+
+**效果：**
+- 恶意刷新被有效拦截
+- 正常用户访问成功率从 **30%** 提升到 **95%**
+- 接口响应时间从 **3秒** 降到 **200ms**
+
+---
+
+**Q6: 监控指标与告警 ⭐⭐⭐**
+
+**Sentinel监控指标：**
+
+```java
+@Component
+public class SentinelMetricsCollector {
+    
+    @Scheduled(fixedDelay = 10000)  // 每10秒采集一次
+    public void collectMetrics() {
+        Map<String, List<MetricNode>> metrics = 
+            InMemoryMetricsRepository.getInstance().queryByAppAndResourceBetween(
+                "appointment-service", 
+                System.currentTimeMillis() - 10000,
+                System.currentTimeMillis()
+            );
+        
+        for (Map.Entry<String, List<MetricNode>> entry : metrics.entrySet()) {
+            String resource = entry.getKey();
+            List<MetricNode> nodes = entry.getValue();
+            
+            for (MetricNode node : nodes) {
+                // 1. QPS监控
+                long passQps = node.getPassQps();
+                long blockQps = node.getBlockQps();
+                double blockRate = (double) blockQps / (passQps + blockQps);
+                
+                // 告警：拒绝率 > 5%
+                if (blockRate > 0.05) {
+                    alertService.send(String.format(
+                        "资源[%s]限流拒绝率过高: %.2f%%", resource, blockRate * 100
+                    ));
+                }
+                
+                // 2. RT监控
+                long avgRt = node.getAvgRt();
+                
+                // 告警：平均响应时间 > 1秒
+                if (avgRt > 1000) {
+                    alertService.send(String.format(
+                        "资源[%s]响应时间过长: %dms", resource, avgRt
+                    ));
+                }
+                
+                // 3. 异常监控
+                long exceptionQps = node.getExceptionQps();
+                double exceptionRate = (double) exceptionQps / passQps;
+                
+                // 告警：异常率 > 1%
+                if (exceptionRate > 0.01) {
+                    alertService.send(String.format(
+                        "资源[%s]异常率过高: %.2f%%", resource, exceptionRate * 100
+                    ));
+                }
+            }
+        }
+    }
+}
+```
+
+**监控大盘（Grafana）：**
+
+| 指标 | 正常值 | 告警阈值 | 处理方式 |
+|------|--------|----------|----------|
+| **QPS** | 100-500 | >1000 | 检查是否被刷，调整限流阈值 |
+| **拒绝率** | <1% | >5% | 增加缓存，优化降级策略 |
+| **RT（P99）** | <500ms | >1s | 检查慢查询，增加索引 |
+| **熔断次数** | 0 | >10次/小时 | 检查下游服务，增加超时时间 |
+| **异常率** | <0.1% | >1% | 查看日志，修复bug |
+
+**Prometheus监控配置：**
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'sentinel'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['localhost:8080']
+    
+# 告警规则
+groups:
+  - name: sentinel_alerts
+    rules:
+      - alert: HighBlockRate
+        expr: sentinel_block_qps / (sentinel_pass_qps + sentinel_block_qps) > 0.05
+        for: 1m
+        annotations:
+          summary: "Sentinel限流拒绝率过高"
+          
+      - alert: HighResponseTime
+        expr: sentinel_avg_rt > 1000
+        for: 1m
+        annotations:
+          summary: "接口响应时间过长"
+```
+
+---
+
+**Q7: 性能数据与压测结果 ⭐⭐**
+
+**Sentinel性能数据：**
+
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| **单机QPS** | 10000+ | 几乎无性能损耗 |
+| **限流响应时间** | <1ms | 基于滑动窗口算法 |
+| **内存占用** | 每条规则约1KB | 1000条规则约1MB |
+| **CPU占用** | <1% | 高性能设计 |
+
+**压测场景1：查询医生排班**
+```bash
+# JMeter压测配置
+线程数: 1000
+循环次数: 100
+总请求数: 100000
+
+# 压测结果
+平均响应时间: 150ms
+P95响应时间: 300ms
+P99响应时间: 500ms
+错误率: 0%
+限流触发: 15000次（符合预期）
+```
+
+**压测场景2：创建预约（并发线程数限流）**
+```bash
+# 压测配置
+线程数: 100
+持续时间: 5分钟
+
+# 压测结果
+TPS: 450
+平均响应时间: 220ms
+数据库连接数: 稳定在20（符合限流配置）
+无死锁、无超时
+```
+
+**Outbox性能数据：**
+
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| **消息发送延迟（P99）** | <2s | 轮询间隔1秒 |
+| **吞吐量** | 5000条/秒 | 单机性能 |
+| **消息可靠性** | 99.99% | 结合MQ重试 |
+| **数据库压力** | CPU 20% | 优化后 |
+
+**压测场景：高并发预约**
+```bash
+# 压测配置
+并发用户: 1000
+持续时间: 10分钟
+总预约数: 50000
+
+# 压测结果
+预约成功率: 100%
+Outbox消息全部发送: 50000条
+消息平均延迟: 1.2秒
+数据库无压力（CPU 25%）
+无消息丢失
+```
+
+---
+
+**Q8: 技术选型决策 ⭐⭐**
+
+**为什么选Sentinel而不是Hystrix？**
+
+| 对比项 | Sentinel | Hystrix |
+|--------|----------|---------|
+| **维护状态** | ✅ 活跃维护（阿里开源） | ❌ 已停止维护（2018年） |
+| **隔离策略** | 信号量隔离 | 线程池隔离 + 信号量隔离 |
+| **性能** | ✅ 更好（无线程池开销） | 线程池有上下文切换开销 |
+| **规则配置** | ✅ 动态配置（Nacos） | 静态配置，需重启 |
+| **控制台** | ✅ 官方控制台 | 需要额外组件（Turbine） |
+| **生态** | ✅ Spring Cloud Alibaba | Spring Cloud Netflix |
+
+**决策理由：**
+1. Hystrix已停止维护，未来无法获得支持
+2. Sentinel性能更好，单机QPS可达10000+
+3. Sentinel支持动态规则，运维更友好
+4. 项目使用Spring Cloud Alibaba生态，Sentinel是官方推荐
+
+**为什么选Outbox而不是RocketMQ事务消息？**
+
+| 对比项 | Outbox + RabbitMQ | RocketMQ事务消息 |
+|--------|-------------------|------------------|
+| **实现复杂度** | ✅ 简单（本地表+定时任务） | 需要实现回查接口 |
+| **切换成本** | ✅ 低（已有RabbitMQ） | 高（需引入RocketMQ） |
+| **实时性** | 1-2秒延迟 | ✅ 实时（无轮询） |
+| **可控性** | ✅ 高（代码可控） | 依赖MQ特性 |
+| **运维成本** | ✅ 低（复用现有MQ） | 高（新增组件） |
+
+**决策理由：**
+1. 项目已使用RabbitMQ，切换到RocketMQ成本高
+2. 预约场景对实时性要求不高（2秒延迟可接受）
+3. Outbox实现简单，团队容易理解和维护
+4. 可以复用现有的MQ基础设施和监控
+
+---
+
+**Q9: 故障预案 ⭐⭐**
+
+**场景1：Sentinel Dashboard挂了**
+
+**影响：**
+- 无法通过控制台动态修改规则
+- 无法查看实时监控数据
+
+**预案：**
+```yaml
+# 规则持久化到Nacos
+spring:
+  cloud:
+    sentinel:
+      datasource:
+        flow:
+          nacos:
+            server-addr: localhost:8848
+            dataId: sentinel-flow-rules
+            rule-type: flow
+```
+
+**恢复步骤：**
+1. 应用从Nacos加载规则，不受Dashboard影响
+2. 重启Dashboard，规则自动同步
+3. 已有规则继续生效，业务不受影响
+
+---
+
+**场景2：Nacos挂了**
+
+**影响：**
+- 无法拉取最新规则
+- 无法动态修改规则
+
+**预案：**
+```java
+@Component
+public class SentinelRulePersistence {
+    
+    // 本地缓存规则
+    private static final String RULE_CACHE_FILE = "/data/sentinel/rules.json";
+    
+    @PostConstruct
+    public void init() {
+        // 启动时加载本地缓存
+        loadLocalRules();
+        
+        // 监听Nacos配置变化
+        listenNacosConfig();
+    }
+    
+    private void listenNacosConfig() {
+        // 每次从Nacos拉取规则后，保存到本地
+        configService.addListener(dataId, groupId, new Listener() {
+            @Override
+            public void receiveConfigInfo(String configInfo) {
+                // 保存到本地文件
+                FileUtils.writeStringToFile(
+                    new File(RULE_CACHE_FILE), configInfo, "UTF-8");
+            }
+        });
+    }
+}
+```
+
+**恢复步骤：**
+1. 应用使用本地缓存的规则
+2. 重启Nacos，规则自动同步
+3. 业务不受影响
+
+---
+
+**场景3：RabbitMQ挂了**
+
+**影响：**
+- Outbox消息无法发送
+- 消息堆积在outbox表
+
+**预案：**
+```java
+@Component
+public class OutboxPoller {
+    
+    @Scheduled(fixedDelay = 1000)
+    public void pollOutbox() {
+        try {
+            List<OutboxEvent> events = loadPendingEvents();
+            
+            for (OutboxEvent event : events) {
+                try {
+                    // 发送到MQ
+                    rabbitTemplate.convertAndSend(
+                        event.getExchange(),
+                        event.getRoutingKey(),
+                        event.getPayload()
+                    );
+                    
+                    // 标记为已发送
+                    markAsSent(event);
+                    
+                } catch (AmqpException e) {
+                    // MQ不可用，跳过本次发送
+                    log.warn("MQ不可用，消息保留在outbox表: {}", event.getId());
+                    break;  // 停止本轮发送
+                }
+            }
+        } catch (Exception e) {
+            log.error("Outbox轮询失败", e);
+        }
+    }
+}
+```
+
+**恢复步骤：**
+1. 消息保留在outbox表，不会丢失
+2. MQ恢复后，定时任务自动继续发送
+3. 消费者处理堆积的消息
+
+**监控告警：**
+```java
+// 监控outbox表堆积数量
+@Scheduled(fixedDelay = 60000)
+public void checkOutboxBacklog() {
+    long count = outboxMapper.countPending();
+    
+    // 告警：待发送消息 > 1000
+    if (count > 1000) {
+        alertService.send(String.format(
+            "Outbox消息堆积: %d条，请检查MQ是否正常", count
+        ));
+    }
+}
+```
+
+---
+
+**Q10: 如果重新设计 ⭐**
+
+**Sentinel改进方向：**
+
+1. **自适应限流**
+```java
+// 根据系统负载动态调整阈值
+@Component
+public class AdaptiveFlowRule {
+    
+    @Scheduled(fixedDelay = 10000)
+    public void adjustFlowRule() {
+        // 获取系统负载
+        double cpuUsage = systemMetrics.getCpuUsage();
+        double memoryUsage = systemMetrics.getMemoryUsage();
+        
+        // 负载高时降低阈值
+        if (cpuUsage > 0.8 || memoryUsage > 0.8) {
+            adjustThreshold(0.7);  // 降低到70%
+        } else if (cpuUsage < 0.5 && memoryUsage < 0.5) {
+            adjustThreshold(1.2);  // 提升到120%
+        }
+    }
+}
+```
+
+2. **用户分级限流**
+```java
+// VIP用户更高的限流阈值
+@SentinelResource(value = "querySchedule")
+public List<Schedule> querySchedule(String doctorId) {
+    String userId = getCurrentUserId();
+    String userLevel = userService.getUserLevel(userId);
+    
+    // VIP用户走单独的资源
+    if ("VIP".equals(userLevel)) {
+        return queryScheduleVip(doctorId);
+    }
+    
+    return scheduleMapper.selectByDoctorId(doctorId);
+}
+```
+
+**Outbox改进方向：**
+
+1. **考虑CDC方案（Canal）**
+```
+优势：
+- 无需轮询，实时性更好（<100ms）
+- 无代码侵入，监听binlog即可
+- 性能更好，无数据库查询压力
+
+劣势：
+- 依赖MySQL binlog
+- 运维复杂度高
+- 需要额外的Canal服务
+
+适用场景：
+- 对实时性要求高（<1秒）
+- 消息量大（>10000条/秒）
+- 有专业运维团队
+```
+
+2. **消息优先级**
+```java
+// 重要消息优先发送
+@Transactional
+public void enqueue(String eventType, Object payload, int priority) {
+    OutboxEvent event = new OutboxEvent();
+    event.setEventType(eventType);
+    event.setPayload(JSON.toJSONString(payload));
+    event.setPriority(priority);  // 1-高，2-中，3-低
+    outboxMapper.insert(event);
+}
+
+// 轮询时按优先级排序
+SELECT * FROM outbox 
+WHERE status = 'PENDING' 
+ORDER BY priority ASC, create_time ASC 
+LIMIT 100;
+```
+
+---
+
+## 二、分布式问题解决方案 ⭐⭐⭐⭐⭐
+
+### 2.1 分布式事务
+
+**业务场景：用户预约挂号**
+```
+用户预约 → 扣减号源 → 创建订单 → 发送通知
+涉及3个服务：排班服务、订单服务、通知服务
+如何保证一致性？
+```
+
+**方案对比：**
+
+| 方案                     | 一致性   | 性能 | 复杂度 | 适用场景       |
+| ------------------------ | -------- | ---- | ------ | -------------- |
+| **Seata AT模式**         | 强一致   | 低   | 中     | 金融、支付     |
+| **TCC**                  | 强一致   | 中   | 高     | 金融、核心业务 |
+| **本地消息表（Outbox）** | 最终一致 | 高   | 低     | 互联网业务     |
+| **RabbitMQ事务消息**     | 最终一致 | 高   | 低     | 异步通知       |
+
+**我们的选择：Outbox模式**
+
+**理由：**
+1. 互联网医院对实时性要求不高（最终一致性即可）
+2. 已有RabbitMQ基础设施，可复用
+3. 开发成本低，可靠性高
+4. 性能好，不影响主流程
+
+**实现方案：**
+```java
+// 预约服务
+@Service
+public class AppointmentService {
+    
+    @Autowired
+    private AppointmentMapper appointmentMapper;
+    
+    @Autowired
+    private OutboxService outboxService;
+    
+    @Transactional
+    public void createAppointment(AppointmentDTO dto) {
+        // 1. 创建预约记录
+        Appointment appointment = new Appointment();
+        appointment.setUserId(dto.getUserId());
+        appointment.setDoctorId(dto.getDoctorId());
+        appointment.setScheduleId(dto.getScheduleId());
+        appointment.setStatus("PENDING");
+        appointmentMapper.insert(appointment);
+        
+        // 2. 插入Outbox事件（同一事务）
+        outboxService.enqueue(
+            "APPOINTMENT_CREATED",
+            appointment.getId(),
+            JSON.toJSONString(appointment),
+            "appointment.exchange",
+            "appointment.created"
+        );
+        
+        // 事务提交后，Outbox异步发送MQ
+    }
+}
+
+// 排班服务消费MQ
+@Service
+public class ScheduleConsumer {
+    
+    @RabbitListener(queues = "appointment.created.queue")
+    public void handleAppointmentCreated(Message message, Channel channel) {
+        try {
+            Appointment appointment = JSON.parseObject(
+                new String(message.getBody()), Appointment.class);
+            
+            // 扣减号源
+            scheduleService.decreaseQuota(appointment.getScheduleId());
+            
+            // 手动ACK
+            channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+            
+        } catch (Exception e) {
+            log.error("处理预约事件失败", e);
+            // 重试或进入死信队列
+            channel.basicNack(message.getMessageProperties().getDeliveryTag(), false, false);
+        }
+    }
+}
+```
+
+**优势：**
+- 预约创建和Outbox插入在同一事务，保证原子性
+- 异步发送MQ，不阻塞主流程
+- 定时补偿任务，保证消息最终发送成功
+- 消费者手动ACK，保证消息不丢失
+
+**详细实现参考：** [[RabbitMQ+Outbox模式生产级实现方案]]
+
+---
+
+**补充：TCC模式 - 金融核心业务场景**
+
+**业务场景：用户充值到账户余额**
+```
+用户充值 → 第三方支付扣款 → 账户余额增加 → 记录流水
+涉及3个服务：支付服务、账户服务、流水服务
+要求：强一致性，不能出现扣款成功但余额未增加的情况
+```
+
+**为什么选择TCC而不是AT？**
+
+| 对比项 | Seata AT | TCC |
+|--------|----------|-----|
+| 锁定资源 | 数据库行锁 | 业务资源（冻结金额） |
+| 锁定时长 | 整个事务期间 | 仅Try阶段 |
+| 性能 | 低（长时间持锁） | 高（不持数据库锁） |
+| 适用场景 | 短事务 | 长事务、跨异构系统 |
+
+**TCC实现方案：**
+
+```java
+// ========== 1. 账户服务 - TCC接口 ==========
+@LocalTCC
+public interface AccountTccService {
+    
+    /**
+     * Try阶段：冻结金额
+     */
+    @TwoPhaseBusinessAction(
+        name = "accountTcc",
+        commitMethod = "confirm",
+        rollbackMethod = "cancel"
+    )
+    boolean tryFreeze(
+        @BusinessActionContextParameter(paramName = "userId") Long userId,
+        @BusinessActionContextParameter(paramName = "amount") BigDecimal amount,
+        @BusinessActionContextParameter(paramName = "bizId") String bizId
+    );
+    
+    /**
+     * Confirm阶段：确认扣款
+     */
+    boolean confirm(BusinessActionContext context);
+    
+    /**
+     * Cancel阶段：解冻金额
+     */
+    boolean cancel(BusinessActionContext context);
+}
+
+// ========== 2. 账户服务 - TCC实现 ==========
+@Service
+public class AccountTccServiceImpl implements AccountTccService {
+    
+    @Autowired
+    private AccountMapper accountMapper;
+    
+    @Autowired
+    private AccountFreezeMapper freezeMapper;
+    
+    @Override
+    @Transactional
+    public boolean tryFreeze(Long userId, BigDecimal amount, String bizId) {
+        // 1. 检查是否重复Try（幂等性）
+        AccountFreeze existing = freezeMapper.selectByBizId(bizId);
+        if (existing != null) {
+            return true;  // 已经Try过，直接返回成功
+        }
+        
+        // 2. 检查余额是否足够
+        Account account = accountMapper.selectByIdForUpdate(userId);
+        if (account.getBalance().compareTo(amount) < 0) {
+            throw new BusinessException("余额不足");
+        }
+        
+        // 3. 冻结金额（不实际扣减）
+        account.setBalance(account.getBalance().subtract(amount));
+        account.setFrozenAmount(account.getFrozenAmount().add(amount));
+        accountMapper.updateById(account);
+        
+        // 4. 记录冻结记录
+        AccountFreeze freeze = new AccountFreeze();
+        freeze.setUserId(userId);
+        freeze.setAmount(amount);
+        freeze.setBizId(bizId);
+        freeze.setStatus("TRY");
+        freezeMapper.insert(freeze);
+        
+        log.info("Try阶段成功，冻结金额：{}", amount);
+        return true;
+    }
+    
+    @Override
+    @Transactional
+    public boolean confirm(BusinessActionContext context) {
+        Long userId = context.getActionContext("userId", Long.class);
+        BigDecimal amount = context.getActionContext("amount", BigDecimal.class);
+        String bizId = context.getActionContext("bizId", String.class);
+        
+        // 1. 检查是否已经Confirm（幂等性）
+        AccountFreeze freeze = freezeMapper.selectByBizId(bizId);
+        if (freeze == null) {
+            return true;  // 已经处理过，直接返回成功
+        }
+        if ("CONFIRM".equals(freeze.getStatus())) {
+            return true;  // 已经Confirm过
+        }
+        
+        // 2. 确认扣款：减少冻结金额
+        Account account = accountMapper.selectByIdForUpdate(userId);
+        account.setFrozenAmount(account.getFrozenAmount().subtract(amount));
+        accountMapper.updateById(account);
+        
+        // 3. 更新冻结记录状态
+        freeze.setStatus("CONFIRM");
+        freezeMapper.updateById(freeze);
+        
+        // 4. 删除冻结记录（可选，也可以保留用于审计）
+        freezeMapper.deleteById(freeze.getId());
+        
+        log.info("Confirm阶段成功，扣减金额：{}", amount);
+        return true;
+    }
+    
+    @Override
+    @Transactional
+    public boolean cancel(BusinessActionContext context) {
+        Long userId = context.getActionContext("userId", Long.class);
+        BigDecimal amount = context.getActionContext("amount", BigDecimal.class);
+        String bizId = context.getActionContext("bizId", String.class);
+        
+        // 1. 检查是否已经Cancel（幂等性）
+        AccountFreeze freeze = freezeMapper.selectByBizId(bizId);
+        if (freeze == null) {
+            return true;  // 已经处理过
+        }
+        if ("CANCEL".equals(freeze.getStatus())) {
+            return true;  // 已经Cancel过
+        }
+        
+        // 2. 解冻金额：恢复余额
+        Account account = accountMapper.selectByIdForUpdate(userId);
+        account.setBalance(account.getBalance().add(amount));
+        account.setFrozenAmount(account.getFrozenAmount().subtract(amount));
+        accountMapper.updateById(account);
+        
+        // 3. 更新冻结记录状态
+        freeze.setStatus("CANCEL");
+        freezeMapper.updateById(freeze);
+        
+        // 4. 删除冻结记录
+        freezeMapper.deleteById(freeze.getId());
+        
+        log.info("Cancel阶段成功，解冻金额：{}", amount);
+        return true;
+    }
+}
+
+// ========== 3. 充值服务 - 编排TCC事务 ==========
+@Service
+public class RechargeService {
+    
+    @Autowired
+    private AccountTccService accountTccService;
+    
+    @Autowired
+    private PaymentService paymentService;
+    
+    @Autowired
+    private TransactionLogService logService;
+    
+    @GlobalTransactional  // Seata全局事务
+    public void recharge(Long userId, BigDecimal amount) {
+        String bizId = UUID.randomUUID().toString();
+        
+        try {
+            // 1. Try阶段：冻结账户金额
+            accountTccService.tryFreeze(userId, amount, bizId);
+            
+            // 2. 调用第三方支付（可能耗时较长）
+            PaymentResult result = paymentService.pay(userId, amount);
+            if (!result.isSuccess()) {
+                throw new BusinessException("支付失败：" + result.getMessage());
+            }
+            
+            // 3. 记录流水
+            logService.recordRecharge(userId, amount, bizId);
+            
+            // 4. 全局事务提交 → 自动调用所有Confirm方法
+            log.info("充值成功，用户：{}，金额：{}", userId, amount);
+            
+        } catch (Exception e) {
+            log.error("充值失败，用户：{}，金额：{}", userId, amount, e);
+            // 全局事务回滚 → 自动调用所有Cancel方法
+            throw e;
+        }
+    }
+}
+
+// ========== 4. 数据库表设计 ==========
+/*
+-- 账户表
+CREATE TABLE account (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    balance DECIMAL(20, 2) NOT NULL DEFAULT 0,      -- 可用余额
+    frozen_amount DECIMAL(20, 2) NOT NULL DEFAULT 0, -- 冻结金额
+    version INT NOT NULL DEFAULT 0,                  -- 乐观锁版本号
+    INDEX idx_user_id (user_id)
+);
+
+-- 冻结记录表
+CREATE TABLE account_freeze (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    amount DECIMAL(20, 2) NOT NULL,
+    biz_id VARCHAR(64) NOT NULL UNIQUE,  -- 业务ID（幂等性）
+    status VARCHAR(20) NOT NULL,         -- TRY/CONFIRM/CANCEL
+    create_time DATETIME NOT NULL,
+    INDEX idx_biz_id (biz_id)
+);
+*/
+```
+
+**TCC三阶段详解：**
+
+| 阶段 | 操作 | 数据库状态 | 说明 |
+|------|------|-----------|------|
+| **Try** | 冻结金额 | balance减少，frozen_amount增加 | 预留资源，不实际扣款 |
+| **Confirm** | 确认扣款 | frozen_amount减少 | 确认业务，释放冻结 |
+| **Cancel** | 解冻金额 | balance增加，frozen_amount减少 | 回滚业务，恢复资源 |
+
+**TCC关键点：**
+
+1. **幂等性**：每个阶段都要检查是否已执行，防止重复调用
+2. **空回滚**：Cancel可能在Try之前执行（网络延迟），需要处理
+3. **悬挂**：Try在Cancel之后执行，需要拒绝
+4. **资源预留**：Try阶段只预留资源，不实际扣减
+
+**TCC vs Outbox 选择建议：**
+
+```
+强一致性 + 跨异构系统 → TCC
+强一致性 + 纯数据库操作 + 短事务 → Seata AT
+最终一致性 + 异步场景 → Outbox + MQ
+```
+
+---
+
+**分布式事务实战问题与解决 ⭐⭐⭐**
+
+**问题1：TCC空回滚导致资金异常**
+
+**现象：**
+- Try阶段因网络超时未执行
+- Seata认为Try失败，触发Cancel
+- Cancel先于Try执行，导致账户余额异常增加
+
+**问题代码：**
+```java
+@Override
+@Transactional
+public boolean cancel(BusinessActionContext context) {
+    String bizId = context.getActionContext("bizId", String.class);
+    
+    // ❌ 没有检查Try是否执行过
+    AccountFreeze freeze = freezeMapper.selectByBizId(bizId);
+    
+    // freeze为null，说明Try未执行，但仍然执行了解冻逻辑
+    Account account = accountMapper.selectByIdForUpdate(userId);
+    account.setBalance(account.getBalance().add(amount));  // 余额异常增加！
+    accountMapper.updateById(account);
+}
+```
+
+**解决方案：**
+```java
+@Override
+@Transactional
+public boolean cancel(BusinessActionContext context) {
+    Long userId = context.getActionContext("userId", Long.class);
+    BigDecimal amount = context.getActionContext("amount", BigDecimal.class);
+    String bizId = context.getActionContext("bizId", String.class);
+    
+    // 1. 检查Try是否执行过
+    AccountFreeze freeze = freezeMapper.selectByBizId(bizId);
+    
+    if (freeze == null) {
+        // 空回滚：Try未执行，Cancel先执行
+        // 记录空回滚标记，防止后续Try执行
+        AccountFreeze emptyRollback = new AccountFreeze();
+        emptyRollback.setBizId(bizId);
+        emptyRollback.setStatus("EMPTY_ROLLBACK");
+        emptyRollback.setUserId(userId);
+        emptyRollback.setAmount(BigDecimal.ZERO);
+        freezeMapper.insert(emptyRollback);
+        
+        log.warn("空回滚，bizId: {}", bizId);
+        return true;  // 直接返回成功
+    }
+    
+    // 2. 检查是否已经Cancel过（幂等性）
+    if ("CANCEL".equals(freeze.getStatus())) {
+        return true;
+    }
+    
+    // 3. 正常解冻
+    Account account = accountMapper.selectByIdForUpdate(userId);
+    account.setBalance(account.getBalance().add(amount));
+    account.setFrozenAmount(account.getFrozenAmount().subtract(amount));
+    accountMapper.updateById(account);
+    
+    freeze.setStatus("CANCEL");
+    freezeMapper.updateById(freeze);
+    
+    log.info("Cancel成功，解冻金额: {}", amount);
+    return true;
+}
+
+// Try阶段也要检查空回滚标记
+@Override
+@Transactional
+public boolean tryFreeze(Long userId, BigDecimal amount, String bizId) {
+    // 1. 检查是否已经空回滚
+    AccountFreeze existing = freezeMapper.selectByBizId(bizId);
+    if (existing != null && "EMPTY_ROLLBACK".equals(existing.getStatus())) {
+        // 悬挂：Cancel已执行，拒绝Try
+        log.warn("悬挂，拒绝Try，bizId: {}", bizId);
+        return false;
+    }
+    
+    // 2. 正常Try逻辑
+    // ...
+}
+```
+
+**效果：**
+- 彻底解决空回滚问题
+- 防止悬挂（Try在Cancel之后执行）
+- 资金账户数据100%准确
+
+---
+
+**问题2：TCC事务悬挂超过1小时未完成**
+
+**现象：**
+- 监控发现有100+笔TCC事务处于Try状态超过1小时
+- 冻结金额累计达到50万元
+- 用户投诉余额被冻结无法使用
+
+**排查过程：**
+```java
+// 1. 查询悬挂事务
+SELECT * FROM account_freeze 
+WHERE status = 'TRY' 
+AND create_time < DATE_SUB(NOW(), INTERVAL 1 HOUR);
+
+// 2. 发现问题：Seata全局事务超时，但本地Try已提交
+// 原因：Try方法上加了@Transactional，独立提交了
+```
+
+**问题代码：**
+```java
+@Override
+@Transactional  // ❌ 独立事务，Try提交后Seata无法回滚
+public boolean tryFreeze(Long userId, BigDecimal amount, String bizId) {
+    // Try逻辑
+    // 如果Seata全局事务超时，这里已经提交，无法回滚
+}
+```
+
+**解决方案：**
+```java
+// 1. 移除Try方法的@Transactional，使用Seata全局事务
+@Override
+public boolean tryFreeze(Long userId, BigDecimal amount, String bizId) {
+    // Try逻辑
+    // 跟随Seata全局事务，超时会自动回滚
+}
+
+// 2. 增加补偿任务，清理悬挂事务
+@Component
+public class TccCompensationTask {
+    
+    @Scheduled(cron = "0 */10 * * * ?")  // 每10分钟执行
+    public void compensateHangingTransaction() {
+        // 查询超过1小时的Try状态记录
+        List<AccountFreeze> hangingList = freezeMapper.selectList(
+            new QueryWrapper<AccountFreeze>()
+                .eq("status", "TRY")
+                .lt("create_time", LocalDateTime.now().minusHours(1))
+        );
+        
+        for (AccountFreeze freeze : hangingList) {
+            try {
+                // 查询Seata全局事务状态
+                GlobalStatus status = getGlobalTransactionStatus(freeze.getXid());
+                
+                if (status == GlobalStatus.TimeoutRollbacked) {
+                    // 全局事务已超时回滚，执行Cancel补偿
+                    compensateCancel(freeze);
+                    log.info("补偿Cancel成功，bizId: {}", freeze.getBizId());
+                }
+            } catch (Exception e) {
+                log.error("补偿失败，bizId: {}", freeze.getBizId(), e);
+            }
+        }
+    }
+    
+    private void compensateCancel(AccountFreeze freeze) {
+        // 解冻金额
+        Account account = accountMapper.selectByIdForUpdate(freeze.getUserId());
+        account.setBalance(account.getBalance().add(freeze.getAmount()));
+        account.setFrozenAmount(account.getFrozenAmount().subtract(freeze.getAmount()));
+        accountMapper.updateById(account);
+        
+        // 更新状态
+        freeze.setStatus("COMPENSATE_CANCEL");
+        freezeMapper.updateById(freeze);
+    }
+}
+```
+
+**效果：**
+- 悬挂事务从100+降到0
+- 冻结金额及时释放
+- 用户投诉率下降90%
+
+---
+
+**问题3：Outbox消息重复消费导致号源多扣**
+
+**现象：**
+- 用户预约1次，号源被扣减2次
+- 排查发现MQ消息被重复消费
+
+**问题代码：**
+```java
+@RabbitListener(queues = "appointment.created.queue")
+public void handleAppointmentCreated(Message message, Channel channel) {
+    Appointment appointment = JSON.parseObject(
+        new String(message.getBody()), Appointment.class);
+    
+    // ❌ 没有幂等性控制
+    scheduleService.decreaseQuota(appointment.getScheduleId());
+    
+    channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+}
+```
+
+**解决方案：**
+```java
+// 1. 增加消费记录表
+CREATE TABLE mq_consume_log (
+    id BIGINT PRIMARY KEY,
+    message_id VARCHAR(64) NOT NULL UNIQUE,  -- 消息唯一ID
+    consumer VARCHAR(100) NOT NULL,          -- 消费者
+    status VARCHAR(20) NOT NULL,             -- SUCCESS/FAIL
+    create_time DATETIME NOT NULL,
+    INDEX idx_message_id (message_id)
+);
+
+// 2. 消费者增加幂等性控制
+@RabbitListener(queues = "appointment.created.queue")
+@Transactional
+public void handleAppointmentCreated(Message message, Channel channel) {
+    String messageId = message.getMessageProperties().getMessageId();
+    
+    // 检查是否已消费
+    MqConsumeLog log = consumeLogMapper.selectByMessageId(messageId);
+    if (log != null && "SUCCESS".equals(log.getStatus())) {
+        log.info("消息已消费，跳过，messageId: {}", messageId);
+        channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+        return;
+    }
+    
+    try {
+        Appointment appointment = JSON.parseObject(
+            new String(message.getBody()), Appointment.class);
+        
+        // 扣减号源
+        scheduleService.decreaseQuota(appointment.getScheduleId());
+        
+        // 记录消费成功
+        MqConsumeLog consumeLog = new MqConsumeLog();
+        consumeLog.setMessageId(messageId);
+        consumeLog.setConsumer("ScheduleConsumer");
+        consumeLog.setStatus("SUCCESS");
+        consumeLogMapper.insert(consumeLog);
+        
+        // 手动ACK
+        channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+        
+    } catch (Exception e) {
+        log.error("消费失败，messageId: {}", messageId, e);
+        
+        // 记录消费失败
+        MqConsumeLog consumeLog = new MqConsumeLog();
+        consumeLog.setMessageId(messageId);
+        consumeLog.setConsumer("ScheduleConsumer");
+        consumeLog.setStatus("FAIL");
+        consumeLogMapper.insert(consumeLog);
+        
+        // NACK，重新入队
+        channel.basicNack(message.getMessageProperties().getDeliveryTag(), false, true);
+    }
+}
+```
+
+**效果：**
+- 消息重复消费率从5%降到0%
+- 号源扣减100%准确
+- 无用户投诉
+
+---
+
+**分布式事务监控指标 ⭐⭐**
+
+**TCC监控：**
+
+```java
+@Component
+public class TccMetricsCollector {
+    
+    @Scheduled(fixedDelay = 60000)  // 每分钟采集
+    public void collectTccMetrics() {
+        // 1. Try成功率
+        long tryTotal = tccLogMapper.countByPhase("TRY");
+        long trySuccess = tccLogMapper.countByPhaseAndStatus("TRY", "SUCCESS");
+        double trySuccessRate = (double) trySuccess / tryTotal;
+        
+        // 告警：Try成功率 < 95%
+        if (trySuccessRate < 0.95) {
+            alertService.send(String.format(
+                "TCC Try成功率过低: %.2f%%", trySuccessRate * 100
+            ));
+        }
+        
+        // 2. Confirm/Cancel耗时
+        long avgConfirmTime = tccLogMapper.avgTimeByPhase("CONFIRM");
+        long avgCancelTime = tccLogMapper.avgTimeByPhase("CANCEL");
+        
+        // 告警：耗时 > 3秒
+        if (avgConfirmTime > 3000) {
+            alertService.send(String.format(
+                "TCC Confirm耗时过长: %dms", avgConfirmTime
+            ));
+        }
+        
+        // 3. 悬挂事务数
+        long hangingCount = freezeMapper.countHanging(1);  // 超过1小时
+        
+        // 告警：悬挂事务 > 10
+        if (hangingCount > 10) {
+            alertService.send(String.format(
+                "TCC悬挂事务过多: %d笔", hangingCount
+            ));
+        }
+        
+        // 4. 冻结金额总额
+        BigDecimal totalFrozen = freezeMapper.sumFrozenAmount();
+        
+        // 告警：冻结金额 > 100万
+        if (totalFrozen.compareTo(new BigDecimal("1000000")) > 0) {
+            alertService.send(String.format(
+                "TCC冻结金额过高: %.2f元", totalFrozen
+            ));
+        }
+    }
+}
+```
+
+**Outbox监控：**
+
+```java
+@Component
+public class OutboxMetricsCollector {
+    
+    @Scheduled(fixedDelay = 60000)
+    public void collectOutboxMetrics() {
+        // 1. 待发送消息数
+        long pendingCount = outboxMapper.countByStatus("PENDING");
+        
+        // 告警：待发送 > 1000
+        if (pendingCount > 1000) {
+            alertService.send(String.format(
+                "Outbox消息堆积: %d条", pendingCount
+            ));
+        }
+        
+        // 2. 消息发送延迟（P99）
+        List<Long> delays = outboxMapper.selectDelays(100);
+        long p99Delay = calculateP99(delays);
+        
+        // 告警：P99延迟 > 5秒
+        if (p99Delay > 5000) {
+            alertService.send(String.format(
+                "Outbox消息延迟过高: %dms", p99Delay
+            ));
+        }
+        
+        // 3. 失败重试次数
+        long retryCount = outboxMapper.countByRetryTimes(3);  // 重试>3次
+        
+        // 告警：重试>3次的消息 > 100
+        if (retryCount > 100) {
+            alertService.send(String.format(
+                "Outbox消息重试次数过多: %d条", retryCount
+            ));
+        }
+    }
+}
+```
+
+**监控大盘：**
+
+| 指标 | 正常值 | 告警阈值 | 处理方式 |
+|------|--------|----------|----------|
+| **TCC Try成功率** | >99% | <95% | 检查网络、数据库 |
+| **TCC Confirm耗时** | <500ms | >3s | 优化数据库查询 |
+| **悬挂事务数** | 0 | >10 | 执行补偿任务 |
+| **冻结金额总额** | <10万 | >100万 | 检查补偿任务 |
+| **Outbox待发送数** | <100 | >1000 | 检查MQ是否正常 |
+| **Outbox延迟P99** | <2s | >5s | 优化轮询逻辑 |
+
+---
+
+**分布式事务性能数据 ⭐⭐**
+
+**TCC性能测试：**
+
+```bash
+# 压测场景：1000用户并发充值
+线程数: 1000
+持续时间: 5分钟
+总充值笔数: 50000
+
+# 压测结果
+TPS: 500
+Try平均耗时: 50ms
+Confirm平均耗时: 30ms
+整体事务耗时: 100ms
+Try成功率: 99.8%
+Confirm成功率: 100%
+无死锁、无悬挂
+资金账户100%准确
+```
+
+**Outbox性能测试：**
+
+```bash
+# 压测场景：10000用户并发预约
+线程数: 10000
+持续时间: 10分钟
+总预约数: 100000
+
+# 压测结果
+预约TPS: 1000
+Outbox消息全部发送: 100000条
+消息平均延迟: 1.5秒
+消息P99延迟: 2.8秒
+消息可靠性: 100%（无丢失）
+数据库CPU: 30%
+无消息重复消费
+```
+
+**对比数据：**
+
+| 方案 | TPS | 平均延迟 | 资源消耗 | 可靠性 |
+|------|-----|----------|----------|--------|
+| **TCC** | 500 | 100ms | 高（数据库锁） | 99.99% |
+| **Outbox** | 1000 | 1.5s | 低 | 99.99% |
+| **Seata AT** | 200 | 200ms | 高（行锁） | 99.9% |
+
+---
+
+### 2.2 分布式锁
+
+**业务场景1：医生排班冲突**
+```
+问题：同一时间段，医生只能排一个班
+并发场景：多个管理员同时给医生排班
+```
+
+**解决方案：Redisson分布式锁**
+```java
+@Service
+public class ScheduleService {
+    
+    @Autowired
+    private RedissonClient redissonClient;
+    
+    @Transactional
+    public void createSchedule(ScheduleDTO dto) {
+        String lockKey = "schedule:" + dto.getDoctorId() + ":" + dto.getTimeSlot();
+        RLock lock = redissonClient.getLock(lockKey);
+        
+        try {
+            // 等待3秒，持锁10秒自动释放
+            if (lock.tryLock(3, 10, TimeUnit.SECONDS)) {
+                // 检查是否已排班
+                Schedule existing = scheduleMapper.selectByDoctorAndTime(
+                    dto.getDoctorId(), dto.getTimeSlot());
+                if (existing != null) {
+                    throw new BusinessException("该时间段已排班");
+                }
+                
+                // 创建排班记录
+                Schedule schedule = new Schedule();
+                schedule.setDoctorId(dto.getDoctorId());
+                schedule.setTimeSlot(dto.getTimeSlot());
+                schedule.setQuota(dto.getQuota());
+                scheduleMapper.insert(schedule);
+                
+                log.info("排班成功，医生：{}，时间：{}", dto.getDoctorId(), dto.getTimeSlot());
+            } else {
+                throw new BusinessException("系统繁忙，请稍后重试");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new BusinessException("操作被中断");
+        } finally {
+            // 只释放自己持有的锁
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+}
+```
+
+**业务场景2：预约防重**
+```
+问题：用户重复点击预约按钮
+并发场景：同一用户短时间内多次请求
+```
+
+**解决方案：分布式锁 + 幂等性检查**
+```java
+@Service
+public class AppointmentService {
+    
+    @Transactional
+    public void createAppointment(AppointmentDTO dto) {
+        String lockKey = "appointment:" + dto.getUserId() + ":" + dto.getScheduleId();
+        RLock lock = redissonClient.getLock(lockKey);
+        
+        try {
+            if (lock.tryLock(3, 10, TimeUnit.SECONDS)) {
+                // 幂等性检查：是否已预约
+                Appointment existing = appointmentMapper.selectByUserAndSchedule(
+                    dto.getUserId(), dto.getScheduleId());
+                if (existing != null) {
+                    throw new BusinessException("您已预约该时段");
+                }
+                
+                // 检查号源是否充足
+                Schedule schedule = scheduleMapper.selectById(dto.getScheduleId());
+                if (schedule.getRemainQuota() <= 0) {
+                    throw new BusinessException("号源已满");
+                }
+                
+                // 创建预约
+                // ...
+            }
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+}
+```
+
+**优化效果：**
+- 重复预约从100单/天降到0
+- 排班冲突从每周5次降到0
+
+---
+
+### 2.3 分布式ID生成
+
+**业务场景：订单号、预约号生成**
+
+**方案对比：**
+
+| 方案           | 优点             | 缺点               | 适用场景         |
+| -------------- | ---------------- | ------------------ | ---------------- |
+| **UUID**       | 简单、无依赖     | 无序、占用空间大   | 不适合数据库主键 |
+| **数据库自增** | 简单、有序       | 性能瓶颈、单点故障 | 小规模系统       |
+| **Redis INCR** | 性能高           | 依赖Redis          | 中等规模         |
+| **雪花算法**   | 高性能、趋势递增 | 依赖时钟           | 大规模分布式系统 |
+
+**我们的选择：雪花算法（Snowflake）**
+
+**结构：64位Long**
+```
+1位符号位 + 41位时间戳 + 10位机器ID + 12位序列号
+0 - 0000000000 0000000000 0000000000 0000000000 0 - 0000000000 - 000000000000
+```
+
+**优势：**
+- 趋势递增：有利于数据库索引
+- 高性能：单机100万/秒
+- 无依赖：不依赖数据库或Redis
+- 信息量：包含时间戳，可反推生成时间
+
+**实现：**
+```java
+@Component
+public class SnowflakeIdGenerator {
+    
+    private final long workerId;
+    private final long datacenterId;
+    private long sequence = 0L;
+    private long lastTimestamp = -1L;
+    
+    // 时间戳占41位，起始时间2020-01-01
+    private final long twepoch = 1577808000000L;
+    
+    public SnowflakeIdGenerator(@Value("${snowflake.worker-id}") long workerId,
+                                @Value("${snowflake.datacenter-id}") long datacenterId) {
+        this.workerId = workerId;
+        this.datacenterId = datacenterId;
+    }
+    
+    public synchronized long nextId() {
+        long timestamp = System.currentTimeMillis();
+        
+        // 时钟回拨检查
+        if (timestamp < lastTimestamp) {
+            throw new RuntimeException("时钟回拨，拒绝生成ID");
+        }
+        
+        // 同一毫秒内，序列号递增
+        if (timestamp == lastTimestamp) {
+            sequence = (sequence + 1) & 4095;  // 12位序列号，最大4095
+            if (sequence == 0) {
+                // 序列号用完，等待下一毫秒
+                timestamp = waitNextMillis(lastTimestamp);
+            }
+        } else {
+            sequence = 0L;
+        }
+        
+        lastTimestamp = timestamp;
+        
+        // 组装ID
+        return ((timestamp - twepoch) << 22)
+            | (datacenterId << 17)
+            | (workerId << 12)
+            | sequence;
+    }
+    
+    private long waitNextMillis(long lastTimestamp) {
+        long timestamp = System.currentTimeMillis();
+        while (timestamp <= lastTimestamp) {
+            timestamp = System.currentTimeMillis();
+        }
+        return timestamp;
+    }
+}
+```
+
+**使用：**
+```java
+@Service
+public class OrderService {
+    
+    @Autowired
+    private SnowflakeIdGenerator idGenerator;
+    
+    public void createOrder(OrderDTO dto) {
+        Order order = new Order();
+        order.setOrderId(String.valueOf(idGenerator.nextId()));
+        // ...
+    }
+}
+```
+
+**注意事项：**
+1. **机器ID配置**：每个实例配置不同的workerId
+2. **时钟回拨**：检测到时钟回拨，拒绝生成ID或等待
+3. **序列号用完**：等待下一毫秒
+
+---
+
+## 三、服务间调用 ⭐⭐⭐⭐
+
+### 3.1 OpenFeign - 声明式HTTP客户端
+
+**核心功能：**
+- 声明式调用：接口 + 注解，无需手动编写HTTP请求
+- 负载均衡：集成Ribbon/LoadBalancer
+- 服务降级：集成Sentinel/Hystrix
+- 请求拦截：统一添加请求头、日志
+
+**基本使用：**
+```java
+// 1. 定义Feign客户端
+@FeignClient(
+    name = "doctor-service",              // 服务名（从Nacos获取）
+    path = "/api/doctor",                 // 统一路径前缀
+    fallbackFactory = DoctorServiceFallbackFactory.class  // 降级工厂
+)
+public interface DoctorServiceClient {
+    
+    @GetMapping("/{id}")
+    DoctorDTO getDoctorInfo(@PathVariable("id") String id);
+    
+    @PostMapping("/schedule/query")
+    List<Schedule> querySchedule(@RequestBody ScheduleQuery query);
+    
+    @GetMapping("/list")
+    List<DoctorDTO> listDoctors(@RequestParam("deptId") String deptId,
+                                 @RequestParam("page") Integer page,
+                                 @RequestParam("size") Integer size);
+}
+
+// 2. 降级工厂（推荐，可以获取异常信息）
+@Component
+public class DoctorServiceFallbackFactory implements FallbackFactory<DoctorServiceClient> {
+    
+    @Override
+    public DoctorServiceClient create(Throwable cause) {
+        return new DoctorServiceClient() {
+            @Override
+            public DoctorDTO getDoctorInfo(String id) {
+                log.error("查询医生信息失败，id: {}, 原因: {}", id, cause.getMessage());
+                // 返回默认数据或缓存数据
+                return getFromCache(id);
+            }
+            
+            @Override
+            public List<Schedule> querySchedule(ScheduleQuery query) {
+                log.error("查询排班失败，原因: {}", cause.getMessage());
+                return Collections.emptyList();
+            }
+            
+            @Override
+            public List<DoctorDTO> listDoctors(String deptId, Integer page, Integer size) {
+                return Collections.emptyList();
+            }
+        };
+    }
+    
+    private DoctorDTO getFromCache(String id) {
+        // 从Redis获取缓存
+        return redisTemplate.opsForValue().get("doctor:" + id);
+    }
+}
+
+// 3. 使用Feign客户端
+@Service
+public class AppointmentService {
+    
+    @Autowired
+    private DoctorServiceClient doctorServiceClient;
+    
+    public void createAppointment(AppointmentDTO dto) {
+        // 调用医生服务，获取医生信息
+        DoctorDTO doctor = doctorServiceClient.getDoctorInfo(dto.getDoctorId());
+        
+        // 调用排班服务，查询排班信息
+        ScheduleQuery query = new ScheduleQuery();
+        query.setDoctorId(dto.getDoctorId());
+        query.setDate(dto.getDate());
+        List<Schedule> schedules = doctorServiceClient.querySchedule(query);
+        
+        // 创建预约
+        // ...
+    }
+}
+```
+
+**配置：**
+```yaml
+feign:
+  client:
+    config:
+      default:  # 全局配置
+        connectTimeout: 5000      # 连接超时5秒
+        readTimeout: 10000        # 读取超时10秒
+        loggerLevel: BASIC        # 日志级别
+      doctor-service:  # 针对特定服务配置
+        connectTimeout: 3000
+        readTimeout: 5000
+  
+  # 启用Sentinel支持
+  sentinel:
+    enabled: true
+  
+  # 启用压缩
+  compression:
+    request:
+      enabled: true
+      mime-types: text/xml,application/xml,application/json
+      min-request-size: 2048
+    response:
+      enabled: true
+```
+
+**请求拦截器（统一添加请求头）：**
+```java
+@Configuration
+public class FeignConfig {
+    
+    @Bean
+    public RequestInterceptor requestInterceptor() {
+        return template -> {
+            // 传递TraceId（链路追踪）
+            String traceId = MDC.get("traceId");
+            if (traceId != null) {
+                template.header("X-Trace-Id", traceId);
+            }
+            
+            // 传递用户信息
+            ServletRequestAttributes attributes = 
+                (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
+            if (attributes != null) {
+                HttpServletRequest request = attributes.getRequest();
+                String userId = request.getHeader("X-User-Id");
+                if (userId != null) {
+                    template.header("X-User-Id", userId);
+                }
+            }
+            
+            // 添加认证Token
+            template.header("Authorization", "Bearer " + getToken());
+        };
+    }
+}
+```
+
+**面试高频问题：**
+
+**Q1: Feign如何实现负载均衡？**
+
+Feign集成了Ribbon/LoadBalancer：
+1. **服务发现**：从Nacos获取服务实例列表
+2. **负载均衡**：根据策略选择一个实例
+3. **发起请求**：向选中的实例发送HTTP请求
+
+**负载均衡策略：**
+```yaml
+doctor-service:
+  ribbon:
+    NFLoadBalancerRuleClassName: com.netflix.loadbalancer.RandomRule  # 随机
+    # 其他策略：
+    # RoundRobinRule - 轮询（默认）
+    # WeightedResponseTimeRule - 响应时间加权
+    # BestAvailableRule - 最少并发
+```
+
+**Q2: Feign超时如何处理？**
+
+超时分两种：
+1. **连接超时（connectTimeout）**：建立TCP连接的时间
+2. **读取超时（readTimeout）**：等待响应的时间
+
+**处理策略：**
+```java
+// 1. 配置合理的超时时间
+feign.client.config.default.connectTimeout=5000
+feign.client.config.default.readTimeout=10000
+
+// 2. 降级处理
+@FeignClient(fallbackFactory = DoctorServiceFallbackFactory.class)
+
+// 3. 重试机制（慎用，注意幂等性）
+@Bean
+public Retryer feignRetryer() {
+    // 最多重试3次，间隔100ms，最大间隔1秒
+    return new Retryer.Default(100, 1000, 3);
+}
+```
+
+**Q3: Feign和RestTemplate的区别？**
+
+| 对比项   | Feign               | RestTemplate       |
+| -------- | ------------------- | ------------------ |
+| 编码方式 | 声明式（接口+注解） | 命令式（手动编写） |
+| 负载均衡 | 自动集成            | 需要手动配置       |
+| 服务降级 | 支持                | 需要手动实现       |
+| 代码量   | 少                  | 多                 |
+| 灵活性   | 低                  | 高                 |
+| 适用场景 | 微服务间调用        | 调用外部API        |
+
+**实际使用：**
+- 微服务间调用：优先使用Feign
+- 调用第三方API：使用RestTemplate或HttpClient
+
+---
+
+### 3.2 服务调用链路追踪
+
+**业务场景：**
+```
+用户预约 → Gateway → 预约服务 → Feign调用医生服务 → Feign调用排班服务
+如何追踪一次请求的完整链路？
+```
+
+**解决方案：Sleuth + Zipkin**
+
+**Sleuth核心概念：**
+- **TraceId**：一次请求的唯一标识，贯穿整个调用链
+- **SpanId**：一个服务调用的唯一标识
+- **ParentSpanId**：父级SpanId，用于构建调用树
+
+**配置：**
+```yaml
+spring:
+  sleuth:
+    sampler:
+      probability: 1.0  # 采样率100%（生产环境建议0.1）
+  zipkin:
+    base-url: http://localhost:9411  # Zipkin服务地址
+    sender:
+      type: web  # 发送方式：web/rabbit/kafka
+```
+
+**调用链路示例：**
+```
+TraceId: 1234567890abcdef
+├── SpanId: 1234567890abcdef (Gateway)
+│   └── SpanId: 2345678901bcdefg (预约服务)
+│       ├── SpanId: 3456789012cdefgh (医生服务)
+│       └── SpanId: 4567890123defghi (排班服务)
+```
+
+**日志输出：**
+```
+[预约服务,1234567890abcdef,2345678901bcdefg,true] 创建预约，用户ID: 123
+[医生服务,1234567890abcdef,3456789012cdefgh,true] 查询医生信息，医生ID: 456
+[排班服务,1234567890abcdef,4567890123defghi,true] 查询排班信息，排班ID: 789
+```
+
+**自定义Span：**
+```java
+@Service
+public class AppointmentService {
+    
+    @Autowired
+    private Tracer tracer;
+    
+    public void createAppointment(AppointmentDTO dto) {
+        // 创建自定义Span
+        Span span = tracer.nextSpan().name("create-appointment").start();
+        try (Tracer.SpanInScope ws = tracer.withSpan(span)) {
+            // 添加标签
+            span.tag("userId", dto.getUserId());
+            span.tag("doctorId", dto.getDoctorId());
+            
+            // 业务逻辑
+            // ...
+            
+            // 添加事件
+            span.event("appointment-created");
+            
+        } catch (Exception e) {
+            span.error(e);
+            throw e;
+        } finally {
+            span.end();
+        }
+    }
+}
+```
+
+**Zipkin可视化：**
+- 查看完整调用链路
+- 分析每个服务的耗时
+- 快速定位性能瓶颈
+- 查看异常堆栈
+
+**优化效果：**
+- 问题定位时间从1小时降到5分钟
+- 性能瓶颈一目了然
+- 跨服务调用可追溯
+
+---
+
+## 四、配置管理 ⭐⭐⭐
+
+### 4.1 Nacos Config - 配置中心
+
+**核心功能：**
+- 集中管理：所有配置统一存储在Nacos
+- 动态刷新：配置变更无需重启
+- 环境隔离：dev、test、prod环境隔离
+- 版本管理：配置历史版本可回滚
+- 灰度发布：配置可以灰度发布
+
+**配置结构：**
+```yaml
+spring:
+  cloud:
+    nacos:
+      config:
+        server-addr: localhost:8848
+        namespace: prod                    # 环境隔离
+        group: MEDICAL_GROUP               # 分组
+        file-extension: yaml               # 配置文件格式
+        refresh-enabled: true              # 自动刷新
+        shared-configs:                    # 共享配置
+          - data-id: common-config.yaml
+            group: MEDICAL_GROUP
+            refresh: true
+        extension-configs:                 # 扩展配置
+          - data-id: redis-config.yaml
+            group: MEDICAL_GROUP
+            refresh: true
+```
+
+**配置文件命名规则：**
+```
+${spring.application.name}-${spring.profiles.active}.${file-extension}
+
+示例：
+appointment-service-prod.yaml  # 预约服务生产环境配置
+doctor-service-dev.yaml        # 医生服务开发环境配置
+```
+
+**动态刷新配置：**
+```java
+@RestController
+@RefreshScope  // 关键：支持配置动态刷新
+public class AppointmentController {
+    
+    @Value("${business.max-appointment-days}")
+    private Integer maxAppointmentDays;  // 最多提前预约天数
+    
+    @Value("${business.cancel-hours-before}")
+    private Integer cancelHoursBefore;   // 提前多少小时可取消
+    
+    @GetMapping("/config")
+    public Map<String, Object> getConfig() {
+        Map<String, Object> config = new HashMap<>();
+        config.put("maxAppointmentDays", maxAppointmentDays);
+        config.put("cancelHoursBefore", cancelHoursBefore);
+        return config;
+    }
+}
+```
+
+**监听配置变更：**
+```java
+@Component
+public class ConfigChangeListener {
+    
+    @NacosConfigListener(dataId = "appointment-service-prod.yaml", timeout = 5000)
+    public void onConfigChange(String newConfig) {
+        log.info("配置发生变更：{}", newConfig);
+        // 可以在这里做一些额外的处理
+        // 比如刷新缓存、重新加载规则等
+    }
+}
+```
+
+**面试高频问题：**
+
+**Q1: 配置如何动态刷新？**
+
+Nacos配置刷新机制：
+1. **客户端长轮询**：每30秒向Nacos发起长轮询请求
+2. **服务端Hold住**：如果配置未变更，Hold住请求29.5秒
+3. **配置变更通知**：配置变更时，立即返回响应
+4. **客户端拉取**：客户端收到通知后，拉取最新配置
+5. **Spring刷新**：触发Spring的Environment刷新
+6. **Bean重新绑定**：@RefreshScope的Bean重新创建
+
+**Q2: 如何保证配置的安全性？**
+
+1. **命名空间隔离**：不同环境使用不同namespace
+2. **权限控制**：Nacos支持用户权限管理
+3. **敏感信息加密**：数据库密码等敏感信息加密存储
+4. **审计日志**：记录配置变更历史
+
+**加密配置示例：**
+```yaml
+spring:
+  datasource:
+    password: ENC(encrypted_password)  # 加密后的密码
+```
+
+```java
+@Component
+public class ConfigDecryptor {
+    
+    @Bean
+    public EnvironmentPostProcessor environmentPostProcessor() {
+        return (environment, application) -> {
+            // 解密配置
+            String encryptedPassword = environment.getProperty("spring.datasource.password");
+            if (encryptedPassword.startsWith("ENC(")) {
+                String decrypted = decrypt(encryptedPassword);
+                // 替换为解密后的值
+            }
+        };
+    }
+}
+```
+
+---
+
+## 五、性能优化 ⭐⭐⭐⭐
+
+### 5.1 多级缓存策略
+
+**缓存架构：**
+```
+请求 → 本地缓存（Caffeine） → Redis缓存 → 数据库
+```
+
+**实现：**
+```java
+@Service
+public class DoctorService {
+    
+    @Autowired
+    private DoctorMapper doctorMapper;
+    
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+    
+    // 本地缓存（Caffeine）
+    private final Cache<String, DoctorDTO> localCache = Caffeine.newBuilder()
+        .maximumSize(1000)           // 最多1000条
+        .expireAfterWrite(5, TimeUnit.MINUTES)  // 5分钟过期
+        .build();
+    
+    public DoctorDTO getDoctorInfo(String doctorId) {
+        // 1. 查询本地缓存
+        DoctorDTO doctor = localCache.getIfPresent(doctorId);
+        if (doctor != null) {
+            log.debug("命中本地缓存，doctorId: {}", doctorId);
+            return doctor;
+        }
+        
+        // 2. 查询Redis缓存
+        String cacheKey = "doctor:" + doctorId;
+        doctor = (DoctorDTO) redisTemplate.opsForValue().get(cacheKey);
+        if (doctor != null) {
+            log.debug("命中Redis缓存，doctorId: {}", doctorId);
+            localCache.put(doctorId, doctor);  // 回写本地缓存
+            return doctor;
+        }
+        
+        // 3. 查询数据库
+        doctor = doctorMapper.selectById(doctorId);
+        if (doctor != null) {
+            // 写入Redis（30分钟过期）
+            redisTemplate.opsForValue().set(cacheKey, doctor, 30, TimeUnit.MINUTES);
+            // 写入本地缓存
+            localCache.put(doctorId, doctor);
+        }
+        
+        return doctor;
+    }
+    
+    // 更新医生信息时，清除缓存
+    public void updateDoctorInfo(DoctorDTO dto) {
+        doctorMapper.updateById(dto);
+        
+        // 清除本地缓存
+        localCache.invalidate(dto.getId());
+        
+        // 清除Redis缓存
+        redisTemplate.delete("doctor:" + dto.getId());
+        
+        // 发送MQ通知其他实例清除本地缓存
+        rabbitTemplate.convertAndSend("cache.exchange", "cache.invalidate", dto.getId());
+    }
+}
+```
+
+**缓存数据分类：**
+
+| 数据类型 | 缓存策略   | 过期时间 | 理由                 |
+| -------- | ---------- | -------- | -------------------- |
+| 医生信息 | 本地+Redis | 30分钟   | 变更频率低，查询频繁 |
+| 科室列表 | 本地+Redis | 1小时    | 几乎不变             |
+| 排班信息 | 仅Redis    | 10分钟   | 变更频繁，需要实时性 |
+| 号源剩余 | 仅Redis    | 1分钟    | 实时性要求高         |
+
+**优化效果：**
+- 本地缓存命中率：70%
+- Redis缓存命中率：25%
+- 数据库查询：5%
+- 平均响应时间：从50ms降到5ms
+
+---
+
+### 5.2 数据库优化
+
+#### 5.2.1 读写分离
+
+**架构：**
+```
+写操作 → 主库（Master）
+读操作 → 从库（Slave1、Slave2）
+```
+
+**配置（ShardingSphere）：**
+```yaml
+spring:
+  shardingsphere:
+    datasource:
+      names: master,slave1,slave2
+      master:
+        type: com.zaxxer.hikari.HikariDataSource
+        driver-class-name: com.mysql.cj.jdbc.Driver
+        jdbc-url: jdbc:mysql://master:3306/medical
+      slave1:
+        jdbc-url: jdbc:mysql://slave1:3306/medical
+      slave2:
+        jdbc-url: jdbc:mysql://slave2:3306/medical
+    
+    rules:
+      readwrite-splitting:
+        data-sources:
+          medical_ds:
+            type: Static
+            props:
+              write-data-source-name: master
+              read-data-source-names: slave1,slave2
+              load-balancer-name: round_robin
+        load-balancers:
+          round_robin:
+            type: ROUND_ROBIN  # 轮询
+```
+
+**强制主库查询：**
+```java
+@Service
+public class AppointmentService {
+    
+    // 场景：创建预约后立即查询，需要强制走主库
+    @Transactional
+    public AppointmentDTO createAndQuery(AppointmentDTO dto) {
+        // 创建预约（写主库）
+        appointmentMapper.insert(dto);
+        
+        // 立即查询（强制主库，避免主从延迟）
+        HintManager.getInstance().setWriteRouteOnly();
+        try {
+            return appointmentMapper.selectById(dto.getId());
+        } finally {
+            HintManager.clear();
+        }
+    }
+}
+```
+
+#### 5.2.2 分库分表
+
+**场景：订单表数据量大**
+```
+订单表：1000万条/年
+预计3年：3000万条
+单表性能下降
+```
+
+**分表策略：按月分表**
+```yaml
+spring:
+  shardingsphere:
+    rules:
+      sharding:
+        tables:
+          appointment:
+            actual-data-nodes: medical_ds.appointment_$->{2024..2026}_$->{01..12}
+            table-strategy:
+              standard:
+                sharding-column: create_time
+                sharding-algorithm-name: appointment_month
+        sharding-algorithms:
+          appointment_month:
+            type: INTERVAL
+            props:
+              datetime-pattern: yyyy-MM-dd HH:mm:ss
+              datetime-interval-amount: 1
+              datetime-interval-unit: MONTHS
+```
+
+**查询优化：**
+```java
+// 带分片键查询（高效）
+appointmentMapper.selectByCreateTime("2024-01-15");  // 只查appointment_2024_01
+
+// 不带分片键查询（全表扫描，慢）
+appointmentMapper.selectByUserId("user123");  // 扫描所有分表
+```
+
+#### 5.2.3 索引优化
+
+**案例：查询医生排班**
+```sql
+-- 慢查询（300ms）
+SELECT * FROM schedule 
+WHERE doctor_id = '123' AND date = '2024-01-15' AND status = 'AVAILABLE';
+
+-- 优化：创建联合索引
+CREATE INDEX idx_doctor_date_status ON schedule(doctor_id, date, status);
+
+-- 优化后（5ms）
+```
+
+**索引设计原则：**
+1. **最左前缀**：联合索引遵循最左前缀原则
+2. **区分度高的列在前**：doctor_id > date > status
+3. **覆盖索引**：索引包含查询的所有字段
+4. **避免索引失效**：不在索引列上使用函数
+
+---
+
+### 5.3 异步解耦
+
+**场景：预约成功后发送通知**
+```
+同步方式：
+预约成功 → 发送短信 → 发送推送 → 返回结果
+总耗时：100ms + 200ms + 150ms = 450ms
+
+异步方式：
+预约成功 → 返回结果（100ms）
+         ↓
+      发送MQ → 异步发送短信、推送
+```
+
+**实现：**
+```java
+@Service
+public class AppointmentService {
+    
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+    
+    @Transactional
+    public void createAppointment(AppointmentDTO dto) {
+        // 1. 创建预约
+        Appointment appointment = new Appointment();
+        // ...
+        appointmentMapper.insert(appointment);
+        
+        // 2. 发送MQ（异步）
+        AppointmentCreatedEvent event = new AppointmentCreatedEvent();
+        event.setAppointmentId(appointment.getId());
+        event.setUserId(appointment.getUserId());
+        event.setDoctorId(appointment.getDoctorId());
+        
+        rabbitTemplate.convertAndSend(
+            "appointment.exchange",
+            "appointment.created",
+            event
+        );
+        
+        // 3. 立即返回（不等待通知发送）
+    }
+}
+
+// 通知服务消费MQ
+@Service
+public class NotificationConsumer {
+    
+    @RabbitListener(queues = "appointment.created.queue")
+    public void handleAppointmentCreated(AppointmentCreatedEvent event) {
+        // 发送短信
+        smsService.sendAppointmentSms(event);
+        
+        // 发送推送
+        pushService.sendAppointmentPush(event);
+    }
+}
+```
+
+**优化效果：**
+- 响应时间：从450ms降到100ms（提升4.5倍）
+- 用户体验：立即返回，无需等待
+- 系统解耦：通知服务故障不影响预约
+
+---
+
+## 六、面试回答模板（2分钟版）
+
+> "互联网医院项目采用Spring Cloud微服务架构，我主要负责在线问诊、医生排班、患者预约等核心功能的开发。
+>
+> **服务治理方面：**
+> - 使用Nacos做服务注册发现和配置中心，支持动态配置刷新
+> - Gateway作为统一网关，实现认证鉴权、限流（令牌桶算法）、路由转发
+> - Sentinel做服务熔断降级，配置了异常比例和慢调用比例熔断策略
+>
+> **分布式问题解决：**
+> - 分布式事务采用Outbox模式，保证预约、扣减号源、发送通知的最终一致性
+> - 分布式锁用Redisson解决排班冲突和预约防重，重复预约从100单/天降到0
+> - 雪花算法生成分布式ID，单机性能100万/秒
+>
+> **服务调用：**
+> - OpenFeign做服务间调用，集成负载均衡和服务降级
+> - Sleuth+Zipkin做链路追踪，问题定位时间从1小时降到5分钟
+>
+> **性能优化：**
+> - 多级缓存（Caffeine本地缓存 + Redis），响应时间从50ms降到5ms
+> - 读写分离 + 按月分表，支持千万级数据
+> - RabbitMQ异步解耦，预约响应时间从450ms降到100ms
+>
+> **核心业务数据：**
+> - 日均处理预约请求X万次，QPS峰值X
+> - 系统可用性99.9%，平均响应时间50ms"
