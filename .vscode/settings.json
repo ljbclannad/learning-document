@@ -1,4 +1,5 @@
 {
     "editor.detectIndentation": false,
-    "markdown.extension.list.indentationSize": "inherit"
+    "markdown.extension.list.indentationSize": "inherit",
+    "workbench.colorTheme": "Catppuccin Latte"
 }
