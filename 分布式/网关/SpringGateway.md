@@ -97,6 +97,84 @@ Ingress Controller 偏基础设施入口，API 网关偏业务治理入口。
 
 `Mapping` 找路由，`Filter` 做治理，`NettyRoutingFilter` 真转发。
 
+## 2.1.1 `RoutePredicateHandlerMapping` 怎么理解？是不是就是匹配 yaml 里的路由配置？
+
+### 主答
+
+可以这么理解。`RoutePredicateHandlerMapping` 的职责，就是拿当前请求去匹配 Gateway 里定义的 `Route`，本质上就是根据 `yaml` 或代码里配置的路由规则做映射。
+
+### 用配置理解
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: user
+          uri: lb://user-service
+          predicates:
+            - Path=/api/user/**
+          filters:
+            - StripPrefix=2
+```
+
+这条配置可以拆成四部分：
+
+- `id`：路由标识
+- `predicates`：匹配条件，比如 `Path=/api/user/**`
+- `filters`：命中这条路由后执行的路由级过滤器
+- `uri`：最终转发目标，比如 `lb://user-service`
+
+### Gateway 收到请求时做了什么
+
+假设请求是：
+
+```http
+GET /api/user/profile
+```
+
+Gateway 会做这几步：
+
+1. `RoutePredicateHandlerMapping` 遍历可用路由
+2. 判断当前请求是否满足某条 `predicates`
+3. 命中 `Path=/api/user/**` 这条 route
+4. 把这条 route 放进当前请求上下文
+5. 后续再执行这条 route 对应的 `filters`，最后按 `uri` 转发
+
+### 一句话记忆
+
+`routes` 定义规则，`predicates` 决定命中谁，`RoutePredicateHandlerMapping` 负责拿请求去匹配这些规则。
+
+## 2.1.2 `RoutePredicateHandlerMapping` 找到 route 后，路由信息存在哪里？
+
+### 主答
+
+不是放在 `header` 里，而是放在 `ServerWebExchange` 的 `attributes` 里。
+
+### 怎么理解
+
+当 `RoutePredicateHandlerMapping` 命中某条 route 后，它不会去改 HTTP 请求头，而是把这次请求的路由上下文保存到当前请求对象 `ServerWebExchange` 中。  
+`exchange.getAttributes()` 本质上可以理解成一个当前请求范围内的上下文 `Map<String, Object>`，后续过滤器和路由组件都会从这里继续取值。
+
+### 常见保存的信息
+
+- `GATEWAY_ROUTE_ATTR`
+  - 当前命中的 `Route`
+- `GATEWAY_REQUEST_URL_ATTR`
+  - 计算后真正要转发的目标 URL
+- `GATEWAY_ORIGINAL_REQUEST_URL_ATTR`
+  - 原始请求 URL
+
+### 为什么不是 header
+
+- `header` 属于 HTTP 协议数据，会继续透传给下游服务
+- `route`、目标 URL、原始 URL 这些属于 Gateway 内部处理状态
+- 所以更适合放在 `exchange attributes` 这种内部上下文里，而不是暴露到请求头里
+
+### 面试回答
+
+`RoutePredicateHandlerMapping` 命中路由之后，不是把路由信息放到 header 里，而是放到 `ServerWebExchange` 的 attributes 里。后续 `GlobalFilter`、`GatewayFilter`、`NettyRoutingFilter` 都会从这里取当前 route、目标 request url、原始 url 等信息继续处理。
+
 ## 2.2 Filter 链怎么执行？`GlobalFilter` 和 `GatewayFilter` 有啥区别？
 
 ### 主答
@@ -113,6 +191,44 @@ SCG 的过滤器链本质上是责任链。命中路由后，会把全局和路�
 
 - `GlobalFilter`：对所有路由生效，适合统一日志、trace 注入、全局鉴权入口、全局限流入口。
 - `GatewayFilter`：只对某个路由或某组路由生效，适合重写路径、特定服务灰度、特定路由加头和限流。
+
+## 2.2.1 `GlobalFilter` 为什么感觉“默认就会执行”？
+
+### 主答
+
+因为 `GlobalFilter` 是全局过滤器。只要请求命中了 Gateway 的某条路由，它就会自动参与这次请求的过滤器链执行，不需要像 `GatewayFilter` 一样在每条 route 上单独配置。
+
+### 怎么理解
+
+你平时写的认证鉴权代码通常类似这样：
+
+```java
+@Component
+public class AuthGlobalFilter implements GlobalFilter, Ordered {
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        // token 校验
+        return chain.filter(exchange);
+    }
+}
+```
+
+一旦它被注册成 Spring Bean：
+
+- 请求命中某条 route
+- Gateway 组装过滤器链
+- 这个 `GlobalFilter` 会自动进链执行
+
+所以你会感觉它是“默认执行”的。
+
+### 和 `GatewayFilter` 的区别
+
+- `GlobalFilter`：全局生效，不需要在 route 里单独声明
+- `GatewayFilter`：只对当前 route 生效，需要在 `yaml` 或代码路由里配置
+
+### 面试回答
+
+可以理解为 `GlobalFilter` 是对所有命中路由的请求自动生效的全局过滤器，所以像 token 鉴权、traceId、统一日志这类通用逻辑，通常都会放到 `GlobalFilter` 里做。
 
 ### 面试提醒
 
@@ -294,6 +410,52 @@ JWT 校验不怕，怕的是“每个请求为了验 JWT 再查库或同步调�
 - 网络层只允许网关网段访问服务。
 - 网关清洗客户端自带的伪造头，只保留自己注入的头。
 - 需要增强可信性时，可给关键头加签并加时间戳、随机数防重放。
+
+## 5.2.1 JWT 里已经有 `userId` 了，为什么还不能完全相信？这是线上真实会遇到的问题
+
+### 主答
+
+因为 JWT 能证明“这个 `userId` 是签发 token 时合法写进去且没有被篡改”，但不能天然保证“这个用户现在这一刻仍然有效”。
+
+### 线上真实问题
+
+生产上经常会遇到这种情况：
+
+- 用户登录成功，认证中心签发了 JWT，里面带了 `userId`
+- 后面用户被禁用、注销、租户权限被回收，或者账号状态发生变化
+- 但旧 JWT 在过期前依然能验签通过
+
+这时如果系统只看 JWT 是否合法，而不看用户当前状态，就会出现：
+
+- 被禁用用户还能继续访问接口
+- 已经回收权限的用户还能继续操作
+- 多租户切换后，旧 token 还带着历史租户信息继续访问
+
+### 正确认知
+
+- JWT 解决的是 **身份声明可信**
+- 不是 **用户当前状态永远有效**
+
+所以不能把“验签通过”直接等同于“这个用户当前还能做任何事”。
+
+### 更稳的做法
+
+1. **网关层做轻校验**
+   - 验签、过期时间、`iss/aud`
+   - 必要时查黑名单或封禁态缓存
+
+2. **服务层做强业务校验**
+   - 用户是否仍然存在
+   - 是否被禁用
+   - 当前租户、角色、资源权限是否还有效
+
+3. **高风险接口二次确认**
+   - 支付、退款、管理后台、处方开具这类敏感操作
+   - 不只信 token，还要结合当前用户状态和权限再校验一次
+
+### 面试回答
+
+生产上真实会遇到一个问题：JWT 里虽然带了 `userId`，并且验签也能通过，但这只能说明这个 token 是合法签发且没被篡改，不代表这个用户当前仍然有效。比如用户登录后被禁用、权限被回收，旧 token 在过期前还是可能继续使用。所以网关通常只做验签和基础合法性校验，真正涉及用户状态、租户边界、资源权限的判断，还是要在下游服务再做一次校验。
 
 ## 5.3 如何防止客户端伪造 `X-User-Id` 之类的头？
 
