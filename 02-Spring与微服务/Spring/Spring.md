@@ -1,12 +1,17 @@
+> [!info] 文档定位：基础知识主文
+>
+> 本文负责回答“是什么、为什么、基本如何使用”，并给出容器主流程、常见配置和排障入口。建议按「循环依赖 → 生命周期/IOC → `ApplicationContext` 与 `refresh()` → DI/Scope/Profile → AOP/事务常见问题」学习。
+>
+> 遇到源码调用链、代理边界、早期引用一致性、事务传播与并发取舍时，进入 [[Spring深度解析|《Spring深度解析》]]；不要在两篇笔记中维护同一份深度推导。
+
 # 1. 循环依赖
 在Spring中，循环依赖是指两个或多个Bean相互依赖，形成一个闭环。Spring处理循环依赖的方式取决于Bean的作用域（如单例或原型）。
 
 ### 1. 单例Bean的循环依赖
-对于单例Bean，Spring使用三级缓存（早期引用、二级缓存、正式缓存）来解决循环依赖（依赖注入情况）。
-使用注解解决构造函数的循环依赖
+三级缓存只适用于**单例 Bean 的属性注入**（Setter/字段注入）场景：Bean 已实例化、但尚未完成属性填充时，容器才能暴露早期引用。构造器循环依赖在实例化前就必须拿到对方，通常会创建失败并抛出 `BeanCurrentlyInCreationException`。
 
 - **三级缓存机制**：
-  1. **早期引用**：在Bean创建过程中，Spring会将Bean的早期引用存储在一个缓存中。这使得其他Bean可以在构造过程中引用这个Bean。
+  1. **早期引用**：Bean 实例化后、初始化前，容器可将其早期引用暴露给正在创建的依赖方。
   2. **二级缓存**：Bean的实例会在完全初始化前被放入二级缓存中。
   3. **正式缓存**：一旦Bean完全初始化，会被放入正式的单例缓存中。
 
@@ -38,7 +43,7 @@ public class B {
 }
 ```
 
-在这种情况下，Spring会在创建A时发现需要B，而B又需要A，这就形成了循环依赖。
+这是**构造器循环依赖**：创建 `A` 需要完整的 `B`，创建 `B` 又需要完整的 `A`；三级缓存尚未来得及暴露任何实例，因此默认无法解决。
 
 ### 4. 解决方法
 - **重构代码**：尽量避免循环依赖，可以通过重构代码来消除相互依赖的关系。（**依赖倒置**：> **依赖倒置让代码依赖于“稳定的抽象”而非“易变的实现”，从而提高复用性、可测试性和灵活性。**）
@@ -65,8 +70,8 @@ class B {
 }
 
 ```
-- **使用`@Lazy`注解**：可以在注入依赖时使用`@Lazy`注解来延迟加载Bean，从而避免循环依赖。
-- **使用setter方法或字段注入**：先让Spring 构造 A 实例（无参数构造器），此时 B 尚未注入，Spring **提前将 A 暴露为“early singleton”**，创建 B 时需要 A，Spring 从缓存中获取刚才暴露的 A，B 注入完成，回过头来再给 A 注入 B；
+- **使用 `@Lazy` 注解**：在一条注入边上延迟解析依赖，可作为兼容性手段；优先选择重构。
+- **理解属性注入的可解边界**：先让 Spring 实例化 `A`，在属性填充前提前暴露 `A` 的 early reference；创建 `B` 时取到该引用，最后再回填 `A` 的 `B` 属性。它解释了三级缓存为何能处理部分单例循环依赖，并不是推荐以字段注入来设计业务对象。
   
   ```java
   @Autowired
@@ -129,7 +134,7 @@ Spring的三级缓存主要包括：
    - 如果一级缓存中没有，检查`earlySingletonObjects`。如果找到了早期引用，直接返回。
 
 3. **创建Bean**：
-   - #Spring 如果一级和二级缓存都没有，Spring开始创建Bean：
+   - 如果一级和二级缓存都没有，Spring 开始创建 Bean：
      - 在创建过程中，Spring会将当前Bean的`ObjectFactory`放入三级缓存`singletonFactories`中。
      - 同时将该Bean的引用添加到`earlySingletonObjects`中。
 
@@ -265,10 +270,8 @@ synchronized (this.singletonObjects) {
 ## 5. 总结
 
 Spring的三级缓存机制是处理单例Bean循环依赖的重要手段。通过合理利用这个机制，可以增强应用的稳定性，但在设计Bean之间的依赖关系时，仍需尽量避免循环依赖的出现。
-![[Pasted image 20250305154153.png]]
-![[Pasted image 20250305155038.png]]
-# 3. 原型Bean
-在Spring框架中，** #Spring 原型Bean（Prototype Bean）**是一种Bean的作用域定义。它的主要特点是每次请求都会返回一个新的Bean实例。以下是对原型Bean的详细解释：
+# 3. 原型 Bean
+在 Spring 框架中，**原型 Bean（Prototype Bean）**是一种 Bean 作用域定义。它的主要特点是每次请求都会返回一个新的 Bean 实例。
 
 ### 1. 原型Bean的特性
 
@@ -317,7 +320,7 @@ public void destroy() {
 原型Bean是Spring中定义的一种作用域，适用于需要独立实例的情况。理解原型Bean的特性和生命周期，有助于合理设计和管理Spring应用中的Bean。
 
 
-# 4. Lazy注解的作用
+# 4. `@Lazy` 的作用
 `@Lazy`注解在Spring中用于延迟加载Bean。它的主要功能是推迟Bean的实例化，直到实际需要时才创建。以下是`@Lazy`注解的原理及其工作机制的详细解释。
 
 ### 1. 使用场景
@@ -325,7 +328,7 @@ public void destroy() {
 `@Lazy`注解适用于以下情况：
 
 - **减少启动时间**：在应用启动时，某些Bean的创建可能会消耗较多资源，通过延迟加载可以提高启动速度。
-- **解决循环依赖**：在某些情况下，使用`@Lazy`可以帮助解决原型Bean的循环依赖问题。
+- **延后依赖解析**：在注入点使用 `@Lazy` 可以推迟获取某个依赖，偶尔可作为打破直接依赖的权衡方案；它不能替代消除循环依赖的设计工作。
 
 ### 2. 原理
 
@@ -336,7 +339,7 @@ public void destroy() {
 在Spring中，`@Lazy`可以应用于类、构造函数、方法或字段。它的基本定义如下：
 
 ```java
-@Target({ElementType.TYPE, ElementType.METHOD, ElementType.FIELD, ElementType.PARAMETER})
+@Target({ElementType.TYPE, ElementType.METHOD, ElementType.CONSTRUCTOR, ElementType.FIELD, ElementType.PARAMETER})
 @Retention(RetentionPolicy.RUNTIME)
 public @interface Lazy {
     boolean value() default true;
@@ -345,15 +348,12 @@ public @interface Lazy {
 
 #### 2) 延迟加载的实现
 
-#Spring 当一个Bean被标记为`@Lazy`时，Spring会在创建该Bean时使用`Lazy`代理。以下是具体的实现步骤：
+需要区分两种用法：
 
-1. **代理创建**：
-   - 当容器扫描到被`@Lazy`注解标记的Bean时，会创建一个代理对象，而不是立即实例化该Bean。
-   - 这个代理对象实现了`SmartInitializingSingleton`接口，负责在第一次访问时进行实际的Bean实例化。
+1. **Bean 定义上的 `@Lazy`**：容器不在启动时预实例化该 Bean，而是在首次请求它时创建。
+2. **注入点上的 `@Lazy`**：Spring 向依赖方注入一个可延迟解析的引用，首次使用时再获取目标 Bean。
 
-2. **首次访问时实例化**：
-   - 当应用程序请求该延迟加载的Bean时，代理会触发实际Bean的创建。
-   - 这时候，Spring会调用该Bean的构造函数或工厂方法，创建并返回真实的Bean实例。
+懒初始化并不意味着“任何场景都会有代理”。例如，懒 Bean 若被非懒加载 singleton 直接依赖，为满足该 singleton 的依赖，容器仍可能在启动时创建它。
 
 ### 3. 示例
 
@@ -378,34 +378,34 @@ public class B {
 }
 ```
 
-在上述代码中，`B`被标记为`@Lazy`。在创建`A`时，`B`不会立即实例化，直到`A`中使用`B`的实例时，`B`才会被创建。
+在上述代码中，`@Lazy` 标注的是 `A` 对 `B` 的**注入点**。创建 `A` 时可先注入延迟解析引用；当业务实际调用 `b` 时，容器才需要获取 `B`。
 
 ### 4. 小结
 
-通过使用`@Lazy`注解，Spring能够有效地延迟Bean的实例化，从而优化启动性能和解决某些循环依赖问题。理解`@Lazy`的原理和使用场景，有助于更灵活地管理应用中的Bean生命周期。
+`@Lazy` 的主要用途是延迟 Bean 初始化或依赖解析，从而控制启动成本和依赖获取时机。它可以缓解某些创建阶段的依赖冲突，但不应替代循环依赖的设计治理。
 
-# 5. 通过代码解决循环依赖的方案
-在Spring中，`@Lazy`注解可以帮助解决循环依赖问题，特别是在涉及原型Bean的情况下。下面详细解释`@Lazy`是如何解决循环依赖的。
+# 5. 使用 `@Lazy` 处理循环依赖
+在 Spring 中，`@Lazy` 可以推迟一条依赖边的解析，从而让某些相互依赖的 Bean 得以创建；它是兼容性手段，不是循环依赖的通用解法，更不能说明原型 Bean 的循环依赖已被容器支持。
 
 ### 1. 循环依赖概述
 
-循环依赖指的是两个或多个Bean相互依赖，导致在创建过程中出现死锁或异常。例如，Bean A依赖于Bean B，而Bean B又依赖于Bean A。当Spring试图创建这两个Bean时，会陷入无限等待。
+循环依赖指两个或多个 Bean 相互依赖，导致创建顺序无法直接满足。例如 A 依赖 B、B 又依赖 A；Spring 会根据作用域和注入方式尝试解析，无法处理时通常抛出循环依赖相关异常，而不是无限等待。
 
-### 2. #Spring 使用`@Lazy`的原理
+### 2. 使用 `@Lazy` 延迟解析依赖
 
 当一个Bean被标记为`@Lazy`时，Spring会使用代理机制延迟该Bean的实例化。具体步骤如下：
 
 #### 1) 创建代理
 
-- 当一个Bean被`@Lazy`注解标记时，Spring不会立即创建该Bean的实例，而是创建一个代理对象。这个代理对象可以在需要时触发实际Bean的创建。
+- 在构造器、字段或 Setter 的注入点使用 `@Lazy` 时，Spring 可以注入延迟解析引用；真正使用该引用时再请求目标 Bean。
 
 #### 2) 延迟实例化
 
-- 在依赖注入过程中，如果Bean A依赖于Bean B，并且Bean B被标记为`@Lazy`，当Spring创建Bean A时，它不会立即创建Bean B，而是会将Bean B的代理对象注入到Bean A中。
+- 在依赖注入过程中，若 `A` 对 `B` 的注入点标记为 `@Lazy`，创建 `A` 时不必立刻完成 `B` 的解析，从而打破“创建 A 必须同步创建 B”的直接链路。
 
 #### 3) 第一次访问时创建
 
-- 当Bean A需要使用Bean B的实例时，代理会被调用，这时Spring会实际创建Bean B并返回其实例。这种方式打破了直接依赖关系，从而避免了循环依赖的死锁。
+- 当 Bean A 需要使用 Bean B 时，延迟解析引用会触发对 B 的获取。这只是把依赖解析延后，不能保证所有循环依赖在运行期都安全可用。
 
 ### 3. 示例
 
@@ -428,8 +428,10 @@ public class A {
 
 @Component
 public class B {
-    public B() {
-        System.out.println("B is created");
+    private final A a;
+
+    public B(A a) {
+        this.a = a;
     }
 
     public void action() {
@@ -438,13 +440,13 @@ public class B {
 }
 ```
 
-在这个示例中，假设`A`和`B`都有相互依赖的情况。通过在`A`的构造函数中使用`@Lazy`注解，Spring不会在创建`A`时立即创建`B`。而是创建`A`的代理对象，直到`A`调用`B`的方法时，`B`才会被实例化。
+在这个示例中，`A` 和 `B` 确实互相依赖。`A` 创建时先注入指向 `B` 的延迟解析引用；首次调用 `b.action()` 时才获取 `B`，此时 `B` 可以注入已完成创建的 `A`。需要同时评估延迟失败和职责耦合等风险。
 
 ### 4. 小结
 
-通过使用`@Lazy`注解，Spring能够有效地解决循环依赖问题。它通过延迟创建Bean实例的方式，打破了直接的依赖关系，从而避免了死锁或异常的发生。这种机制使得在复杂的依赖关系中，开发者能够更灵活地管理Bean的生命周期。
+`@Lazy` 的主要价值是控制初始化时机；用于循环依赖时只是把问题从“创建阶段”推迟到“首次使用阶段”。优先做职责拆分或引入中介者，只有在边界清楚时才使用它作为权衡。
 
-# 6.  #Spring 生命周期
+# 6. Bean 生命周期
 Spring Bean 的生命周期是指从 Bean 实例化到销毁的完整过程，由 Spring 容器管理。了解其生命周期有助于开发者更好地控制对象的行为和资源管理。
 
 ### **Spring Bean 生命周期的完整流程**
@@ -453,17 +455,16 @@ Spring Bean 的生命周期是指从 Bean 实例化到销毁的完整过程，�
 
 ---
 
-#### **1. Bean 实例化（Instantiation、构造器注入）**
+#### **1. Bean 实例化（Instantiation）**
 
-- 容器读取配置文件或注解，使用反射实例化 Bean 对象。
-- 此时，Bean 还未进行依赖注入，实例化的是一个裸对象。
-- 属于JVM的初始化。
+- 容器先解析构造器参数，再调用构造器或工厂方法创建 Bean 实例。
+- 构造器注入属于这一阶段；字段和 Setter 注入尚未发生。
 
 ---
 
 #### **2. 设置属性（Populate Properties，依赖注入）**
 
-- 容器解析并注入 Bean 所依赖的其他对象（从Bean容器中）。先byType再byName
+- 容器解析并注入字段、Setter 等依赖。`@Autowired` 通常按类型解析，再结合 `@Qualifier`、`@Primary` 或参数名等规则消除歧义，不能简单概括为固定的“先 byType 再 byName”。
 - 依赖注入的方式：
     1. 构造函数注入（**发生在实例化**）
     2. Setter 方法注入
@@ -494,8 +495,9 @@ Spring Bean 的生命周期是指从 Bean 实例化到销毁的完整过程，�
 - 初始化方法是开发者定义的钩子，用于在 Bean 初始化时执行自定义逻辑。
 - **定义方式：**
     1. 在 XML 配置中指定 `init-method`。
-    2. 使用注解 `@PostConstruct`（JDK 标准，优先级高）。
+    2. 使用注解 `@PostConstruct`（现代 Spring 使用 `jakarta.annotation.PostConstruct`）。
     3. 实现 `InitializingBean` 接口的 `afterPropertiesSet()` 方法。
+  当三种回调同时存在时，常见执行顺序为 `@PostConstruct` → `afterPropertiesSet()` → 自定义 `init-method`；其实现仍受 BeanPostProcessor 协调，不应泛化为“优先级最高”。
 
 ---
 
@@ -578,15 +580,15 @@ Spring Bean 的生命周期是指从 Bean 实例化到销毁的完整过程，�
 3. **Bean 初始化方法的优先级？**
     
     - **答：**
-        1. `@PostConstruct`（优先级最高）
+        1. `@PostConstruct`
         2. `afterPropertiesSet()`（来自 `InitializingBean`）
-        3. XML 或 `@Bean` 配置的 `init-method`
+        3. XML 或 `@Bean` 配置的 `init-method`（通常按此顺序执行）
 4. **什么是 FactoryBean？和普通 Bean 有什么区别？**
     
     - **答：**
         - `FactoryBean` 是一个特殊的 Bean，其 `getObject()` 方法返回的是创建的对象，而非 `FactoryBean` 本身。
 
-# 7. IOC和DI
+# 7. IoC 与 DI
 ### **IOC（Inversion of Control，控制反转）**
 
 #### **什么是 IOC？**
@@ -619,7 +621,7 @@ Spring Bean 的生命周期是指从 Bean 实例化到销毁的完整过程，�
 
 ---
 
-### #Spring **DI（Dependency Injection，依赖注入）**
+### DI（Dependency Injection，依赖注入）
 
 #### **什么是 DI？**
 
@@ -723,7 +725,7 @@ Spring 提供以下三种依赖注入方式：
 
 ---
 
-### #Spring **典型面试问题**
+### 常见问题
 
 1. **IOC 和 DI 的区别是什么？**
     
@@ -812,7 +814,7 @@ ApplicationContext context = new AnnotationConfigApplicationContext(AppConfig.cl
 MyService myService = context.getBean(MyService.class);
 ```
 
-####  #Spring **核心初始化流程**
+#### 核心初始化流程
 
 1. **创建容器实例**
     
@@ -861,47 +863,7 @@ MyService myService = context.getBean(MyService.class);
     4. **实例化单例 Bean**
         - 创建所有单例 Bean，并调用初始化方法。
 
-```java
-public void refresh() throws BeansException, IllegalStateException {
-    synchronized (this.startupShutdownMonitor) {
-        // 1. 预准备（设置启动时间、校验环境变量等）
-        prepareRefresh();
-
-        // 2. 创建并加载 BeanFactory（包括解析配置类、扫描 @Component）
-        ConfigurableListableBeanFactory beanFactory = obtainFreshBeanFactory();
-
-        // 3. 设置 BeanFactory 的各种属性（ClassLoader、Aware 支持等）
-        prepareBeanFactory(beanFactory);
-
-        // 4. 扩展点：允许子类进一步处理 BeanFactory
-        postProcessBeanFactory(beanFactory);
-
-        // 5. 调用 BeanFactoryPostProcessor（如解析 @Configuration、@Import）
-        invokeBeanFactoryPostProcessors(beanFactory);
-
-        // 6. 注册所有的 BeanPostProcessor（如 @Autowired、AOP）
-        registerBeanPostProcessors(beanFactory);
-
-        // 7. 初始化国际化 MessageSource（可选）
-        initMessageSource();
-
-        // 8. 初始化事件广播器 ApplicationEventMulticaster
-        initApplicationEventMulticaster();
-
-        // 9. 留给子类扩展，如 Web 环境下初始化 DispatcherServlet
-        onRefresh();
-
-        // 10. 注册所有事件监听器（包括 @EventListener）
-        registerListeners();
-
-        // 11. 完成所有非懒加载单例 Bean 的实例化（🔥 Bean 注入 + AOP 创建都在此步）
-        finishBeanFactoryInitialization(beanFactory);
-
-        // 12. 发布 ContextRefreshedEvent，标志容器启动完成
-        finishRefresh();
-    }
-}
-```
+完整的 `refresh()` 源码骨架和各阶段说明见后文「9. Spring refresh」。这里保留其在 `ApplicationContext` 中的职责，避免同一段启动流程在一篇笔记中重复维护。
 
 ---
 
@@ -1033,7 +995,7 @@ public Object doGetBean(String name) {
 2. **Spring Boot 默认使用 `AnnotationConfigServletWebServerApplicationContext`，加载注解配置类并启动 Web 容器。**
 3. **源码级别理解：重点关注 `refresh()` 和 `getBean()` 方法，掌握容器初始化与 Bean 创建的流程。**
 
-# 9. #Spring refresh
+# 9. `refresh()`
 
 
 ---
@@ -1312,7 +1274,7 @@ public void refresh() throws BeansException, IllegalStateException {
 
 这段代码展示了 Spring 容器启动的核心流程。如果需要进一步探讨具体步骤（如 `@Autowired` 或 AOP 的实现），可以继续展开！
 
-# 10.Bean scope
+# 10. Bean Scope
 在 Spring 框架中，**Bean 的范围（Scope）** 定义了 Spring 容器中 Bean 的生命周期和实例化规则。不同的范围控制 Bean 在容器中是否共享实例或根据请求创建新实例。
 
 ---
@@ -1497,7 +1459,7 @@ public class PrototypeBean {
 
 ### **7. 常见面试问题**
 
-####  #Spring **(1) 什么是 Spring Bean 的作用域？如何选择合适的 Scope？**
+#### (1) 什么是 Spring Bean 的作用域？如何选择合适的 Scope？
 
 - **答：** Bean 的作用域定义了 Bean 的生命周期和实例数量：
     - `singleton`：默认，适合无状态服务类。
@@ -2410,7 +2372,7 @@ public class ThreadLocalService {
 
 ---
 
-### **方法 2：使用 `@Scope("prototype")`（每次请求新建 Bean）**
+### **方法 2：按需获取 prototype Bean**
 
 Spring 提供 `@Scope("prototype")` 作用域，每次 `getBean()` 调用都会返回新的实例，从而避免多个线程共享同一个实例。
 
@@ -2427,8 +2389,10 @@ public class PrototypeService {
 }
 ```
 
-**优点：** ✅ 每个线程都创建新 Bean，不会共享数据。  
-**缺点：** ❌ 适用于短生命周期对象，可能会增加内存占用。
+`prototype` 表示每次由容器解析该 Bean 时创建新实例，不等于“每个线程一个实例”。若 prototype 直接注入 singleton，注入只发生一次，singleton 仍会持有同一个 prototype 实例；需要反复获取新对象时，应注入 `ObjectProvider<PrototypeService>` 或使用 scoped proxy。
+
+**优点：** ✅ 适用于短生命周期、有状态的临时对象。
+**缺点：** ❌ 需要自行管理销毁；不自动解决线程隔离或 singleton 中的共享问题。
 
 ---
 
@@ -2481,19 +2445,19 @@ public class ConcurrentService {
 
 | **场景**                           | **是否需要线程安全？** | **推荐方案**                            |
 | ---------------------------------- | ---------------------- | --------------------------------------- |
-| **Controller 层**（`@Controller`） | ❌ 无需线程安全         | Spring MVC 处理请求是无状态的           |
-| **Service 层**（`@Service`）       | ⭕ 需要视情况而定       | 1. 使用 `ThreadLocal`2. 避免实例变量    |
-| **Repository 层**（`@Repository`） | ❌ 无需线程安全         | Spring Data JPA/Hibernate 本身线程安全  |
+| **Controller 层**（`@Controller`） | ⭕ 取决于是否持有可变状态 | 保持无状态；不要把请求数据存到实例字段 |
+| **Service 层**（`@Service`）       | ⭕ 取决于是否持有可变状态 | 避免实例变量；必要时选用并发容器或显式同步 |
+| **Repository 层**（`@Repository`） | ⭕ 取决于实现与资源类型   | 保持无状态；不要共享非线程安全的持久化资源 |
 | **存储共享数据的 Bean**            | ✅ 需要线程安全         | 1. `ConcurrentHashMap`2. `synchronized` |
 
 ---
 
 ## **5. 结论**
 
-1. **Spring 的单例 Bean 本质上是无状态的，因此默认是线程安全的**。
+1. **Spring 的 singleton 只表示“容器中通常共享同一个实例”，并不保证线程安全**；无状态 Bean 往往天然线程安全，有可变共享状态时则需要自行设计并发控制。
 2. **如果 Bean 维护了可变状态（如成员变量），那么它在多线程环境下就不是线程安全的，需要采取措施**：
     - ✅ **使用 `ThreadLocal` 进行线程隔离**
-    - ✅ **使用 `@Scope("prototype")` 确保每个线程都有自己的实例**
+    - ✅ **在确实需要短生命周期对象时按需获取 prototype Bean，并明确其生命周期**
     - ✅ **使用 `synchronized` 或 `Lock` 保证并发安全**
     - ✅ **使用 `ConcurrentHashMap` 代替 `HashMap` 进行共享数据存储**
 3. **一般情况下，Spring 的 Service 和 Repository 层是无状态的，因此不需要额外的线程安全措施**。
@@ -2523,14 +2487,14 @@ Bean 创建时（通过 BeanPostProcessor）扫描 @Transactional
 | **事务失效场景**                     | **原因**                                                                                                                                                                              | **解决方案**                                                                                                                                                |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **（1）自调用问题（this.method()）** | Spring 事务基于代理，如果在同一个类中调用事务方法，代理不会生效。                                                                                                                     | 1. 通过 `AopContext.currentProxy()` 调用代理对象。2. 使用 `ApplicationContext.getBean()` 获取代理对象。                                                     |
-| **（2）非 public 方法**              | Spring AOP 代理 **只会拦截 public 方法**，非 `public` 方法不会被代理。CGLIB 使用字节码生成一个**子类**来“重写”目标类的方法，private、final方法无法被子类覆盖                          | 1. 确保事务方法是 `public` 修饰的。                                                                                                                         |
+| **（2）事务方法不可被代理拦截**       | JDK 接口代理只能拦截接口中的 `public` 方法；类代理不能覆盖 `private`、`final` 方法。Spring 6 起类代理默认也可处理 `protected` 和包可见方法，但版本和代理类型会影响结果。 | 事务边界优先放在 `public` 的具体类方法上；不要依赖 `private`/`final` 方法的事务注解。 |
 | **（3）异常未被捕获**                | 事务只对 **运行时异常（RuntimeException）或 Error** 生效，**CheckedException 不会触发回滚**。- CheckedException 通常表示“外部问题” → 比如文件找不到、远程调用失败，不一定代表业务失败 | 1. 手动抛出 `RuntimeException`（throw new RuntimeException(new IOException())）。2. 使用 `rollbackFor = Exception.class` 让 `@Transactional` 回滚所有异常。 |
 | **（4）事务方法被 final`修饰**       | CGLIB 代理模式下，`final` 方法无法被子类重写，因此事务不会生效。                                                                                                                      | **移除 final 修饰符**，让 Spring 能够动态代理该方法。                                                                                                       |
 | **（5）事务管理器没有正确配置**      | 事务管理器可能没有正确配置，如使用 `@Transactional` 但 `DataSourceTransactionManager` 没有生效。                                                                                      | 1. 确保 `@EnableTransactionManagement` 生效。2. 检查 `@Transactional` 是否正确标注在类或方法上。                                                            |
 | **（6）不同的 TransactionManager**   | 事务方法 A 使用 `DataSourceTransactionManager`，事务方法 B 使用 `JpaTransactionManager`，事务不会共用。                                                                               | 确保所有相关事务使用相同的 `TransactionManager`。                                                                                                           |
 | **（7）多线程导致事务失效**          | Spring 事务是 **线程绑定的**，但如果事务方法在 **新线程** 中执行，事务上下文不会传播。                                                                                                | 1. **使用 @TransactionalEventListener 监听异步任务**。2. **避免在事务方法中使用 @Async**。                                                                  |
-| **（8）@Transactional标注在接口上**  | 如果使用 **JDK 代理**，Spring 只代理接口方法，而 `@Transactional` 只能在 **实现类的方法** 上生效。                                                                                    | 1. **将 @Transactional标注在实现类的方法上**。                                                                                                              |
-| **（9）嵌套事务的 Propagation`设置** | `@Transactional(propagation = Propagation.REQUIRES_NEW)` 会开启新事务，与外部事务无关，可能导致回滚失效。                                                                             | 1. **使用 Propagation.REQUIRED保证事务嵌套**。2. **根据业务需求正确选择事务传播方式**。                                                                     |
+| **（8）事务注解位置与代理模式不一致** | 接口、类和方法都可声明 `@Transactional`；但接口注解在 AspectJ 等场景存在识别边界，且 JDK 代理只拦截接口的 `public` 方法。 | 优先标注在具体类的 `public` 方法上，并统一团队约定。 |
+| **（9）误解传播行为** | `REQUIRES_NEW` 会挂起外层并开启独立事务，内外提交/回滚相互独立；这不是“回滚失效”，而是事务边界不同。 | 按业务原子性选择 `REQUIRED`、`REQUIRES_NEW` 或 `NESTED`，并评估连接池与锁竞争。 |
 
 ---
 
@@ -2602,7 +2566,7 @@ public class UserService {
 
 **为什么事务失效？**
 
-- Spring **AOP 代理** 只会拦截 `public` 方法，`private` 方法不会被代理。
+- `private` 方法无法被类代理覆盖；若使用 JDK 接口代理，事务方法还必须是接口中声明的 `public` 方法。Spring 6 的类代理虽默认支持 `protected` 和包可见方法，但为了避免代理类型和版本差异，业务事务边界仍建议使用 `public` 方法。
 
 **解决方案：**
 
@@ -2729,12 +2693,12 @@ logging.level.org.springframework.jdbc.datasource.DataSourceTransactionManager=D
 | `CheckedException` 不回滚    | Spring 只回滚 `RuntimeException` | `rollbackFor = Exception.class`               |
 | `@Async` 事务失效            | 事务上下文不能跨线程             | 避免 `@Async`，或手动管理事务                 |
 
-如果你在项目中遇到事务失效的问题，可以按照这些步骤进行 Debug 和优化！ 🚀
+如果你在项目中遇到事务失效的问题，可以按照这些步骤进行排查和优化。
 
 # 16. Spring推断构造方法
 ### **Spring 如何推断构造方法？**
 
-在 Spring 中，**当一个 Bean 没有显式定义构造方法时**，Spring 会 **自动推断** 并选择一个适当的构造方法来实例化该 Bean。这个过程主要发生在 `@Component` 注解的 Bean 或 `@Bean` 方法返回的类中。Spring 使用以下逻辑来推断构造方法：
+Spring 在创建 Bean 时会解析构造器，但“选择参数最多的构造器”不是通用规则。是否能走构造器注入还取决于 BeanDefinition 中是否指定了构造参数、是否存在 `@Autowired` 候选，以及候选参数能否从容器解析。
 
 ---
 
@@ -2745,48 +2709,33 @@ Spring 在 **实例化 Bean** 时，主要使用 **`ConstructorResolver`** 进�
 1. **如果只有一个构造方法（无论是否带参数）**
     
     - 直接使用该构造方法。
-2. **如果有多个构造方法**
+2. **只有一个 `required = true` 的 `@Autowired` 构造器**
+
+    - 使用该构造器；它的依赖都必须能满足。
+3. **有多个 `@Autowired(required = false)` 构造器**
     
-    - **优先使用 `@Autowired` 标注的构造方法**。
-    - 如果没有 `@Autowired`，则使用**参数最多的构造方法**（Spring 5 之后默认支持）。
-3. **如果存在默认无参构造方法**
+    - 它们都是候选；Spring 选择“可满足依赖数最多”的那个。若没有候选可满足，才会退回默认/无参构造器（若存在）。
+4. **多个构造器都没有 `@Autowired`**
     
-    - Spring 直接调用无参构造方法实例化 Bean（**默认行为**）。
+    - Spring 不会因为参数更多而自动选择其中一个；存在默认/无参构造器时通常使用它。没有可用默认构造器时，应显式标注要注入的构造器，避免依赖于内部解析细节。
 
 ---
 
 ## **2. 源码分析：Spring 如何推断构造方法？**
 
-Spring **使用 `ConstructorResolver` 类的 `autowireConstructor()` 方法来推断构造方法**。
+`ConstructorResolver#autowireConstructor()` 的真实实现还要处理显式构造参数、参数名匹配、类型转换和歧义检测。以下是帮助理解决策边界的伪代码，并非 Spring 源码：
 
-```java
-protected BeanWrapper autowireConstructor(
-        String beanName, RootBeanDefinition mbd, Constructor<?>[] chosenCtors, Object[] explicitArgs) {
-
-    Constructor<?> constructorToUse = null;
-    ArgumentsHolder argsHolderToUse = null;
-    Object[] argsToUse = null;
-
-    // 如果没有显式指定构造参数
-    if (chosenCtors == null) {
-        chosenCtors = mbd.getBeanClass().getDeclaredConstructors();
-    }
-
-    for (Constructor<?> candidate : chosenCtors) {
-        // 如果构造方法有 @Autowired 注解，优先选择
-        if (candidate.isAnnotationPresent(Autowired.class)) {
-            constructorToUse = candidate;
-            break;
-        }
-
-        // 记录参数最多的构造方法
-        if (constructorToUse == null || candidate.getParameterCount() > constructorToUse.getParameterCount()) {
-            constructorToUse = candidate;
-        }
-    }
-
-    // 通过反射调用构造方法
-    return instantiateBean(beanName, mbd, constructorToUse, argsToUse);
+```text
+if (只有一个构造器) {
+    使用它;
+} else if (存在一个 required = true 的 @Autowired 构造器) {
+    使用它，所有参数都必须可解析;
+} else if (存在多个 required = false 的 @Autowired 构造器) {
+    选择可解析参数最多的候选;
+} else if (存在默认/无参构造器) {
+    使用默认/无参构造器;
+} else {
+    报出构造器歧义或参数无法解析的异常;
 }
 ```
 
@@ -2841,9 +2790,9 @@ OrderService 带 UserService 的构造方法
 
 ---
 
-### **（3）没有 `@Autowired`，Spring 选择参数最多的构造方法**
+### **（3）多个构造方法都没有 `@Autowired` 时，使用默认构造方法**
 
-如果没有 `@Autowired`，Spring 选择参数最多的构造方法（Spring 5 之后默认支持）：
+当存在默认/无参构造器时，Spring 使用它，而不会仅按参数数量猜测：
 
 ```java
 @Component
@@ -2871,10 +2820,10 @@ public class ProductService {
 }
 ```
 
-**Spring 选择参数最多的构造方法**
+**Spring 选择无参构造方法；若希望注入依赖，应在目标构造器上显式标注 `@Autowired`。**
 
 ```
-ProductService 双参数构造方法
+ProductService 无参构造方法
 ```
 
 ---
@@ -2910,13 +2859,13 @@ public class AppConfig {
 }
 ```
 
-**Spring 依然会选择参数最多的构造方法。**
+这里调用的是配置类中的 `productService(...)` 工厂方法；方法参数由 Spring 注入，`new ProductService(...)` 明确决定了使用哪个构造器，不存在“再次推断参数最多构造器”。
 
 ---
 
-## **4. 事务 `@Transactional` 的特殊情况**
+## **4. `@Transactional` 与构造器选择**
 
-如果类使用了 `@Transactional`，Spring **可能会使用 CGLIB 代理**，导致构造方法选择不同：
+事务代理在目标对象创建完成后再包装 Bean，不会改变目标 Bean 的构造器选择：
 
 ```java
 @Service
@@ -2931,32 +2880,19 @@ public class PaymentService {
 }
 ```
 
-Spring 可能会 **使用 CGLIB 子类代理 `PaymentService`**，然后调用代理类的构造方法，而不是直接调用 `PaymentService` 本身的构造方法。
+代理类型会影响哪些业务方法可被事务拦截，但不应被当作构造器推断规则的一部分。
 
 ---
 
-## **5. Spring 5 之前的不同**
-
-在 **Spring 5 之前**：
-
-- 如果没有 `@Autowired`，Spring **默认调用无参构造方法**，即使有多个构造方法。
-- 需要手动 **显式使用 `@Autowired` 指定构造方法**。
-
-在 **Spring 5 及以后**：
-
-- 如果没有 `@Autowired`，Spring **会选择参数最多的构造方法** 进行注入。
-
----
-
-## **6. 总结**
+## **5. 总结**
 
 | **场景**                        | **Spring 选择的构造方法**               |
 | ------------------------------- | --------------------------------------- |
 | 只有一个构造方法                | 直接使用该构造方法                      |
 | 有 `@Autowired` 的构造方法      | **优先使用 `@Autowired`** 标注的方法    |
-| 没有 `@Autowired`，多个构造方法 | **Spring 5 之后选择参数最多的构造方法** |
-| 有 `@Bean` 配置方法             | 按参数最多的构造方法进行推断            |
-| **CGLIB 代理（事务等）**        | 可能调用代理类构造方法                  |
+| 多个构造方法且均未标注          | 使用默认/无参构造器（若存在）；否则显式标注目标构造器 |
+| 有 `@Bean` 配置方法             | 由工厂方法直接创建；工厂方法参数由 Spring 注入          |
+| **CGLIB 代理（事务等）**        | 在目标对象创建后包装，不改变构造器选择                  |
 
 ### **最佳实践**
 
@@ -3005,11 +2941,12 @@ public final class PaymentService {}  // ❌ 不推荐
 **总结：**
 
 - **Spring 通过 `ConstructorResolver` 自动推断构造方法。**
-- **Spring 5 之后，默认选择参数最多的构造方法。**
-- **优先使用 `@Autowired` 明确指定构造方法，避免歧义。**
-- **事务或 AOP 代理可能影响构造方法的选择。**
+- **单构造器无需 `@Autowired`；它会被用于构造器注入。**
+- **多个构造器时，使用 `@Autowired` 明确选择，或保留默认构造器。**
+- **“参数最多”只适用于多个非必需 `@Autowired` 候选之间的比较。**
+- **事务或 AOP 代理不改变目标 Bean 的构造器选择。**
 
-希望这个解析对你有所帮助！🚀🚀🚀
+以上内容可作为排查入口；复杂边界以实际 Spring 版本与配置为准。
 
 # 17. 为什么不推荐使用字段注入
 ### **为什么不要使用字段注入（Field Injection）？**
@@ -3299,7 +3236,7 @@ public class UserServiceTest {
 | **Setter 注入** | 适用于可选依赖                 | 依赖可以随时更改，风险高         | 🟡 适用于少数情况 |
 | **构造器注入**  | 线程安全，可测试，强制依赖注入 | 代码稍多                         | ✅ 强烈推荐       |
 
-✅ **最佳实践**：**使用构造器注入，避免字段注入！** 🚀
+**最佳实践：使用构造器注入，避免字段注入。**
 
 # 18. **Spring AOP 的工作原理**
 
@@ -3409,7 +3346,7 @@ public Object proceed() throws Throwable {
 4. **调用目标方法后继续执行后置增强（`@After`、`@AfterReturning`、`@AfterThrowing`）。**
 5. **最终返回结果给调用者。**
 
-Spring AOP 的核心就是 **代理模式 + 责任链模式**，通过动态代理实现无侵入的切面增强。🚀
+Spring AOP 的核心是**代理模式 + 责任链模式**：通过动态代理实现无侵入的切面增强。
 
 [^1]: @Configuration + @EnableTransactionManagement
 	        ↓
@@ -3423,10 +3360,12 @@ Spring AOP 的核心就是 **代理模式 + 责任链模式**，通过动态代�
 
 
 
-# 19. **Spring事务原理**
+# 19. Spring 事务原理（进阶入口）
+
+> 本节只用于建立事务调用链的全局认知。传播行为的精细语义、多数据源、异步边界、隔离级别和最终一致性，以 [[Spring深度解析|《Spring深度解析》]] 的「事务」章节为准；基础排障则回看本文「15. Spring事务失效」。
 ## 1. Spring 事务到底是什么
 Spring 事务的本质是：Spring 通过 AOP（代理 + 拦截器链）把“开启事务/提交/回滚”的控制逻辑织入到方法调用边界；数据库事务仍由底层数据库实现（如 MySQL InnoDB），Spring 负责正确地获取连接、设置事务属性、在方法前后调用 commit/rollback，并在执行完毕后清理线程上下文与释放连接。核心前提：调用必须经过 Spring 生成的代理对象（Proxy），否则事务不会生效。
-## 2. 核心组件与职责划分（面试必须能说清）
+## 2. 核心组件与职责划分
 ### 2.1 PlatformTransactionManager（事务管理器：真正干活的人）
 常见实现：DataSourceTransactionManager（JDBC/MyBatis）、JpaTransactionManager（JPA/Hibernate）。职责：getTransaction() 创建或加入事务；commit() 提交；rollback() 回滚。
 ### 2.2 TransactionDefinition（事务定义：配置载体）
@@ -3438,219 +3377,21 @@ Spring 事务的本质是：Spring 通过 AOP（代理 + 拦截器链）把“�
 ### 2.5 TransactionSynchronizationManager（线程级上下文：关键）
 基于 ThreadLocal 绑定 Connection/资源与事务同步回调；保证同线程 DAO 共享同一连接与事务。
 ## 3. @Transactional 如何从注解变成可执行的事务逻辑
-@EnableTransactionManagement 会注册 TransactionInterceptor 与对应 Advisor（切点 + 通知）；容器启动时自动代理创建器扫描 Advisor，发现 Bean 方法匹配事务切点就创建代理；调用经过代理进入 TransactionInterceptor 执行事务模板。必要条件：Spring 管理的 Bean + 经过代理调用 + 拦截条件满足（常见要求 public）。
+@EnableTransactionManagement 会注册 TransactionInterceptor 与对应 Advisor（切点 + 通知）；容器启动时自动代理创建器扫描 Advisor，发现 Bean 方法匹配事务切点就创建代理；调用经过代理进入 TransactionInterceptor 执行事务模板。必要条件：Spring 管理的 Bean、经过代理调用且满足拦截条件。实践中建议将事务放在 public 服务方法上；JDK 代理要求接口方法为 public，Spring 6 的类代理还支持 protected/package-private 方法。
 ## 4. 一次事务调用的完整执行链路（按时序拆解）
 进入代理→读取事务属性→getTransaction()（创建/加入）→执行目标方法→正常 commit/异常 rollback→清理线程绑定与释放连接→触发事务同步回调（afterCommit/afterCompletion）。
-## 5. 源码骨架 1：TransactionInterceptor / TransactionAspectSupport（事务模板的入口）
-TransactionInterceptor 主要逻辑是调用父类 TransactionAspectSupport 的 invokeWithinTransaction；你面试时讲“事务模板”就指它。
-```java
-public class TransactionInterceptor extends TransactionAspectSupport implements MethodInterceptor {
-  @Override
-  public Object invoke(MethodInvocation invocation) throws Throwable {
-    Class<?> targetClass = (invocation.getThis() != null ? invocation.getThis().getClass() : null);
-    return invokeWithinTransaction(invocation.getMethod(), targetClass, invocation::proceed);
-  }
-}
-public abstract class TransactionAspectSupport {
-  protected Object invokeWithinTransaction(Method method, Class<?> targetClass, InvocationCallback cb) throws Throwable {
-    TransactionAttribute txAttr = getTransactionAttributeSource().getTransactionAttribute(method, targetClass);
-    PlatformTransactionManager tm = determineTransactionManager(txAttr);
-    String joinpointId = method.toGenericString();
-    TransactionInfo txInfo = createTransactionIfNecessary(tm, txAttr, joinpointId);
-    Object retVal;
-    try {
-      retVal = cb.proceedWithInvocation(); // 这里才真正执行你的业务方法
-    } catch (Throwable ex) {
-      completeTransactionAfterThrowing(txInfo, ex); // 根据回滚规则决定 rollback/commit 或标记 rollback-only
-      throw ex;
-    } finally {
-      cleanupTransactionInfo(txInfo); // 恢复 ThreadLocal 上下文
-    }
-    commitTransactionAfterReturning(txInfo); // 正常返回：提交（或因 rollback-only 转回滚/抛 UnexpectedRollbackException）
-    return retVal;
-  }
-}
-````
+## 5. 源码阅读入口
 
-面试解释点：AOP 层只负责“模板与决策”，真正对 Connection 的操作在事务管理器（PlatformTransactionManager）里完成；rollback-only 可能导致“外层看似成功返回但最终提交失败/转回滚”的现象。
-## **6. 源码骨架 2：AbstractPlatformTransactionManager（传播行为与提交/回滚的总控）**
-Spring 把传播行为、挂起/恢复事务、保存点、同步回调等通用逻辑放在 AbstractPlatformTransactionManager。
+基础文只保留调用链：`TransactionInterceptor` 委托 `TransactionAspectSupport` 执行事务模板；`AbstractPlatformTransactionManager` 处理传播、挂起/恢复和同步回调；具体实现（例如 `DataSourceTransactionManager`）再对连接执行开启、提交、回滚和清理。`rollback-only` 会让外层即使正常返回，也在最终提交时转为回滚或抛出 `UnexpectedRollbackException`。
 
-```java
-public abstract class AbstractPlatformTransactionManager implements PlatformTransactionManager {
-  @Override
-  public final TransactionStatus getTransaction(TransactionDefinition definition) throws TransactionException {
-    Object transaction = doGetTransaction(); // 子类返回“事务对象”（JDBC 场景通常是 DataSourceTransactionObject）
-    boolean existing = isExistingTransaction(transaction);
-    if (existing) {
-      return handleExistingTransaction(definition, transaction); // REQUIRED/REQUIRES_NEW/NESTED 等在这里分支
-    }
-    if (definition.getPropagationBehavior() == TransactionDefinition.PROPAGATION_MANDATORY) {
-      throw new IllegalTransactionStateException("No existing transaction found for propagation 'mandatory'");
-    }
-    SuspendedResourcesHolder suspended = suspend(null); // 某些场景会先挂起
-    try {
-      DefaultTransactionStatus status = newTransactionStatus(definition, transaction, true, suspended);
-      doBegin(transaction, definition); // 子类真正开启事务（JDBC: setAutoCommit(false) 等）
-      prepareSynchronization(status, definition); // 绑定 ThreadLocal、注册同步回调容器
-      return status;
-    } catch (RuntimeException | Error ex) {
-      resume(null, suspended);
-      throw ex;
-    }
-  }
-  @Override
-  public final void commit(TransactionStatus status) throws TransactionException {
-    DefaultTransactionStatus s = (DefaultTransactionStatus) status;
-    if (s.isCompleted()) throw new IllegalTransactionStateException("Transaction is already completed");
-    if (s.isRollbackOnly()) { // 包含 local/global rollback-only
-      processRollback(s, false);
-      return;
-    }
-    processCommit(s); // 触发 beforeCommit/beforeCompletion → doCommit → afterCommit/afterCompletion
-  }
-  @Override
-  public final void rollback(TransactionStatus status) throws TransactionException {
-    DefaultTransactionStatus s = (DefaultTransactionStatus) status;
-    if (s.isCompleted()) throw new IllegalTransactionStateException("Transaction is already completed");
-    processRollback(s, true); // 触发 beforeCompletion → doRollback → afterCompletion
-  }
-  protected abstract Object doGetTransaction();
-  protected abstract void doBegin(Object transaction, TransactionDefinition definition);
-  protected abstract void doCommit(DefaultTransactionStatus status);
-  protected abstract void doRollback(DefaultTransactionStatus status);
-}
-```
+## 6. JDBC / MyBatis 场景
 
-面试解释点：传播行为的“加入/新开/挂起/保存点”是 Spring 控制流；真正数据库层 commit/rollback 仍是 connection.commit/rollback。
-## **7. 源码骨架 3：DataSourceTransactionManager（JDBC/MyBatis 场景最常考）**
+`DataSourceTransactionManager` 获取连接、设置事务属性并关闭自动提交；随后将 `ConnectionHolder` 绑定到 `TransactionSynchronizationManager`，使同一线程的 DAO 复用该连接。完成后恢复连接状态、解绑并归还连接池。因此 `@Async`、线程池和 `CompletableFuture` 默认不继承事务上下文。
 
-JDBC 场景关键是“拿连接、改 autoCommit、设置隔离级别、绑定到线程、用完还原并归还连接池”。
+## 7. 基础排障清单
 
-``` java
-public class DataSourceTransactionManager extends AbstractPlatformTransactionManager {
-  @Override
-  protected Object doGetTransaction() {
-    DataSourceTransactionObject txObj = new DataSourceTransactionObject();
-    ConnectionHolder conHolder = (ConnectionHolder) TransactionSynchronizationManager.getResource(dataSource);
-    txObj.setConnectionHolder(conHolder, false);
-    return txObj;
-  }
-  @Override
-  protected void doBegin(Object transaction, TransactionDefinition definition) {
-    DataSourceTransactionObject txObj = (DataSourceTransactionObject) transaction;
-    if (txObj.getConnectionHolder() == null || txObj.getConnectionHolder().isSynchronizedWithTransaction() == false) {
-      Connection con = dataSource.getConnection(); // 来自连接池（如 Hikari）
-      txObj.setConnectionHolder(new ConnectionHolder(con), true);
-    }
-    Connection con = txObj.getConnectionHolder().getConnection();
-    Integer previousIsolation = DataSourceUtils.prepareConnectionForTransaction(con, definition); // 设置隔离级别/只读 hint
-    txObj.setPreviousIsolationLevel(previousIsolation);
-    if (con.getAutoCommit()) {
-      txObj.setMustRestoreAutoCommit(true);
-      con.setAutoCommit(false);
-    }
-    // 某些实现会根据 timeout 设置 statement/query timeout 的辅助配置
-    txObj.getConnectionHolder().setTransactionActive(true);
-    TransactionSynchronizationManager.bindResource(dataSource, txObj.getConnectionHolder()); // 绑定 ThreadLocal
-  }
-  @Override
-  protected void doCommit(DefaultTransactionStatus status) {
-    Connection con = ((DataSourceTransactionObject) status.getTransaction()).getConnectionHolder().getConnection();
-    con.commit();
-  }
-  @Override
-  protected void doRollback(DefaultTransactionStatus status) {
-    Connection con = ((DataSourceTransactionObject) status.getTransaction()).getConnectionHolder().getConnection();
-    con.rollback();
-  }
-  @Override
-  protected void doCleanupAfterCompletion(Object transaction) {
-    DataSourceTransactionObject txObj = (DataSourceTransactionObject) transaction;
-    TransactionSynchronizationManager.unbindResource(dataSource);
-    Connection con = txObj.getConnectionHolder().getConnection();
-    if (txObj.isMustRestoreAutoCommit()) con.setAutoCommit(true);
-    DataSourceUtils.resetConnectionAfterTransaction(con, txObj.getPreviousIsolationLevel());
-    DataSourceUtils.releaseConnection(con, dataSource); // 归还连接池
-    txObj.getConnectionHolder().clear();
-  }
-}
-```
+- 事务方法必须经 Spring 代理调用；同类自调用会绕过代理，通常应拆到独立 Bean。
+- 默认对 `RuntimeException` 和 `Error` 回滚；受检异常需要配置 `rollbackFor`，吞掉异常则要明确标记 rollback-only 或重新抛出。
+- 多数据源需指定正确的事务管理器；异步消息或外部副作用应放到提交后回调或 Outbox 中。
 
-面试解释点：同线程共享连接的关键在 bindResource/unbindResource；事务“吃连接”的根因在于 connection 在事务期间一直被线程绑定不归还连接池。
-## **8. 源码骨架 4：TransactionSynchronizationManager（为什么事务与线程强绑定）**
-
-``` java
-public abstract class TransactionSynchronizationManager {
-  private static final ThreadLocal<Map<Object, Object>> resources = ThreadLocal.withInitial(HashMap::new);
-  private static final ThreadLocal<Boolean> synchronizationActive = new ThreadLocal<>();
-  public static void bindResource(Object key, Object value) {
-    resources.get().put(key, value);
-  }
-  public static Object getResource(Object key) {
-    return resources.get().get(key);
-  }
-  public static Object unbindResource(Object key) {
-    return resources.get().remove(key);
-  }
-  public static void initSynchronization() { synchronizationActive.set(true); }
-  public static void clearSynchronization() { synchronizationActive.remove(); }
-}
-```
-
-面试解释点：同线程事务上下文靠 ThreadLocal；因此跨线程（@Async、线程池、CompletableFuture）默认不会“自动传递事务”，这也是很多生产事故的根源。
-## **9. 生产级示例代码：演示“自调用导致事务失效”与正确改法**
-### **9.1 失效示例（同类 this 调用绕过代理）**
-
-``` java
-@Service
-public class OrderService {
-  public void placeOrder() {
-    // this.createOrder(); // 自调用：绕过代理，@Transactional 不生效
-    createOrder();
-  }
-  @Transactional
-  public void createOrder() {
-    // MyBatis update/insert
-  }
-}
-```
-
-### **9.2 正确改法（抽到独立 Bean，保证经过代理）**
-
-``` java
-@Service
-public class OrderService {
-  @Resource private OrderTxService orderTxService;
-  public void placeOrder() { orderTxService.createOrder(); }
-}
-@Service
-public class OrderTxService {
-  @Transactional
-  public void createOrder() { /* DB ops */ }
-}
-```
-
-## **10. 生产级示例代码：演示“异常被吞导致不回滚”与兜底**
-
-``` java
-@Service
-public class PaymentService {
-  @Transactional(rollbackFor = Exception.class)
-  public void pay() throws Exception {
-    try {
-      // 1) 扣款 2) 记账
-      throw new Exception("checked ex");
-    } catch (Exception e) {
-      // 只记录不抛：会提交（危险）
-      // 正确：要么 throw；要么标记回滚
-      TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
-      throw e;
-    }
-  }
-}
-```
-
-## **11. 面试一句话总结（可直接背）**
-  
-Spring 事务通过 AOP 代理在方法边界织入 TransactionInterceptor，拦截器读取 @Transactional 事务属性并调用 AbstractPlatformTransactionManager 的通用控制流处理传播行为与回滚决策；在 JDBC 场景由 DataSourceTransactionManager 获取并配置 Connection（关闭 autocommit、设置隔离/只读等），并借助 TransactionSynchronizationManager 将连接绑定到线程以保证同线程 DAO 共享事务；方法正常提交、异常按规则回滚，最终清理 ThreadLocal 并归还连接池；常见失效原因是自调用绕过代理、非 public、异常规则不匹配/吞异常、多数据源事务管理器错误。
+需要跟源码验证传播、保存点、线程绑定和事务失效的完整推导时，阅读 [[Spring深度解析|《Spring深度解析》]] 的事务章节。

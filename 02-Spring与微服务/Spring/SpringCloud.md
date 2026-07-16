@@ -1,11 +1,11 @@
 # 1. SpringCloud的组件
-Spring Cloud 是一个微服务架构的完整解决方案，提供了多种组件来帮助开发者构建和管理分布式系统。Spring Cloud 主要包含以下 **五大核心组件**：
+Spring Cloud 是一组用于构建分布式系统的项目，而不是一套固定不变的“五大组件”。本节以 Spring Boot 3.x / 较新的 Spring Cloud 版本为默认背景；旧版 Netflix、Sleuth 和注解式 Stream API 会明确标注为历史方案。
 
 > 快速导航  
-> - [Spring Cloud Netflix](#1-spring-cloud-netflix服务注册与发现负载均衡熔断等)  
+> - [服务注册、调用与容错](#1-服务注册调用与容错)
 > - [Spring Cloud Config](#2-spring-cloud-config分布式配置中心)  
 > - [Spring Cloud Gateway](#3-spring-cloud-gatewayapi-网关)  
-> - [Spring Cloud Sleuth](#4-spring-cloud-sleuth分布式链路追踪)  
+> - [Micrometer Tracing（链路追踪）](#4-micrometer-tracing分布式链路追踪)
 > - [Spring Cloud Stream](#5-spring-cloud-stream消息驱动)  
 > - [Spring Cloud LoadBalancer](#2spring-cloud-loadbalancer-详细解析)  
 > - [熔断与限流示例（Sentinel）](#3-熔断和限流示例)  
@@ -13,9 +13,9 @@ Spring Cloud 是一个微服务架构的完整解决方案，提供了多种组�
 
 ---
 
-## **1. Spring Cloud Netflix（服务注册与发现、负载均衡、熔断等）**
+## **1. 服务注册、调用与容错**
 
-Spring Cloud Netflix 是 Spring Cloud 生态中最早的一部分，主要基于 Netflix 开源组件开发，包括以下几个关键组件：
+Eureka 仍可用于服务注册与发现；但 Ribbon、Hystrix 已停止维护，不应作为新项目默认选型。新项目通常使用 Spring Cloud LoadBalancer，并按团队生态选择 Resilience4j 或 Sentinel 实现容错与限流。
 
 ### **(1) Eureka（服务注册与发现）**
 
@@ -48,9 +48,9 @@ Eureka 是 Netflix 提供的服务注册与发现组件，微服务启动时会�
     ```
     
 
-### **(2) Ribbon（客户端负载均衡）**
+### **(2) Spring Cloud LoadBalancer（客户端负载均衡）**
 
-Ribbon 是一个客户端负载均衡组件，它可以自动从 `Eureka Server` 获取可用的服务实例，并进行轮询或其他策略的负载均衡。
+`@LoadBalanced` 的 `RestTemplate` 示例在较新版本中由 Spring Cloud LoadBalancer 提供支持；它从注册中心获取实例并选择一个实例发起请求。
 
 ```java
 @Bean
@@ -60,9 +60,9 @@ public RestTemplate restTemplate() {
 }
 ```
 
-### **(3) Feign（声明式 HTTP 客户端）**
+### **(3) OpenFeign（声明式 HTTP 客户端）**
 
-Feign 结合了 Ribbon 和 Eureka，使得服务调用更加简单。
+OpenFeign 可结合注册发现与 Spring Cloud LoadBalancer 简化服务调用；是否启用负载均衡取决于项目是否引入相应的 LoadBalancer 依赖和配置。
 
 ```java
 @FeignClient(name = "order-service")
@@ -72,9 +72,9 @@ public interface OrderClient {
 }
 ```
 
-### **(4) Hystrix（熔断器）**
+### **(4) 容错：Resilience4j / Sentinel；Hystrix 为历史方案**
 
-Hystrix 通过断路器模式防止服务雪崩。
+Hystrix 的以下代码仅用于阅读旧项目。新项目可用 Resilience4j 实现断路器、重试和限流；使用 Spring Cloud Alibaba + Nacos 时，Sentinel 还提供规则动态配置与热点参数限流。
 
 ```java
 @HystrixCommand(fallbackMethod = "fallback")
@@ -106,16 +106,17 @@ public class ConfigServerApplication {
 
 ### **(2) 客户端使用 Config**
 
-在 `bootstrap.yml` 中配置：
+推荐使用 Config Data API，在 `application.yml` 中配置：
 
 ```yaml
 spring:
   application:
     name: order-service
-  cloud:
-    config:
-      uri: http://localhost:8888
+  config:
+    import: optional:configserver:http://localhost:8888
 ```
+
+`bootstrap.yml` 仍可通过额外的 bootstrap 支持使用，但属于兼容旧项目的方式；不要在同一应用中混用两套加载模型而不明确优先级。
 
 ---
 
@@ -149,35 +150,38 @@ public class ApiGatewayApplication {
 
 ---
 
-## **4. Spring Cloud Sleuth（分布式链路追踪）**
+## **4. Micrometer Tracing（分布式链路追踪）**
 
-Spring Cloud Sleuth 用于微服务的链路追踪，通常结合 Zipkin 或 SkyWalking。
+Spring Boot 3.x 的链路追踪以 Micrometer Tracing 为主，可按所选实现桥接到 Brave 或 OpenTelemetry，并将追踪数据导出到 Zipkin、Tempo 等后端。Spring Cloud Sleuth 3.1 已功能冻结，以下不再把它作为新项目依赖。
 
-### **(1) 引入 Sleuth**
+### **(1) 引入 Tracing 与 Zipkin 导出器**
 
 ```xml
 <dependency>
-    <groupId>org.springframework.cloud</groupId>
-    <artifactId>spring-cloud-starter-sleuth</artifactId>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
 </dependency>
-```
-
-### **(2) 添加 Zipkin 进行可视化**
-
-```xml
 <dependency>
-    <groupId>org.springframework.cloud</groupId>
-    <artifactId>spring-cloud-starter-zipkin</artifactId>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-tracing-bridge-brave</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.zipkin.reporter2</groupId>
+    <artifactId>zipkin-reporter-brave</artifactId>
 </dependency>
 ```
 
 ```yaml
 spring:
+  application:
+    name: order-service
+management:
+  tracing:
+    sampling:
+      probability: 1.0 # 生产环境应根据流量和成本设置采样率
   zipkin:
-    base-url: http://localhost:9411
-  sleuth:
-    sampler:
-      probability: 1.0
+    tracing:
+      endpoint: http://localhost:9411/api/v2/spans
 ```
 
 ---
@@ -189,28 +193,36 @@ Spring Cloud Stream 用于构建基于消息的微服务，支持 Kafka、Rabbit
 ### **(1) 创建消息生产者**
 
 ```java
-@EnableBinding(Source.class)
-public class MessageProducer {
-    @Autowired
-    private MessageChannel output;
+@Configuration
+public class MessageFunctions {
+    @Bean
+    public Supplier<String> producer() {
+        return () -> "hello";
+    }
 
-    public void sendMessage(String msg) {
-        output.send(MessageBuilder.withPayload(msg).build());
+    @Bean
+    public Consumer<String> consumer() {
+        return msg -> System.out.println("Received message: " + msg);
     }
 }
 ```
 
-### **(2) 创建消息消费者**
+### **(2) 配置函数绑定**
 
-```java
-@EnableBinding(Sink.class)
-public class MessageConsumer {
-    @StreamListener(Sink.INPUT)
-    public void receive(String msg) {
-        System.out.println("Received message: " + msg);
-    }
-}
+```yaml
+spring:
+  cloud:
+    function:
+      definition: producer;consumer
+    stream:
+      bindings:
+        producer-out-0:
+          destination: orders
+        consumer-in-0:
+          destination: orders
 ```
+
+较新的 Spring Cloud Stream 使用函数式模型；`@EnableBinding`、`Source`、`Sink`、`@StreamListener` 是 3.x 以前的注解式模型，阅读旧项目时再使用。
 
 ---
 
@@ -218,15 +230,15 @@ public class MessageConsumer {
 
 | 组件                     | 作用                                      |
 | ------------------------ | ----------------------------------------- |
-| **Spring Cloud Netflix** | 提供服务注册、发现、负载均衡、熔断等      |
+| **服务注册、调用与容错** | 注册发现可使用 Eureka/Nacos；负载均衡使用 LoadBalancer；容错按生态选择 Resilience4j 或 Sentinel |
 | **Spring Cloud Config**  | 分布式配置中心，集中管理微服务配置        |
 | **Spring Cloud Gateway** | 统一 API 网关，提供路由、过滤、认证等功能 |
-| **Spring Cloud Sleuth**  | 分布式链路追踪，监控微服务间调用链路      |
+| **Micrometer Tracing**   | 分布式链路追踪，监控微服务间调用链路      |
 | **Spring Cloud Stream**  | 消息驱动，支持 Kafka、RabbitMQ 等消息队列 |
 
 ---
 
-这五大组件构成了 Spring Cloud 微服务架构的核心，能够帮助开发者高效地构建分布式系统。如果你想进一步了解或需要代码示例，欢迎随时提问！🚀
+这些能力可以组合使用，但具体依赖和配置必须与 Spring Boot、Spring Cloud release train、Spring Cloud Alibaba 版本保持兼容。
 
 # **2.Spring Cloud LoadBalancer 详细解析**
 
@@ -564,6 +576,8 @@ public class ProductFallback implements ProductClient {
 如果你希望在 `RestController` 方法上直接加熔断，可以使用 `@SentinelResource`。
 
 ```java
+import com.alibaba.csp.sentinel.slots.block.BlockException;
+
 @RestController
 @RequestMapping("/orders")
 public class OrderController {
@@ -572,14 +586,23 @@ public class OrderController {
     private ProductClient productClient;
 
     @GetMapping("/{id}")
-    @SentinelResource(value = "getOrder", fallback = "fallbackGetOrder")
+    @SentinelResource(
+        value = "getOrder",
+        fallback = "fallbackGetOrder",
+        blockHandler = "handleGetOrderBlocked"
+    )
     public String getOrder(@PathVariable("id") String id) {
         return productClient.getProduct(id);
     }
 
-    // 降级方法
+    // 业务方法抛出异常时的降级方法
     public String fallbackGetOrder(String id, Throwable throwable) {
         return "Order Service is temporarily unavailable. Please try again later.";
+    }
+
+    // 被 Sentinel 限流或熔断时的处理方法
+    public String handleGetOrderBlocked(String id, BlockException exception) {
+        return "Too many requests or the service is temporarily blocked.";
     }
 }
 ```
@@ -657,7 +680,7 @@ spring:
 
 ---
 
-# 4. # **Sentinel 的熔断和降级原理**
+# 4. **Sentinel 的熔断和降级原理**
 
 ## **1. Sentinel 熔断和降级的基本概念**
 
@@ -742,85 +765,13 @@ Sentinel 的降级策略基于 **服务端性能和健康状态**：
 
 ### **（1）Feign + Sentinel 实现熔断降级**
 
-#### **① 在 `pom.xml` 中引入 Sentinel 依赖**
-
-```xml
-<dependency>
-    <groupId>com.alibaba.cloud</groupId>
-    <artifactId>spring-cloud-starter-alibaba-sentinel</artifactId>
-</dependency>
-```
-
-#### **② 在 `application.yml` 中启用 Sentinel**
-
-```yaml
-spring:
-  application:
-    name: order-service
-  cloud:
-    sentinel:
-      transport:
-        dashboard: localhost:8080  # Sentinel 控制台地址
-        port: 8719  # 本地 Sentinel 监听端口
-feign:
-  sentinel:
-    enabled: true  # 启用 Feign + Sentinel 断路器
-```
-
-#### **③ 定义 FeignClient 并绑定降级**
-
-```java
-@FeignClient(name = "product-service", fallback = ProductFallback.class)
-public interface ProductClient {
-    @GetMapping("/products/{id}")
-    String getProduct(@PathVariable("id") String id);
-}
-```
-
-#### **④ 创建 `ProductFallback` 处理熔断后的逻辑**
-
-```java
-@Component
-public class ProductFallback implements ProductClient {
-    @Override
-    public String getProduct(String id) {
-        return "Product service is down. Returning default product.";
-    }
-}
-```
-
-当 `product-service` 无法访问时，Feign 将自动调用 `ProductFallback`。
+依赖、Feign 开关和 `ProductFallback` 的完整代码已在上文「如何在 Spring Cloud Alibaba（Nacos）中使用 Sentinel」给出。本节只强调：`fallback` 用于处理业务调用异常；若需要处理 Sentinel 的限流/熔断拦截，应配置 `blockHandler` 或使用 Sentinel 适配层提供的降级机制。
 
 ---
 
 ### **（2）`@SentinelResource` 实现熔断**
 
-如果不使用 Feign，而是通过 **RestTemplate/WebClient** 调用其他服务，可以使用 `@SentinelResource`。
-
-#### **① 在 Controller 方法上加 `@SentinelResource`**
-
-```java
-@RestController
-@RequestMapping("/orders")
-public class OrderController {
-
-    @Autowired
-    private ProductClient productClient;
-
-    @GetMapping("/{id}")
-    @SentinelResource(value = "getOrder", fallback = "fallbackGetOrder")
-    public String getOrder(@PathVariable("id") String id) {
-        return productClient.getProduct(id);
-    }
-
-    // 降级方法
-    public String fallbackGetOrder(String id, Throwable throwable) {
-        return "Order Service is temporarily unavailable. Please try again later.";
-    }
-}
-```
-
-**`fallback` 方法** 只会在 **业务异常时** 执行，并不会触发限流。
+若不使用 Feign，而是直接保护本地资源或调用逻辑，可以使用上文已经给出的 `@SentinelResource` 示例。`fallback` 用于处理业务方法抛出的异常；限流、熔断等 Sentinel block 异常由 `blockHandler` 处理。两类方法的参数都要与原方法匹配，并在末尾分别增加 `Throwable` 或 `BlockException`。
 
 ---
 
@@ -832,7 +783,7 @@ public class OrderController {
     - 熔断类型：**失败率**
     - 失败率阈值：**50%**
     - 熔断时间：**5 秒**
-3. 触发熔断后，Sentinel 会进入 **Open 状态**，所有请求都会返回 `fallbackGetOrder` 方法的内容。
+3. 触发熔断后，Sentinel 会进入 **Open 状态**；后续请求会被拦截并调用 `handleGetOrderBlocked`。熔断恢复窗口结束后，Sentinel 会放行探测请求以判断是否恢复。
 
 ---
 
@@ -865,6 +816,5 @@ public class OrderController {
 - 注册发现优先用 Spring Cloud LoadBalancer 搭配 Nacos/Eureka，减少 Ribbon 旧依赖。
 - 网关统一走 Spring Cloud Gateway，限流过滤器接 Sentinel。
 - 配置集中放 Config Server/Git，变更后配合 `bus-refresh` 热推送。
-- 链路追踪优先接 Sleuth + Zipkin/SkyWalking，问题定位靠 traceId。
+- 链路追踪优先接 Micrometer Tracing；按实现选择 Brave/OpenTelemetry，并导出到 Zipkin、Tempo 等后端，通过 traceId 关联请求链路。
 - 熔断、限流规则放入 Nacos 持久化，避免节点重启规则丢失。
-
