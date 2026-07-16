@@ -5,15 +5,15 @@
 2. [堆内存空间](#2-堆内存空间)
 3. [垃圾收集算法](#3-垃圾收集算法)
 4. [收集器](#4-收集器)
-5. [收集器详解](#5-收集器详解)
+5. [Java对象创建和内存布局](#5-java对象创建和内存布局)
 6. [类加载和双亲委派](#6-类加载和双亲委派)
-7. [JVM调优参数工具](#7-JVM调优参数工具)
+7. [G1 的 Humongous Region](#7-g1-的-humongous-region为什么大对象反而更需要关注)
 8. [怎么处理大对象](#8-怎么处理大对象)
 9. [STW](#9-STW)
 10. [g1垃圾收集器工作原理详解](#10-g1垃圾收集器工作原理详解)
 11. [栈内存中局部变量线程不安全问题](#11-栈内存中局部变量线程不安全问题)
 12. [JVM调优参数工具及设置方式](#12-JVM调优参数工具及设置方式)
-13. [JVMGC调优指南](#13-JVMGC调优指南)
+13. [JVM GC 诊断与调优指南](#13-jvm-gc-诊断与调优指南)
 
 ## 1. JVM运行时数据区：
 
@@ -134,12 +134,15 @@ Person p = new Person();
 ## 2. 堆内存空间：
 ### 2.1 堆的分代结构
 
+> 以下 Eden、Survivor、对象年龄和 Minor GC 的叙述，描述的是经典分代收集器及 G1 中常见的对象流转模型。它不是 Java 规范对所有收集器的统一承诺；例如低延迟收集器可能采用不同的分代或并发实现，不应机械套用这些区域与触发术语。
+
 - Java 堆通常可以分为*新生代*和*老年代*。
 - 从经典分代视角看，新生代一般由 `Eden + Survivor From + Survivor To` 组成，常见比例是 `8:1:1`。
 - 经验上常说新生代和老年代比例约为 `1:2`，但这只是常见配置思路，不是绝对固定规则。
 
 ### 2.2 Minor GC 的核心流程
 
+- 在经典分代收集器中常称为 `Minor GC`；G1 的对应日志和术语通常是 `Young GC`，其内部以 Region 而非连续的新生代空间组织。
 - 大多数新创建的对象会先进入 *Eden*。
 - 当 Eden 空间不足时，会触发一次 *Minor GC*，主要回收新生代。
 - Minor GC 的典型流程是：
@@ -165,7 +168,8 @@ Person p = new Person();
 - 如果 Eden 空间不足，虚拟机会尝试通过 Minor GC 回收空间。
 
 #### 2.4.2 大对象可能直接进入老年代
-- 某些大对象为了避免在 Eden 和 Survivor 之间进行大量复制，可能会直接进入老年代。
+- 在 Parallel/CMS 等经典收集器中，某些大对象为了避免在 Eden 和 Survivor 之间进行大量复制，可能会直接进入老年代。
+- G1 对达到 Humongous 阈值的对象使用连续 Region，规则见[第 7 节](#7-g1-的-humongous-region为什么大对象反而更需要关注)；不要把“直接进入老年代”当作所有收集器的统一规则。
 - 典型场景是大数组、超长字符串或需要连续大块内存的对象。
 
 #### 2.4.3 长期存活对象会晋升到老年代
@@ -361,27 +365,21 @@ Java 的收集器可以按三个维度去理解：*吞吐量*、*停顿时间*�
 - 每个 Region 可以在逻辑上扮演 Eden、Survivor、Old 等角色。
 - G1 会优先回收“收益最高”的 Region，因此叫 *Garbage-First*。
 
-#### 4.4.3 G1 的执行流程
-- 初始标记 `Initial Mark`：`STW`，先标记和 GC Roots 直接关联的对象。这个阶段通常会伴随一次 Young GC，这样可以顺带完成初始标记，减少额外停顿成本。
-- 并发标记 `Concurrent Mark`：和用户线程并发执行。从初始标记找到的对象继续向下遍历整张引用图，找出所有可达的存活对象，并统计各个 Region 的存活情况和回收收益。
-- 最终标记 `Remark`：`STW`，修正并发标记期间因为用户线程继续运行而发生变化的引用关系，保证存活对象标记结果和 Region 统计结果尽可能准确。
-- 筛选回收 / 混合回收 `Mixed GC`：根据前面统计出来的 Region 回收收益，优先选择垃圾比例高、价值大的 Region 组成回收集合。除了回收年轻代 Region，还会分批回收一部分老年代 Region，并在回收过程中完成对象复制和空间整理。需要注意，Mixed GC 不是一次性全量回收整个老年代，而是分批回收一部分老年代 Region。
+#### 4.4.3 回收方式概览
+- `Young GC` 回收年轻代相关 Region；存活对象会复制到 Survivor 或 Old Region。
+- 并发标记完成后，`Mixed GC` 会在 Young GC 的基础上分批回收一部分回收收益高的老年代 Region，而不是一次性回收整个老年代。
+- 初始标记、并发标记、最终标记、筛选回收及其 STW 边界见[第 10 节](#10-g1垃圾收集器工作原理详解)。
 
-#### 4.4.4 什么是 Mixed GC
-- `Young GC` 只回收年轻代相关 Region。
-- `Mixed GC` 不仅回收年轻代 Region，还会顺带回收一部分“垃圾比例高、回收收益大”的老年代 Region。
-- 这就是 G1 比传统收集器更灵活的地方：不是等老年代彻底顶满再一次性重扫，而是*分批回收老年代*。
-
-#### 4.4.5 G1 的优点
-- *停顿更可预测*：可以通过 `-XX:MaxGCPauseMillis` 设定目标停顿时间。
+#### 4.4.4 G1 的优点
+- *停顿更可预测*：可以通过 `-XX:MaxGCPauseMillis` 设定停顿目标，G1 会据此调整回收工作量，但这不是硬性上限。
 - *碎片少*：G1 在回收时会做整理和复制，整体碎片问题比 CMS 更轻。
 - *适合大堆*：面对中大内存服务更稳定。
 
-#### 4.4.6 G1 的代价
+#### 4.4.5 G1 的代价
 - 结构更复杂，维护成本和理解成本更高。
 - 为了实现停顿预测，需要额外维护 Region、Remembered Set 等结构，运行时开销也更高。
 
-#### 4.4.7 G1 的适用场景
+#### 4.4.6 G1 的适用场景
 - 大内存服务
 - 延迟敏感的在线系统
 - 希望在吞吐和停顿之间取得平衡的现代 Java 服务
@@ -453,9 +451,12 @@ Java 的收集器可以按三个维度去理解：*吞吐量*、*停顿时间*�
 ## 5. Java对象创建和内存布局
 
 ### 5.1 HotSpot 中 Java 对象的内存布局
+
+> 这里描述的是 HotSpot 常见实现的概念模型，不是 Java 规范规定的固定二进制布局。对象头字段、大小和对齐会随 JDK 版本、64 位指针压缩及 Compact Object Headers 等实现选项变化；排查精确大小时应以目标 JDK 的工具输出为准。
+
 1. 对象头（Object Header）：
-	- `Mark Word`：用于存储对象运行时数据，例如哈希码、锁状态、GC 年龄等。
-	- `Klass Pointer`：指向类元数据，用于确定这个对象到底属于什么类型。
+	- `Mark Word`：在常见 HotSpot 布局中承载哈希码、锁相关状态、GC 年龄等运行时数据。
+	- `Klass Pointer`：在常见未启用紧凑对象头的布局中指向类元数据，用于确定对象类型。
 2. 实例数据（Instance Data）：
 	- 存储对象真正的字段内容，也就是程序里定义的成员变量。
 3. 对齐填充（Padding）：
@@ -485,8 +486,7 @@ Java 的收集器可以按三个维度去理解：*吞吐量*、*停顿时间*�
 	- 对象分配到的内存通常会先被清零，以保证字段默认值语义成立，比如 `0`、`null`、`false`。
 
 6. 设置对象头：
-	- 写入 `Mark Word`
-	- 写入 `Klass Pointer`
+	- 按当前 HotSpot 布局写入对象的运行时头信息；常见实现可理解为 `Mark Word` 和类型信息。
 	- 如果是数组，还要写入数组长度
 
 7. 执行构造方法：
@@ -594,58 +594,30 @@ public class Demo {
 - 好处主要是：避免重复加载、保证安全性、稳定类加载边界
 - 打破双亲委派的典型场景：Tomcat、OSGi、SPI
 
-## 7. 为什么 G1 GC 使用 Humongous Region 来管理大对象？这种设计如何优化大对象的管理？
-### 7.1 为什么 G1 使用 Humongous Region？
+## 7. G1 的 Humongous Region：为什么大对象反而更需要关注？
 
-1. 分区化管理：
-	- G1 GC 将堆划分为多个固定大小的 *Region*（通常为 1MB 或 2MB）。
-	- 每个 Region 可以充当 *Eden 区*、*Survivor 区* 或 *Old 区*。
-	- 大对象（*Humongous Object*）是指其大小超过单个 Region 的容量。
-2. Humongous Region 的设计：
-	- 为了管理大对象，G1 引入了 *Humongous Region*。
-	- 一个大对象会占用连续的多个 Humongous Region（类似“超级块”），并且这些 Region 会被标记为 *Humongous*。
-	- 这避免了大对象分布在老年代时可能造成的内存碎片问题。
-3. 减少 GC 次数：
-	- 因为 Humongous Region 是独立管理的，当大对象生命周期结束时，只需要回收这些 Region，而不是遍历整个堆。
+G1 的 Region 划分和完整回收流程已在[第 10 节](#10-g1垃圾收集器工作原理详解)说明。本节只聚焦一个容易误解的边界：Humongous Region 并不是“G1 自动处理好大对象”的保证，而是一种有额外约束的分配路径。
 
-### 7.2 G1 的大对象管理机制
+### 7.1 什么对象会走 Humongous 分配
 
-1. 大对象直接进入老年代：
-	- 大对象通常会直接分配到老年代的 Humongous Region，避免频繁的 Minor GC。
-2. 回收 Humongous Region：
-	- G1 的垃圾回收基于 **Region 的回收成本**，如果 Humongous Region 的回收收益较高（如大对象已无引用），G1 会优先回收这些 Region。
-3. 避免内存碎片：
-	- 传统老年代的标记-清除算法容易导致内存碎片问题，而 Humongous Region 通过连续的分配和回收策略，显著降低了碎片化的可能性。
+- 当对象大小**达到或超过一个 Region 容量的 50%** 时，G1 会把它作为 Humongous Object 处理。
+- 该对象需要占用一组**连续**的 Region，首个 Region 为 Humongous Start，其余为 Humongous Continuation；这组 Region 逻辑上计入老年代。
+- 因此，“大对象”是相对 Region 大小而言的。同一个数组在不同 `G1HeapRegionSize` 设置下，是否属于 Humongous Object 可能不同。
 
-### 7.3 优化大对象分配的建议
+### 7.2 这种设计解决了什么，又带来什么代价
 
-1. 调整 Region 大小：
-	- 使用 `-XX:G1HeapRegionSize` 参数调整 Region 大小（1MB 到 32MB）。
-		```bash
-		-XX:G1HeapRegionSize=2M
-		```
-	- Region 大小越大，大对象就越少占用多个 Region，减少内存管理开销。
+| 角度 | 说明 |
+| --- | --- |
+| 避免复制成本 | 不让超大对象在 Young GC 中反复复制，减少复制和晋升压力。 |
+| 连续空间要求 | 分配时必须找到足够连续的 Region；即使总空闲空间充足，也可能因缺少连续 Region 而失败。 |
+| 回收时机 | 已死亡的 Humongous Object 可在并发标记后的清理阶段被尽早回收；仍存活的对象通常要等后续标记周期或 Full GC，不能假设一次 Young GC 就会回收。 |
+| 内存利用率 | 最后一个 Region 未被对象占满的部分会被浪费，短时间大量创建此类对象还可能带来堆碎片和 Full GC 风险。 |
 
-2. 监控和分析大对象：
-	- 启用 GC 日志，查看 Humongous Region 的分配和回收情况：
-		```bash
-		-Xlog:gc+humongous=debug
-		```
-		
-3. 代码层面的优化：
-	- 避免分配不必要的大对象，例如：
-		- 优化大数组的初始化和使用。
-		- 使用合适的数据结构（如 `ArrayList` 代替 `HashMap`，根据需求）。
-	- 分块处理大数据，减少单次分配的内存量。
+### 7.3 排查与优化顺序
 
-### 7.4 G1 的 Humongous Region 与传统老年代的对比
-
-| 特性           | 传统老年代                   | G1 的 Humongous Region             |
-| -------------- | ---------------------------- | ---------------------------------- |
-| 大对象存储位置 | 老年代中的内存块             | 独立的连续 Humongous Region        |
-| 内存碎片问题   | 容易产生内存碎片             | 减少内存碎片，连续分配和回收       |
-| GC 回收策略    | 标记-清除或标记-整理         | 按收益优先回收 Humongous Region    |
-| 调优复杂度     | 难以控制大对象对老年代的影响 | 通过 Region 大小和 G1 参数灵活调优 |
+1. **先确认事实**：在 JDK 9+ 使用 `-Xlog:gc+humongous=debug`，结合 GC 日志中的 Humongous Region 数量、老年代趋势和分配失败事件判断是否为根因。
+2. **优先改分配行为**：避免一次性构造超大数组、字符串、查询结果或字节缓冲；采用分页、流式处理、分块编解码或限制并发。
+3. **最后再评估 Region 大小**：`-XX:G1HeapRegionSize` 会同时影响 Humongous 阈值、Remembered Set 和回收粒度，不能只为避开阈值而盲调，必须压测并比较 GC 日志。
 
 ## 8. 怎么处理大对象
 ### 8.1 分解大对象
@@ -702,72 +674,52 @@ public class Demo {
 
 ### 8.3 内存池优化
 
-1. 对象复用：
-	- 使用对象池管理大对象，减少频繁创建和销毁大对象的开销。
-	- 示例：大对象池
-		```java
-		public class LargeObjectPool {
-			private final Queue<byte[]> pool = new LinkedList<>();
-		
-			public byte[] borrow(int size) {
-				if (!pool.isEmpty()) {
-					return pool.poll();
-				}
-				return new byte[size]; // 分配新的大对象
-			}
-		
-			public void release(byte[] object) {
-				pool.offer(object);
-			}
-		}
-		```
-		
-2. 预分配内存：
-	- 在程序启动时，预分配部分大对象的内存，减少运行时频繁的内存分配。
+对象池不是默认优化，尤其不应把大对象放入无边界池中：它会把可回收的短生命周期对象变成长期存活对象，反而抬高老年代占用。
+
+只有在性能剖析已经证明“分配、清零或 GC”是瓶颈，并且对象有明确借还边界时，才考虑复用。此时至少应满足：
+
+- 池按对象大小分桶，并同时限制**每个桶的数量和总字节数**。
+- 通过 `try/finally` 或框架生命周期保证归还；复用前校验容量，敏感数据按需清理。
+- 压测对比池化前后的分配率、存活集、P99 延迟和 CPU；若收益不明显，优先保持普通分配。
+
+预分配同样只是把分配成本前移，并没有减少所需内存；只有容量确实稳定、启动时就需要这些缓冲区且上限可控时才适用。
 
 ### 8.4 数据分布与外部存储
 
 1. 分布式处理：
-	- 将大对象的处理分布到多个节点中，利用分布式系统的内存和计算资源。
-	- 示例：将大对象切片后分发到消息队列中供不同节点处理。
+	- 仅在任务天然可拆分且可以承受序列化、网络与一致性成本时，将数据切片后分发到多个节点处理。
+	- 分布式化不是解决单机大对象的默认手段；先限制单次读取量和并发量。
 2. 外部存储：
-	- 将大对象存储在磁盘、数据库或分布式存储系统中，只在需要时加载到内存中。
-	- 示例：使用 Redis、HBase 等分布式存储系统来保存大对象。
+	- 将大对象存储在磁盘、数据库或对象存储中，并通过分页、流式读取和有界缓存控制进入 JVM 堆的数据量。
+	- 即使使用 Redis、HBase 等外部系统，客户端反序列化和本地缓存仍可能制造大对象，边界同样要受控。
 
 ### 8.5 使用更高效的数据结构
 
 1. 压缩存储：
-	- 对大对象的数据进行压缩，例如对字符串或文件使用 GZIP 压缩后再存储。
-	- 示例：使用 ByteBuffer 存储高效的二进制数据。
+	- 对传输或冷数据评估压缩；压缩能降低容量，但会增加 CPU、延迟和解压时的临时内存，需用真实数据验证。
+	- `ByteBuffer` 只是容器选择，不天然更省内存；堆外缓冲还会占用直接内存并需要单独监控。
 2. 精简数据结构：
-	- 优化大对象的字段，移除不必要的数据。
+	- 根据访问模式选择数据结构，移除不必要字段，避免为少量访问场景构建完整对象图。
 
 ### 8.6 G1 GC 调优的配合
 
-1. 优化 Region 大小：
-	- 调整 `-XX:G1HeapRegionSize`，避免大对象占用过多 Region。
-		```bash
-		-XX:G1HeapRegionSize=2M
-		```
-		
-2. 监控 Humongous Region：
-	- 通过 GC 日志或工具（如 VisualVM）监控大对象在 Humongous Region 的分配情况，动态调整参数。
+如果确认使用 G1，先按[第 7 节](#7-g1-的-humongous-region为什么大对象反而更需要关注)检查 Humongous 分配和连续 Region 压力。只有在分配行为已经优化、GC 日志仍证明 Region 配置不合适时，才通过压测评估 `-XX:G1HeapRegionSize`；不要为绕过 Humongous 阈值而盲调。
 
 ### 8.7 总结
 
 在频繁分配大对象的场景中，可以从以下几个方面优化：
 1. 减少单次分配的内存量： 通过分块处理或分段存储优化大对象的分配方式。
 2. 控制分配频率： 使用限流或调度机制，减少大对象的并发分配。
-3. 提高内存复用率： 使用对象池或预分配机制复用大对象。
+3. 谨慎复用：只有在有性能证据、生命周期清晰且池容量有界时，才考虑对象池或预分配。
 4. 引入分布式和外部存储： 减少对 JVM 堆内存的依赖。
-5. 结合 G1 GC 调优： 通过调整 Region 大小和参数，减少大对象对垃圾回收的影响。
+5. 结合 G1 诊断：通过 GC 日志确认 Humongous Region 是否为根因，再决定是否调整 Region 大小。
 
 ## 9. STW
 ### 9.1 什么是 Stop-The-World（STW）？
 **STW** 是指 JVM 在执行某些操作时，会暂停所有应用线程（用户线程），只允许 GC 线程或其他 JVM 内部线程运行。这种暂停是为了确保内存一致性和安全性。
 - 本质： STW 是由 JVM 自动触发的，开发者无法直接控制，但可以通过调优来减少其影响。
 - 影响：
-	- STW 会导致应用程序暂停，用户无法感知程序运行。
+	- STW 会导致应用程序暂停，用户会感知到请求停顿或超时。
 	- 在延迟敏感的应用（如 Web 服务）中，过长的 STW 会显著影响用户体验。
 
 ### 9.2 哪些场景会触发 STW？
@@ -782,14 +734,12 @@ public class Demo {
 3. 并发垃圾收集器的标记阶段：
 	- 如 CMS GC 的初始标记和重新标记阶段，或 G1 GC 的初始标记和最终标记阶段。
 
-#### 9.2.2 类加载
-- 加载类或静态变量初始化时可能触发 STW，尤其是当大量类在运行时动态加载时（如反射操作）。
+#### 9.2.2 到达安全点（Safepoint）
+- GC 以外，JVM 为了执行某些全局 VM 操作也会让 Java 线程到达安全点；具体是否形成可感知停顿取决于操作和 JVM 实现。
+- 类加载、锁竞争、死锁本身并不等同于 STW：它们会阻塞相关线程或造成业务卡顿，但不能据此诊断为“所有应用线程被 JVM 暂停”。
 
-#### 9.2.3 内存快照
-- JVM 生成堆快照（Heap Dump）或线程快照（Thread Dump）时，暂停所有线程以确保一致性。
-
-#### 9.2.4 锁竞争
-- 在 JVM 内部出现死锁或高竞争时，也可能引发类似 STW 的暂停行为。
+#### 9.2.3 诊断操作
+- 部分堆转储、线程转储或诊断命令可能需要安全点，因工具、JDK 版本和命令实现不同而异。线上应在可控流量下执行，并用 safepoint 日志确认实际暂停原因。
 
 ### 9.3 如何优化 STW 的影响？
 
@@ -797,8 +747,10 @@ public class Demo {
 
 1. CMS GC（Concurrent Mark-Sweep）：
 	- 减少老年代 GC 的停顿时间，但可能产生内存碎片。
+	- 仅作为 JDK 8 等存量环境知识：CMS 已在 JDK 9 被废弃，并在 JDK 14 移除；新版本不能再用其启动参数。
 	- 启用参数：
 		```bash
+		# 仅 JDK 8 等仍支持 CMS 的环境
 		-XX:+UseConcMarkSweepGC
 		```
 		
@@ -811,7 +763,7 @@ public class Demo {
 		```
 		
 3. ZGC（Z Garbage Collector）：
-	- 极低延迟，STW 时间通常小于 10ms，适合延迟敏感的大内存应用。
+	- 以极低停顿为目标，暂停时间与堆大小弱相关；实际暂停仍取决于 JDK、CPU、负载和运行环境，不能把某个毫秒数当作保证。
 	- 启用参数：
 		```bash
 		-XX:+UseZGC
@@ -820,13 +772,13 @@ public class Demo {
 #### 9.3.2 调整内存分配
 
 1. 增大堆内存：
-	- 减少 GC 的频率，延长 Minor GC 和 Major GC 的触发间隔：
+	- 可能减少 GC 的频率，但也可能增加单次回收或转储的成本；需要结合 GC 日志验证：
 		```bash
 		-Xms1G -Xmx2G
 		```
 		
 2. 调整新生代和老年代比例：
-	- 增大新生代（`-XX:NewRatio`）或 Survivor 区大小（`-XX:SurvivorRatio`），减少晋升到老年代的对象数量。
+	- 这些参数主要适用于传统分代收集器。G1 会自适应管理年轻代，除非已由日志证实问题，否则不要机械固定新生代大小或比例。
 3. 减少对象分配频率：
 	- 优化代码，减少无用对象的创建，避免临时对象大量堆积。
 
@@ -835,7 +787,7 @@ public class Demo {
 1. 降低 Full GC 触发概率：
 	- 提高老年代使用率的阈值（CMS 中可用 `-XX:CMSInitiatingOccupancyFraction` 参数）。
 2. 优化大对象分配：
-	- 设置大对象直接进入老年代，避免新生代频繁触发 GC：
+	- 对 Parallel/CMS 等经典收集器，可评估大对象直接进入老年代；这会增加老年代压力，且 `PretenureSizeThreshold` 不适用于 G1：
 		```bash
 		-XX:PretenureSizeThreshold=1M
 		```
@@ -862,7 +814,7 @@ public class Demo {
 	3. 监控应用内存使用情况，优化代码中的对象分配逻辑。
 
 ## 10. G1垃圾收集器工作原理详解
-G1（Garbage First）收集器是 Java 的一种垃圾收集器，旨在提供高效的垃圾回收性能，特别是在大内存和低延迟场景下使用。它的设计目标是替代 CMS 收集器，减少垃圾回收的停顿时间（STW，Stop-The-World）并提高整体吞吐量。
+G1（Garbage First）以可预测的停顿目标为设计重点：它将堆划分为 Region，并在有限暂停预算内优先选择回收收益高的 Region。它适合在吞吐量与延迟之间取得平衡，但 `MaxGCPauseMillis` 是目标，不是硬性保证。
 
 ### 10.1 G1 收集器的内存划分
 G1 将堆划分为多个大小固定的 Region，每个 Region 是一块连续的内存空间。所有的内存都分布在这些 Region 中，而不再严格区分 Eden 区、Survivor 区和老年代。
@@ -871,11 +823,11 @@ G1 将堆划分为多个大小固定的 Region，每个 Region 是一块连续�
 	- Eden 区：分配新对象的区域。
 	- Survivor 区：存放从 Eden 区晋升的存活对象。
 	- 老年代区：存放生命周期较长的对象。
-	- Humongous 区：存放大对象（超过 Region 大小 50% 的对象）。
+	- Humongous 区：存放大小达到或超过 Region 容量 50% 的对象；它们需要连续 Region，详细影响见[第 7 节](#7-g1-的-humongous-region为什么大对象反而更需要关注)。
 
 ### 10.2 G1 的垃圾回收目标
-G1 的核心目标是 低延迟垃圾回收，其主要机制是通过增量式垃圾回收和优先处理垃圾最多的区域（Region）来达到目标。
-- 设定停顿时间目标： 用户可以通过参数配置期望的垃圾回收最大停顿时间（如 `-XX:MaxGCPauseMillis=200`），G1 会尝试在此时间内完成垃圾回收。
+G1 的核心目标是以停顿目标约束一次回收的工作量，而不是保证每次都不超过该时间。
+- 用户可通过 `-XX:MaxGCPauseMillis=200` 设置目标；G1 会据此估算 Young / Mixed GC 的回收集合和年轻代大小，实际暂停仍受存活对象量、CPU 资源和负载影响。
 
 ### 10.3 G1 的工作流程
 G1 的工作流程可以分为以下几个阶段：
@@ -888,39 +840,39 @@ G1 的工作流程可以分为以下几个阶段：
 	- 存活对象较少，复制效率高。
 
 #### 10.3.2 并发标记（Concurrent Marking）
-并发标记是 G1 的老年代回收机制，类似 CMS 收集器的标记阶段，用于标记老年代的存活对象。
+并发标记用于建立全堆存活对象图，并统计老年代 Region 的可回收空间，为后续 Mixed GC 选择回收集合。
 
 1. 初始标记阶段（Initial Marking）：
 	- 标记从 GC Root 可达的对象。
 	- 发生在 Young GC 时，伴随一次短暂的 STW。
 2. 并发标记阶段（Concurrent Marking）：
-	- 在应用线程运行的同时，遍历老年代的 Region 并标记存活对象。
-	- 此阶段不会暂停应用线程。
+	- 在应用线程运行的同时遍历对象图、标记存活对象。
+	- 该阶段主体与应用线程并发，但仍会有初始标记和最终标记等短暂停顿阶段。
 3. 最终标记阶段（Final Marking）：
 	- 完成剩余的标记工作，并计算各个 Region 的垃圾比例。
 	- 伴随一次短暂的 STW。
 4. 筛选回收阶段（Cleanup）：
-	- 根据标记结果，优先回收垃圾最多的 Region。
-	- 更新 Region 状态，可能需要短暂的停顿。
+	- 整理标记结果和 Region 回收收益；完全空闲的 Region 可以被释放。
+	- 大多数包含存活对象的老年代 Region 会留给后续 Mixed GC 通过对象复制来回收，而不是在此阶段直接清除。
 
 #### 10.3.3 混合垃圾回收（Mixed GC）
 
-- 触发条件：老年代垃圾过多或堆内存即将耗尽时。
+- 触发条件：一次并发标记周期完成后，G1 根据老年代占用和回收收益决定是否进入 Mixed GC；不应简单理解为“老年代快满才触发”。
 - 回收内容：同时回收年轻代（Eden 和 Survivor）和部分老年代的 Region。
 - 特点：
 	- 根据并发标记的结果，优先选择垃圾比例最高的老年代 Region。
-	- 停顿时间受目标停顿时间控制（`MaxGCPauseMillis`）。
+	- G1 会以 `MaxGCPauseMillis` 作为停顿目标选择回收集合，但实际暂停可能超出目标。
 
 #### 10.3.4 Humongous 区回收
 
-- Humongous 区用于存放超大对象（如大数组、大字符串）。
-- 若 Humongous 区占用过多，也可能触发 Full GC。
+- Humongous Object 不会在普通 Young GC 中搬迁；如果对象在并发标记后被确认死亡，G1 可以在清理阶段尽早释放其 Region。
+- 大量 Humongous 分配会消耗连续 Region，可能触发并发标记、导致分配失败，极端情况下才退化为 Full GC。排查与治理见[第 7 节](#7-g1-的-humongous-region为什么大对象反而更需要关注)。
 
 #### 10.3.5 Full GC
 
 - 触发条件：当 G1 无法满足内存分配需求时。
 - 回收内容：对整个堆进行垃圾回收。
-- 特点：通常由单线程完成，停顿时间较长，应尽量避免。
+- 特点：这是严重的退化路径，会产生长时间 STW；实现是否并行及效果取决于 JDK 版本和运行环境，应通过日志确认，而不是假设为单线程。
 
 ### 10.4 G1 的优先级机制
 
@@ -942,7 +894,7 @@ G1 的名字 Garbage First 反映了它的核心思想：优先回收垃圾最�
 - 优点：
 	- 低延迟：通过分阶段回收和控制 STW 时间，实现较低的垃圾回收延迟。
 	- 空间整合：采用标记-整理算法，减少内存碎片问题。
-	- 高吞吐量：优先回收垃圾最多的 Region，提高回收效率。
+	- 回收收益优先：在暂停预算内优先选择收益高的 Region，提升空间回收的可控性。
 - 缺点：
 	- 复杂性：G1 的内部实现复杂，调优难度较高。
 	- 吞吐量可能低于 Parallel GC：在某些高吞吐量场景下，可能不如 Parallel GC 高效。
@@ -1107,32 +1059,16 @@ java -Xms512m -Xmx2g -XX:+UseG1GC -jar myapp.jar
 export JAVA_OPTS="-Xms512m -Xmx2g -XX:+UseG1GC"
 ```
 
-### 12.3 在 `application.yml` 或 `application.properties`（Spring Boot）中配置
+### 12.3 Spring Boot 的 JVM 参数放在哪里
 
-```yaml
-server:
-  port: 8080
-  tomcat:
-  max-threads: 200
-  accept-count: 100
+`application.yml` / `application.properties` 是应用配置文件，不能直接设置 JVM 启动参数；在其中写入 `JAVA_OPTS` 不会让 JVM 生效。
 
-spring:
-  jpa:
-    properties:
-      hibernate:
-        jdbc:
-          batch_size: 30
-  datasource:
-    url: jdbc:mysql://localhost:3306/mydb
-    username: root
-    password: password
-    hikari:
-      maximum-pool-size: 20
-```
+- 本地开发可在 IDE 的 Run Configuration 中设置 VM options。
+- 可执行 JAR、容器或进程管理器中，应在启动命令、环境变量（由启动脚本读取）或部署清单中传入。例如：
 
-对于 Spring Boot，可以在 `application.properties` 配置：
-```properties
-JAVA_OPTS=-Xms512m -Xmx2g -XX:+UseG1GC
+```bash
+export JAVA_OPTS="-Xms512m -Xmx2g -XX:+UseG1GC"
+java $JAVA_OPTS -jar myapp.jar
 ```
 
 ### 12.4 堆内存参数
@@ -1140,13 +1076,13 @@ JAVA_OPTS=-Xms512m -Xmx2g -XX:+UseG1GC
 | ----------------------------- | ----------------------------------------------------------------------------------- |
 | `-Xms<size>`                  | 设置 初始堆大小（如 `-Xms512m` 表示 512MB）                                         |
 | `-Xmx<size>`                  | 设置 最大堆大小（如 `-Xmx4g` 表示 4GB）                                             |
-| `-Xmn<size>`                  | 设置 新生代大小（如 `-Xmn256m` 表示 256MB）                                         |
-| `-XX:NewRatio=<n>`            | 设置 新生代与老年代的比例（如 `-XX:NewRatio=2` 表示 新生代:老年代=1:2）             |
-| `-XX:SurvivorRatio=<n>`       | 设置 Eden 与 Survivor 区的比例（如 `-XX:SurvivorRatio=8` 表示 Eden:Survivor=8:1:1） |
+| `-Xmn<size>`                  | 固定新生代大小；主要用于经典分代收集器，通常不建议与 `NewRatio` 同时设置           |
+| `-XX:NewRatio=<n>`            | 设置新生代与老年代比例；主要用于经典分代收集器，`2` 表示约 `1:2`                  |
+| `-XX:SurvivorRatio=<n>`       | 设置 Eden 与单个 Survivor 的比例；主要用于经典分代收集器，`8` 常表示约 `8:1:1`     |
 | `-XX:MaxMetaspaceSize=<size>` | 限制 元空间（Metaspace） 的最大大小（如 `-XX:MaxMetaspaceSize=256m`）               |
-示例：
+示例（仅用于经典分代收集器；G1 应先保留其自适应策略）：
 ```bash
-java -Xms1g -Xmx4g -Xmn512m -XX:NewRatio=2 -XX:SurvivorRatio=8 -jar myapp.jar
+java -Xms1g -Xmx4g -Xmn512m -XX:SurvivorRatio=8 -jar myapp.jar
 ```
 
 ### 12.5 线程栈和方法区
@@ -1154,10 +1090,10 @@ java -Xms1g -Xmx4g -Xmn512m -XX:NewRatio=2 -XX:SurvivorRatio=8 -jar myapp.jar
 | -------------------------------- | --------------------------------------------- |
 | `-Xss<size>`                     | 设置 每个线程栈的大小（如 `-Xss1m` 表示 1MB） |
 | `-XX:MaxDirectMemorySize=<size>` | 设置 最大直接内存（NIO 相关）                 |
-| `-XX:+UseCompressedOops`         | 开启 指针压缩（减少 64-bit JVM 内存占用）     |
+| `-XX:+UseCompressedOops`         | 请求使用压缩对象指针；HotSpot 通常会按堆大小和地址空间自动决策，不应默认显式设置 |
 示例：
 ```bash
-java -Xss512k -XX:MaxDirectMemorySize=256m -XX:+UseCompressedOops -jar myapp.jar
+java -Xss512k -XX:MaxDirectMemorySize=256m -jar myapp.jar
 ```
 
 ### 12.6 GC（垃圾回收）相关参数
@@ -1166,9 +1102,9 @@ java -Xss512k -XX:MaxDirectMemorySize=256m -XX:+UseCompressedOops -jar myapp.jar
 | ------------------------- | ------------------------------------- |
 | `-XX:+UseSerialGC`        | 使用 Serial GC（适合小堆内存 <1GB）   |
 | `-XX:+UseParallelGC`      | 使用 Parallel GC（吞吐量优先）        |
-| `-XX:+UseConcMarkSweepGC` | 使用 CMS GC（低延迟场景）             |
-| `-XX:+UseG1GC`            | 使用 G1 GC（默认，适合大内存）        |
-| `-XX:+UseZGC`             | 使用 ZGC（低停顿，适合超大内存 8GB+） |
+| `-XX:+UseConcMarkSweepGC` | 使用 CMS GC；仅 JDK 8 等存量环境可用，JDK 14 起已移除 |
+| `-XX:+UseG1GC`            | 使用 G1 GC；HotSpot 从 JDK 9 起默认采用 G1 |
+| `-XX:+UseZGC`             | 使用 ZGC；适用于低停顿目标，是否合适取决于延迟目标、JDK 和压测结果 |
 示例：
 ```bash
 java -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -jar myapp.jar
@@ -1177,14 +1113,18 @@ java -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -jar myapp.jar
 #### 12.6.2 GC 相关参数
 | 参数                          | 作用                          |
 | ----------------------------- | ----------------------------- |
-| `-XX:MaxGCPauseMillis=<n>`    | 设置 最大 GC 停顿时间（毫秒） |
+| `-XX:MaxGCPauseMillis=<n>`    | 设置 GC 停顿时间目标（毫秒），不是最大值或 SLA 保证 |
 | `-XX:G1HeapRegionSize=<size>` | 设置 G1 GC 的 Region 大小     |
-| `-XX:+PrintGCDetails`         | 启用 GC 详细日志              |
-| `-Xlog:gc*`                   | 开启 GC 日志（JDK 9+）        |
+| `-XX:+PrintGCDetails`         | JDK 8 的传统 GC 详细日志开关  |
+| `-Xlog:gc*`                   | JDK 9+ 的统一日志配置         |
 
-示例（开启 GC 日志）：
+示例（两种日志体系不能混用）：
 ```bash
-java -Xlog:gc* -XX:+PrintGCDetails -XX:+PrintGCDateStamps -jar myapp.jar
+# JDK 8
+java -XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:gc.log -jar myapp.jar
+
+# JDK 9+
+java -Xlog:gc*:file=gc.log:time,uptime,level,tags -jar myapp.jar
 ```
 
 ### 12.7 监控与调试参数
@@ -1202,6 +1142,8 @@ java -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/heapdump.hprof -jar m
 ```
 
 ### 12.8 典型 JVM 调优方案
+
+下面的命令只说明配置形态，不是可直接复制的生产基线。堆大小、收集器和停顿目标应由容器内存限制、延迟 SLO、分配速率及 GC 日志共同决定；每次变更只调整一个假设，并保留变更前后的对比数据。
 
 #### 12.8.1 低延迟应用（如 Web 服务）
 适用于 **Spring Boot、Tomcat、Netty** 等：
@@ -1234,87 +1176,60 @@ java -Xms512m -Xmx1g -XX:+UseSerialGC -jar myapp.jar
 - Java Mission Control (JMC)：高级性能调优工具
 
 
-## 13. JVMGC调优指南
+## 13. JVM GC 诊断与调优指南
 
-### 13.1 频繁 Full GC
-- 症状：几秒一次 Full GC、RT 大幅抖动、业务常卡在 STW。
-- 常见根因：老年代耗尽、Survivor 无法容纳对象导致早晋升、Metaspace 被动态类撑爆。
-- 诊断速查：`jstat -gcutil <pid> 1s 10` 观察老年代占比；`jmap -histo` 查看大对象；`jcmd <pid> GC.heap_info` 看 Metaspace。
-- 调优/缓解：
-	- `-XX:+UseG1GC` + `-XX:InitiatingHeapOccupancyPercent=30`：提前触发并发标记，避免被动 Full GC。
-	- `-XX:G1ReservePercent=20`：预留晋升缓冲，降低 Promotion Failed。
-	- `-XX:+UseStringDeduplication` 或压缩缓存，减少老年代冗余对象。
-	- 排查 Metaspace：`-XX:MaxMetaspaceSize=512m` + `-XX:+ClassUnloadingWithConcurrentMark`。
+### 13.1 先建立诊断闭环
 
-### 13.2 Minor GC 过于频繁
-- 症状：Young GC 每秒多次，引发请求卡顿。
-- 常见根因：Eden 太小、大量短命对象爆堆、Survivor 过窄导致反复复制。
-- 诊断速查：`jstat -gcnew <pid> 1s 10` 关注 YGC 次数与平均耗时；结合 GC 日志看一次 YGC 回收前后占用。
-- 调优/缓解：
-	- `-XX:G1NewSizePercent=30` / `-XX:G1MaxNewSizePercent=50`：稳定新生代占比，减少自动缩放。
-	- `-XX:MaxTenuringThreshold=1~3`：让短命对象更快晋升/清理，避免 Survivor 压力。
-	- 代码层面减少临时集合、字符串拼接；热点路径可启用对象池。
+调优不是从参数表中挑一个数字。每次排查都按同一顺序进行：
 
-### 13.3 GC 停顿时间过长
-- 症状：单次 GC >200 ms，SLA/SLO 频繁被打爆。
-- 常见根因：Mixed GC 一次扫太多 Region、并发标记启动偏晚、Region 过大导致复制成本高。
-- 诊断速查：开启 `-Xlog:gc*:file=gc.log`，用 GCViewer/JMC 分析停顿阶段；观察 `to-space exhausted`、`MMU target violated` 等告警。
-- 调优/缓解：
-	- `-XX:MaxGCPauseMillis=100`：给 G1 明确的停顿预算。
-	- `-XX:InitiatingHeapOccupancyPercent=20`：更早进入并发标记，减少必须回收的 Region 数。
-	- `-XX:G1HeapRegionSize=2m` 或更小，提升并行复制粒度。
-	- 限制 Mixed GC 每次回收的老年代 Region：`-XX:G1MixedGCCountTarget=8`。
+1. **定义现象与影响**：是 Full GC、Young GC、尾延迟、OOM，还是元空间增长？记录发生时段、请求量和容器内存限制。
+2. **收集证据**：优先看 GC 日志、堆/元空间曲线、分配与晋升速率；OOM 或回收效果差时再在可控流量下抓直方图或 Heap Dump。
+3. **提出单一假设**：例如“缓存无上限导致存活集增长”，而不是笼统地说“堆太小”。
+4. **选择最小动作并验证**：先改代码、容量或流量策略；确有证据时才调整一个 JVM 参数，并比较变更前后的停顿、吞吐、回收后占用和 CPU。
 
-### 13.4 OOM: GC Overhead Limit Exceeded
-- 症状：日志出现 `GC overhead limit exceeded`，CPU 长时间 100%，吞吐几乎为 0。
-- 常见根因：对象生成速度远超回收速度、存在大范围循环引用或缓存未逐出。
-- 诊断速查：立即 `jmap -dump:format=b,file=heapdump.hprof <pid>`；用 MAT/VisualVM 查看 Dominator Tree。
-- 调优/缓解：
-	- 启动参数加入 `-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=logs/heapdump.hprof` 保留案发现场。
-	- 排查业务：缓存失控、集合累积、Rx/Stream 无限增长等。
-	- 若确为短期突刺，可临时调大堆或限流入口请求。
+### 13.2 频繁 Full GC
 
-### 13.5 OOM: Metaspace/PermGen 溢出
-- 症状：`java.lang.OutOfMemoryError: Metaspace` 或 PermGen。
-- 常见根因：大量动态代理/反射生成类、热部署导致类卸载失败、第三方脚本引擎缓存类。
-- 诊断速查：`jcmd <pid> GC.class_stats`、`jcmd <pid> VM.classloader_stats`；开启 `-XX:+TraceClassLoading` 看加载洪峰。
-- 调优/缓解：
-	- `-XX:MaxMetaspaceSize=256m~1g`：设置上限并配合监控。
-	- 开启 `-XX:+UseStringDeduplication` 对常量池减压。
-	- 定期触发 `ClassLoader` 卸载（G1/CMS 并发标记阶段才会卸载无引用类）。
+- **先看证据**：Full GC 前后老年代和元空间是否明显回落？GC 日志是否有 `to-space exhausted`、分配失败或并发回收失败？
+- **分支判断**：回落差优先排查缓存、队列、ThreadLocal、监听器和 ClassLoader 引用；回落好但很快复发，优先排查流量尖峰、大对象、批处理和过早晋升；元空间单独上涨则排查动态类与类加载器。
+- **候选动作**：为缓存/队列设容量和淘汰策略；限制大查询或分批处理；确认 G1 并发标记是否启动过晚后再评估 `InitiatingHeapOccupancyPercent`、`G1ReservePercent` 等参数。
+- **验证标准**：Full GC 次数下降，回收后占用恢复到稳定区间，且 P99 延迟与 CPU 没有恶化。
 
-### 13.6 内存泄露导致 OOM
-- 症状：堆使用线性攀升，Full GC 后下降幅度很小，最终 OOM。
-- 常见根因：静态集合持有请求数据、ThreadLocal/CompletableFuture 未清理、监听器/缓存未注销。
-- 诊断速查：开启 `-XX:+HeapDumpOnOutOfMemoryError`；用 MAT 关注 Dominator、Leak Suspects；`jmap -histo` 观察类实例增长。
-- 处理手段：
-	- 查找 GC Roots → 逆向追踪引用链，定位未释放的集合/缓存。
-	- 使用弱引用/软引用替代强引用；ThreadLocal 使用 `remove()`。
-	- 对业务代码做基线压测，确认峰值对象数量。
+### 13.3 Young GC 频繁或晋升过快
 
-### 13.7 Stop-The-World 过于频繁
-- 症状：监控中频繁出现小停顿，尾延迟抖动明显。
-- 常见根因：Eden 过小导致高频 Minor GC、Mixed GC 触发策略过激、并发标记经常因 `to-space` 不足被迫 STW。
-- 诊断速查：配合 `-Xlog:safepoint` 查看 STW 原因；JFR/Arthas `thread` 命令观察暂停点。
-- 调优/缓解：
-	- `-XX:MaxGCPauseMillis=150` + `-XX:InitiatingHeapOccupancyPercent=25`：降低 Mixed GC 压力。
-	- 合理放大 Eden（`-XX:G1NewSizePercent=35`）并确保应用分配峰值平滑。
-	- 检查 `System.gc()`、大规模 Class Loading 或 Heap Dump 是否由运维脚本误触发。
+- **先看证据**：关注 Young GC 间隔、Eden 回收前后占用、Survivor 使用率、对象年龄分布和晋升速率，而不是只看 YGC 次数。
+- **分支判断**：短命对象暴涨通常来自序列化、临时集合、字符串拼接或突发流量；Survivor 溢出和晋升过快则需要结合年龄分布确认。
+- **候选动作**：先减少热点路径临时对象、平滑流量或限制批量规模；仅当日志持续表明年轻代自适应策略不合适时，再评估 `G1NewSizePercent`、`G1MaxNewSizePercent` 或 `MaxTenuringThreshold`。
+- **验证标准**：Young GC 虽可存在，但总暂停、晋升速率和老年代增长都下降；不要只追求降低 YGC 次数。
 
-### 13.8 JVM GC 调优参数总览表
+### 13.4 单次 GC 停顿过长
 
-| 场景              | 参数                                         | 说明                         |
-| ----------------- | -------------------------------------------- | ---------------------------- |
-| G1 启用           | `-XX:+UseG1GC`                               | 启用 G1 垃圾收集器           |
-| 最大停顿时间      | `-XX:MaxGCPauseMillis=200`                   | 尝试控制 GC 停顿时间         |
-| 老年代占用触发 GC | `-XX:InitiatingHeapOccupancyPercent=30`      | 提前启动 Mixed GC            |
-| 晋升空间预留      | `-XX:G1ReservePercent=20`                    | 预留晋升空间防止失败         |
-| 新生代比例        | `-XX:G1NewSizePercent` / `MaxNewSizePercent` | 控制新生代大小占比           |
-| Survivor 区控制   | `-XX:MaxTenuringThreshold=1`                 | 快速晋升，减少 Survivor 压力 |
-| 元空间限制        | `-XX:MaxMetaspaceSize=256m`                  | 控制类元信息使用内存         |
-| 堆设置            | `-Xms`, `-Xmx`                               | 控制初始/最大堆大小          |
+- **先看证据**：使用 GC 日志或 JFR 区分 Young、Mixed、Full GC 以及 safepoint 停顿，不要把所有 RT 抖动都归为 GC。
+- **分支判断**：存活对象复制量大、Mixed GC 回收集合重、CPU 资源不足或并发标记启动晚，都会拉长停顿；Humongous 分配问题应参见[第 7 节](#7-g1-的-humongous-region为什么大对象反而更需要关注)。
+- **候选动作**：先降低分配/存活集压力并确认 CPU 配额；对 G1 再审视 `MaxGCPauseMillis`、并发标记启动时机和 Region 配置。停顿目标调得更小可能换来更高频的 GC。
+- **验证标准**：分别比较各阶段暂停、P99/P999 与吞吐量，确认没有把长停顿变成频繁停顿。
 
-### 13.9 调试推荐工具
+### 13.5 `GC overhead limit exceeded` 与堆 OOM
+
+- **先看证据**：确认进程是否已接近不可用；优先保护服务和保留现场。生产环境抓 Heap Dump 前应评估磁盘空间、I/O 与实例负载。
+- **分支判断**：Full GC 后回落差通常指向持续持有；回落好但对象分配持续高则更像洪峰或容量不足。
+- **候选动作**：提前配置 `-XX:+HeapDumpOnOutOfMemoryError` 和可写的 `HeapDumpPath`；通过限流、摘流或扩容止血；随后用 Dominator Tree 和 GC Roots 定位对象持有链。
+- **验证标准**：修复后压测或回放相同负载，确认存活集不会持续增长，而不是只验证 OOM 消失。
+
+### 13.6 Metaspace OOM
+
+- **先看证据**：查看 Metaspace 趋势、已加载类数量和类加载器统计；区分一次性启动加载与持续增长。
+- **分支判断**：动态代理/字节码生成过多、热部署残留、脚本引擎缓存或 ClassLoader 被引用，都会阻止类卸载。
+- **候选动作**：先解除旧 ClassLoader 的引用、限制动态生成和清理框架缓存；`MaxMetaspaceSize` 只是在上限处更早失败并便于告警，不是泄漏修复。
+- **验证标准**：完整部署/热更新周期后，类加载器数量和元空间曲线能回落或稳定。
+
+### 13.7 非 GC 的 STW 与显式 GC
+
+- **先看证据**：用 safepoint 日志确认暂停原因，并在 GC 日志中核对是否真的发生了 GC。
+- **分支判断**：`System.gc()`、诊断命令、Heap Dump 等可能影响停顿；锁竞争、类加载或慢 I/O 本身不等于 STW。
+- **候选动作**：找出显式 GC 调用方并评估 `-XX:+DisableExplicitGC` 的兼容性；将重型诊断操作放在摘流或低峰实例执行。
+- **验证标准**：安全点暂停原因与持续时间下降，同时确认没有影响依赖显式 GC 的组件。
+
+### 13.8 调试推荐工具
 
 | 工具                 | 用途                        |
 | -------------------- | --------------------------- |
@@ -1325,17 +1240,14 @@ java -Xms512m -Xmx1g -XX:+UseSerialGC -jar myapp.jar
 | GCLogViewer / GCEasy | GC 日志可视化分析           |
 | Arthas               | 热排查 GC、类加载、内存分布 |
 
-### 13.10 启动参数推荐模板
+### 13.9 最小化启动参数模板
 
 ```bash
-java -Xms1g -Xmx1g \  
--XX:+UseG1GC \  
--XX:MaxGCPauseMillis=100 \  
--XX:InitiatingHeapOccupancyPercent=30 \  
--XX:G1ReservePercent=15 \  
--XX:+HeapDumpOnOutOfMemoryError \  
--XX:HeapDumpPath=logs/heapdump.hprof \  
--Xlog:gc*:file=logs/gc.log:time,uptime,level,tags \  
+java -Xms1g -Xmx1g \
+-XX:+UseG1GC \
+-XX:+HeapDumpOnOutOfMemoryError \
+-XX:HeapDumpPath=logs/heapdump.hprof \
+-Xlog:gc*:file=logs/gc.log:time,uptime,level,tags \
 -jar app.jar
 ```
-> 持续 GC 优化是一项系统工程，不只是调参数，更是理解业务特性、对象生命周期、分配模式，以及应用负载变化。
+> 这是 JDK 9+ 的观测优先示例，不包含停顿、Region、并发标记等推测性参数。根据诊断结果逐项加入，并记录回滚条件。
