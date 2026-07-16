@@ -4,6 +4,13 @@
 >
 > 遇到源码调用链、代理边界、早期引用一致性、事务传播与并发取舍时，进入 [[Spring深度解析|《Spring深度解析》]]；不要在两篇笔记中维护同一份深度推导。
 
+## 目录
+
+1. [[#1. 循环依赖|循环依赖与三级缓存]]：[[#2. 三级缓存|缓存状态迁移]]、[[#4. @Lazy 的作用|`@Lazy`]]
+2. [[#6. Bean 生命周期|Bean 生命周期]]、[[#7. IoC 与 DI|IoC/DI]]、[[#8. ApplicationContext|容器]]、[[#9. refresh()|`refresh()`]]
+3. [[#10. Bean Scope|Scope]]、[[#11. Spring Profile 的原理|Profile]]、[[#12. 依赖注入原理|依赖解析]]、[[#13. Spring 注册 Bean 的整体详细源码解析|Bean 注册]]
+4. [[#14. Spring 的单例 Bean 是线程安全的吗|单例并发]]、[[#15. Spring事务失效|事务失效]]、[[#17. 为什么不推荐使用字段注入|注入风格]]、[[#18. Spring AOP 的工作原理|AOP]]、[[#19. Spring 事务原理（进阶入口）|事务调用链]]
+
 # 1. 循环依赖
 在Spring中，循环依赖是指两个或多个Bean相互依赖，形成一个闭环。Spring处理循环依赖的方式取决于Bean的作用域（如单例或原型）。
 
@@ -16,7 +23,7 @@
   3. **正式缓存**：一旦Bean完全初始化，会被放入正式的单例缓存中。
 
 ### 2. 原型Bean的循环依赖
-对于原型Bean，Spring无法处理循环依赖。由于每次请求都会创建新的Bean实例，循环依赖将导致`StackOverflowError`或`BeanCurrentlyInCreationException`。
+对于原型 Bean，Spring 不使用单例三级缓存处理循环依赖，通常会在创建阶段抛出 `BeanCurrentlyInCreationException`；不要把它理解为会稳定地递归到 `StackOverflowError`。
 
 ### 3. 示例
 假设有两个Bean A和B：
@@ -320,7 +327,7 @@ public void destroy() {
 原型Bean是Spring中定义的一种作用域，适用于需要独立实例的情况。理解原型Bean的特性和生命周期，有助于合理设计和管理Spring应用中的Bean。
 
 
-# 4. `@Lazy` 的作用
+# 4. @Lazy 的作用
 `@Lazy`注解在Spring中用于延迟加载Bean。它的主要功能是推迟Bean的实例化，直到实际需要时才创建。以下是`@Lazy`注解的原理及其工作机制的详细解释。
 
 ### 1. 使用场景
@@ -383,68 +390,6 @@ public class B {
 ### 4. 小结
 
 `@Lazy` 的主要用途是延迟 Bean 初始化或依赖解析，从而控制启动成本和依赖获取时机。它可以缓解某些创建阶段的依赖冲突，但不应替代循环依赖的设计治理。
-
-# 5. 使用 `@Lazy` 处理循环依赖
-在 Spring 中，`@Lazy` 可以推迟一条依赖边的解析，从而让某些相互依赖的 Bean 得以创建；它是兼容性手段，不是循环依赖的通用解法，更不能说明原型 Bean 的循环依赖已被容器支持。
-
-### 1. 循环依赖概述
-
-循环依赖指两个或多个 Bean 相互依赖，导致创建顺序无法直接满足。例如 A 依赖 B、B 又依赖 A；Spring 会根据作用域和注入方式尝试解析，无法处理时通常抛出循环依赖相关异常，而不是无限等待。
-
-### 2. 使用 `@Lazy` 延迟解析依赖
-
-当一个Bean被标记为`@Lazy`时，Spring会使用代理机制延迟该Bean的实例化。具体步骤如下：
-
-#### 1) 创建代理
-
-- 在构造器、字段或 Setter 的注入点使用 `@Lazy` 时，Spring 可以注入延迟解析引用；真正使用该引用时再请求目标 Bean。
-
-#### 2) 延迟实例化
-
-- 在依赖注入过程中，若 `A` 对 `B` 的注入点标记为 `@Lazy`，创建 `A` 时不必立刻完成 `B` 的解析，从而打破“创建 A 必须同步创建 B”的直接链路。
-
-#### 3) 第一次访问时创建
-
-- 当 Bean A 需要使用 Bean B 时，延迟解析引用会触发对 B 的获取。这只是把依赖解析延后，不能保证所有循环依赖在运行期都安全可用。
-
-### 3. 示例
-
-以下是一个使用`@Lazy`解决循环依赖的示例：
-
-```java
-@Component
-public class A {
-    private final B b;
-
-    @Autowired
-    public A(@Lazy B b) {
-        this.b = b;
-    }
-
-    public void doSomething() {
-        b.action();
-    }
-}
-
-@Component
-public class B {
-    private final A a;
-
-    public B(A a) {
-        this.a = a;
-    }
-
-    public void action() {
-        System.out.println("B action called");
-    }
-}
-```
-
-在这个示例中，`A` 和 `B` 确实互相依赖。`A` 创建时先注入指向 `B` 的延迟解析引用；首次调用 `b.action()` 时才获取 `B`，此时 `B` 可以注入已完成创建的 `A`。需要同时评估延迟失败和职责耦合等风险。
-
-### 4. 小结
-
-`@Lazy` 的主要价值是控制初始化时机；用于循环依赖时只是把问题从“创建阶段”推迟到“首次使用阶段”。优先做职责拆分或引入中介者，只有在边界清楚时才使用它作为权衡。
 
 # 6. Bean 生命周期
 Spring Bean 的生命周期是指从 Bean 实例化到销毁的完整过程，由 Spring 容器管理。了解其生命周期有助于开发者更好地控制对象的行为和资源管理。
@@ -995,7 +940,7 @@ public Object doGetBean(String name) {
 2. **Spring Boot 默认使用 `AnnotationConfigServletWebServerApplicationContext`，加载注解配置类并启动 Web 容器。**
 3. **源码级别理解：重点关注 `refresh()` 和 `getBean()` 方法，掌握容器初始化与 Bean 创建的流程。**
 
-# 9. `refresh()`
+# 9. refresh()
 
 
 ---
@@ -1485,7 +1430,7 @@ public class PrototypeBean {
 
 如果需要进一步探讨某个作用域或结合实际场景分析，可以继续讨论！
 
-# 11. **Spring Profile 的原理**
+# 11. Spring Profile 的原理
 
 Spring Profile 是 Spring 框架提供的一种功能，用于在不同的环境（如开发、测试、生产）中激活不同的配置。它通过逻辑分组和条件激活机制，让开发者能够灵活地管理环境相关的 Bean 定义和配置。
 
@@ -1888,7 +1833,7 @@ Spring 提供了多种注解来支持依赖注入：
 
 #### **（2）@Resource**
 
-- 来自 JSR-250 标准，默认按名称注入。
+- 属于 Jakarta Common Annotations（Spring 6+ 使用 `jakarta.annotation.Resource`），默认按名称注入，找不到名称时再按类型匹配。
 
 #### **（3）@Inject**
 
@@ -2273,7 +2218,7 @@ protected void populateBean(String beanName, RootBeanDefinition mbd, BeanWrapper
 如果需要更详细的某个阶段源码分析或实际应用场景的解读，可以继续探讨！
 
 
-# 14. Spring的单例Bean是线程安全的吗
+# 14. Spring 的单例 Bean 是线程安全的吗
 
 ### **Spring 的单例 Bean 是线程安全的吗？**
 
@@ -2358,17 +2303,21 @@ public class StatefulService {
 ```java
 @Component
 public class ThreadLocalService {
-    private ThreadLocal<Integer> threadLocalCount = ThreadLocal.withInitial(() -> 0);
+    private final ThreadLocal<Integer> threadLocalCount = ThreadLocal.withInitial(() -> 0);
 
     public void increment() {
-        threadLocalCount.set(threadLocalCount.get() + 1);
-        System.out.println("ThreadLocal Count: " + threadLocalCount.get());
+        try {
+            threadLocalCount.set(threadLocalCount.get() + 1);
+            System.out.println("ThreadLocal Count: " + threadLocalCount.get());
+        } finally {
+            threadLocalCount.remove(); // 在线程池复用线程时必须清理
+        }
     }
 }
 ```
 
 **优点：** ✅ 线程独立，每个线程的 `threadLocalCount` 变量不会相互影响。  
-**适用于：** 线程隔离的数据，如用户请求上下文、事务管理等。
+**适用于：** 线程隔离的数据，如用户请求上下文、事务管理等；在线程池中必须在任务结束时 `remove()`，否则可能残留上下文或造成内存泄漏。
 
 ---
 
@@ -2467,7 +2416,7 @@ public class ConcurrentService {
 
 
 # 15. Spring事务失效
-在 **Spring** 中，事务管理是基于 **AOP（面向切面编程）** 和 **代理机制** 实现的，如果事务配置不正确或某些规则被违反，就会导致 **事务失效**。
+在默认的 **Spring AOP 代理模式** 下，声明式事务依赖 AOP 代理；调用未经过代理、事务属性不匹配或事务管理器选择错误时，可能导致事务不符合预期。若使用 AspectJ 事务模式，织入边界不同，本节的“自调用绕过代理”结论不直接适用。
 ``` 
 @Configuration + @EnableTransactionManagement
         ↓
@@ -2971,11 +2920,11 @@ public class FieldInjectionService {
 }
 ```
 
-**问题：**
+**主要代价：**
 
-- 不能在构造方法中进行**依赖检查**（编译期不可验证）。
-- 破坏了 **SOLID 原则**（特别是 **单一职责** 和 **依赖倒置**）。
-- **难以进行单元测试**。
+- 必需依赖没有体现在构造器签名中，读者无法仅从 API 看出对象的完整前置条件。
+- 无法将依赖声明为 `final`，也不便于在不启动容器时直接构造对象。
+- 单元测试仍可通过反射或 Mockito 注入，但测试更依赖框架行为，意图不如构造器注入清晰。
 
 ---
 
@@ -2998,12 +2947,12 @@ public class SetterInjectionService {
 **优点：**
 
 - 适用于**可选依赖**（依赖可能为空）。
-- 可以在**运行时**改变依赖关系。
+- 适合框架在初始化阶段注入可选依赖；是否允许运行时替换应由类的 API 和封装策略决定。
 
 **缺点：**
 
-- **依赖不是不可变的**，可以被**外部更改**，导致对象状态不可预测。
-- 仍然**无法在编译期检查依赖**，因为对象可能在未注入时被错误使用。
+- 依赖无法天然声明为构造后不可变；若 Setter 对外暴露，才可能被外部重新赋值。
+- 对象可在依赖尚未设置时被构造出来，因此需要明确可选性与使用时机。
 
 ---
 
@@ -3034,12 +2983,12 @@ public class ConstructorInjectionService {
 
 ## **2. 为什么不要使用字段注入？**
 
-### **（1）字段注入破坏了封装**
+### **（1）必需依赖不显式**
 
 **问题：**
 
-- 字段注入会直接暴露类的内部结构，降低封装性。
-- 依赖被 `private` 修饰，但 `@Autowired` 直接访问它，使得类在 Spring 外部难以使用。
+- 私有字段本身仍受封装保护；问题在于依赖没有通过构造器 API 明确声明。
+- 类在 Spring 外部仍可被创建，但需要借助反射或测试工具设置依赖，不如构造器注入直接。
 
 **示例：**
 
@@ -3085,8 +3034,7 @@ public class UserService {
 }
 ```
 
-❌ `userRepository` **无法加 `final`**，意味着它可以被修改，可能导致 **线程安全问题**。
-**Spring 是通过反射来设置字段的，而 Java 不允许反射修改 final 字段（特别是在构造器之后）。**
+❌ `userRepository` **无法加 `final`**，因此无法用语言级不可变性表达“创建后不替换依赖”。这不等同于必然产生线程安全问题；线程安全仍取决于对象是否共享可变状态以及并发访问方式。
 
 ---
 
@@ -3142,13 +3090,13 @@ public class UserService {
 }
 ```
 
-在单元测试中，很难 Mock `userRepository`：
+在单元测试中可以 Mock `userRepository`，但依赖注入由 Mockito 的反射规则隐式完成：
 
 ```java
 @ExtendWith(MockitoExtension.class)
 public class UserServiceTest {
 
-    @InjectMocks // ⚠️ 可能无法正确注入
+    @InjectMocks
     private UserService userService;
 
     @Mock
@@ -3156,7 +3104,7 @@ public class UserServiceTest {
 
     @Test
     void testUserService() {
-        userService.processUser(); // 可能导致 `NullPointerException`
+        userService.processUser(); // Mockito 可注入字段，但构造器注入的依赖更显式
     }
 }
 ```
@@ -3190,18 +3138,9 @@ public class UserServiceTest {
 
 ---
 
-### **（5）违反了 SOLID 原则**
+### **（5）设计表达更弱**
 
-1. **单一职责原则（SRP）**
-    
-    - 依赖注入的方式不应影响类的职责。
-    - 字段注入让类隐式依赖 Spring，破坏了其独立性。
-2. **依赖倒置原则（DIP）**
-    
-    - 高层模块不应依赖于具体实现，构造器注入可以提供更好的依赖倒置结构。
-3. **开闭原则（OCP）**
-    
-    - 采用构造器注入，可以更容易地扩展和替换依赖，而不会影响现有代码。
+字段注入并不天然违反 SRP、DIP 或 OCP；这些原则取决于职责划分和依赖方向。构造器注入的优势是把依赖显式写进 API，更容易发现依赖过多、保持必需依赖不可变，并在测试中直接替换实现。
 
 ---
 
@@ -3232,15 +3171,17 @@ public class UserServiceTest {
 
 | **注入方式**    | **优点**                       | **缺点**                         | **推荐度**       |
 | --------------- | ------------------------------ | -------------------------------- | ---------------- |
-| **字段注入**    | 代码简单，少写构造方法         | 不支持 `final`，难测试，违反封装 | ❌ 不推荐         |
-| **Setter 注入** | 适用于可选依赖                 | 依赖可以随时更改，风险高         | 🟡 适用于少数情况 |
-| **构造器注入**  | 线程安全，可测试，强制依赖注入 | 代码稍多                         | ✅ 强烈推荐       |
+| **字段注入**    | 代码简短 | 必需依赖不显式、不能使用 `final`、脱离容器构造不便 | ❌ 不推荐 |
+| **Setter 注入** | 适合可选依赖 | 需明确对象何时可用，通常不适合必需依赖 | 🟡 适用于少数情况 |
+| **构造器注入**  | 必需依赖显式、可使用 `final`、易于测试 | 依赖过多时会暴露设计需要拆分 | ✅ 推荐 |
 
 **最佳实践：使用构造器注入，避免字段注入。**
 
-# 18. **Spring AOP 的工作原理**
+# 18. Spring AOP 的工作原理
 
 Spring AOP 主要依赖 **动态代理** 实现方法增强，使用 **JDK 动态代理** 或 **CGLIB 代理** 来生成代理对象，并在调用目标方法前后执行切面逻辑。
+
+> 本节只建立代理与通知链的基础模型；多个切面的排序、`@Around` 的精确嵌套和代理边界请以 [[Spring深度解析|《Spring深度解析》]] 的 AOP 章节为准。下方源码均为理解调用链的示意，不等同于特定 Spring 版本的完整源码。
 
 ---
 
@@ -3261,13 +3202,13 @@ Spring AOP 在容器启动时，会扫描所有 `@Aspect` 定义的切面，并�
 
 ### **2. 方法调用拦截**
 
-代理对象的 `invoke()` 方法会拦截对目标方法的调用，并按照以下顺序执行：
+代理对象会按拦截器链处理调用。以单个切面同时包含各种通知为例，可以将顺序理解为：
 
-1. **`@Before` Advice（前置增强）**
-2. **目标方法执行**
-3. **`@AfterReturning` 或 `@AfterThrowing`（成功/异常增强）**
-4. **`@After` Advice（最终增强）**
-5. **返回方法执行结果**
+1. `@Around` 的 `proceed()` 前逻辑（若存在）包裹整个调用；
+2. `@Before`；
+3. 目标方法；正常返回时执行 `@AfterReturning`，抛出异常时执行 `@AfterThrowing`；
+4. `@After` 在 finally 语义下执行；
+5. 回到 `@Around` 的 `proceed()` 后逻辑，再返回或继续抛出异常。
 
 **调用链**
 
@@ -3348,23 +3289,11 @@ public Object proceed() throws Throwable {
 
 Spring AOP 的核心是**代理模式 + 责任链模式**：通过动态代理实现无侵入的切面增强。
 
-[^1]: @Configuration + @EnableTransactionManagement
-	        ↓
-	注册 AOP 代理生成器 + 注册事务拦截器（TransactionInterceptor）
-	        ↓
-	Bean 创建时（通过 BeanPostProcessor）扫描 @Transactional
-	        ↓
-	为匹配的 Bean 创建代理对象（替换原始对象）
-	        ↓
-	你调用方法 → 实际调用代理 → 触发 TransactionInterceptor → 控制事务
-
-
-
 # 19. Spring 事务原理（进阶入口）
 
 > 本节只用于建立事务调用链的全局认知。传播行为的精细语义、多数据源、异步边界、隔离级别和最终一致性，以 [[Spring深度解析|《Spring深度解析》]] 的「事务」章节为准；基础排障则回看本文「15. Spring事务失效」。
 ## 1. Spring 事务到底是什么
-Spring 事务的本质是：Spring 通过 AOP（代理 + 拦截器链）把“开启事务/提交/回滚”的控制逻辑织入到方法调用边界；数据库事务仍由底层数据库实现（如 MySQL InnoDB），Spring 负责正确地获取连接、设置事务属性、在方法前后调用 commit/rollback，并在执行完毕后清理线程上下文与释放连接。核心前提：调用必须经过 Spring 生成的代理对象（Proxy），否则事务不会生效。
+Spring 事务的本质是：Spring 通过 AOP（代理 + 拦截器链）把“开启事务/提交/回滚”的控制逻辑织入到方法调用边界；数据库事务仍由底层数据库实现（如 MySQL InnoDB），Spring 负责正确地获取连接、设置事务属性、在方法前后调用 commit/rollback，并在执行完毕后清理线程上下文与释放连接。以下默认讨论代理模式；该模式下调用必须经过 Spring 生成的代理对象，AspectJ 模式的织入边界不同。
 ## 2. 核心组件与职责划分
 ### 2.1 PlatformTransactionManager（事务管理器：真正干活的人）
 常见实现：DataSourceTransactionManager（JDBC/MyBatis）、JpaTransactionManager（JPA/Hibernate）。职责：getTransaction() 创建或加入事务；commit() 提交；rollback() 回滚。

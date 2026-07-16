@@ -242,7 +242,7 @@
     - 4.1 @Qualifier（以及“限定符匹配”）最强：先按限定符把候选集过滤到更小
     - 4.2 如果仍多：看 @Primary（主候选）
     - 4.3 如果仍多：看 beanName 与注入点名称是否匹配（字段名/参数名/属性名）
-    - 4.4 如果仍多：看 @Priority / Ordered（主要对集合注入排序更常见；单点注入也可能参与“优先级候选”判断）
+    - 4.4 如果仍多：可看 `@Priority` 候选；`Ordered/@Order` 主要用于集合注入排序，不应当作单点注入的常规消歧手段
     - 4.5 还不唯一：抛 NoUniqueBeanDefinitionException（除非注入点允许多值/可选）
   - 5) required=true 且找不到候选：抛 NoSuchBeanDefinitionException；required=false/Optional/ObjectProvider 则允许缺失
 
@@ -250,7 +250,7 @@
   - 首选：匹配 @Qualifier（含自定义 Qualifier 注解的匹配）
   - 其次：匹配 @Primary
   - 再次：匹配“名称”（注入点名称 == beanName，或 @Qualifier("name")）
-  - 再其次：优先级（@Priority/Ordered）参与候选缩小或排序（更常见在集合注入）
+  - 再其次：`@Priority` 可能参与候选缩小；集合注入的排序则主要使用 `Ordered/@Order/@Priority`
   - 兜底：仍不唯一就报错（让你显式指定，避免隐式注入带来线上不确定性）
 
 - @Primary、@Qualifier、@Resource 差异（工程落地视角）
@@ -292,7 +292,7 @@
   - 集合注入（List/Map）用于插件化很香，但要控制排序规则（@Order/@Priority），否则实现顺序不稳定会引发线上行为漂移
 
 - 小结（一句话复盘）
-  - @Autowired 类型优先，冲突时按 Qualifier → Primary → 名称匹配 → 优先级/排序缩小候选；@Primary 给默认赢家，@Qualifier 强制点名，@Resource 名称优先；required=false/Optional 解决“可选”，ObjectProvider 解决“可选 + 延迟 + 多候选遍历”，是生产解耦利器。
+  - @Autowired 类型优先，冲突时按 Qualifier → Primary → 名称匹配 → `@Priority` 缩小候选；集合注入再按排序规则排列。@Primary 给默认赢家，@Qualifier 强制点名，@Resource 名称优先；required=false/Optional 解决“可选”，ObjectProvider 解决“可选 + 延迟 + 多候选遍历”，是生产解耦利器。
 
 ---
 ## 5. FactoryBean 和普通 Bean 有什么本质差异？&beanName 是什么？Spring 为什么需要 FactoryBean？
@@ -637,6 +637,9 @@
 ---
 
 # 事务（@Transactional 深水区：传播、回滚、失效、并发）
+
+> 本章默认讨论命令式 JDBC/MyBatis 事务：`DataSourceTransactionManager` 通过 `TransactionSynchronizationManager` 的 `ThreadLocal` 绑定连接与同步回调。Reactive 事务使用 `ReactiveTransactionManager` 并依赖 Reactor Context 传播事务状态；不要把本章“换线程即断事务”的结论直接套用到 Reactor 链路。
+
 ## 1. Spring 事务是怎么工作的？TransactionInterceptor 到 DataSourceTransactionManager 的关键调用链是什么？（含追问：TransactionSynchronizationManager 为什么要 ThreadLocal？这对异步有什么影响？）
 - 结论（标准答案）
   - Spring 声明式事务本质是 AOP：@Transactional 让目标方法在代理上被 TransactionInterceptor 拦截；拦截器读取事务属性（传播/隔离/回滚规则等），委派给 PlatformTransactionManager（JDBC/MyBatis 场景通常是 DataSourceTransactionManager）完成“获取连接→关闭 autoCommit→绑定线程→提交/回滚→清理释放连接”的全过程。
@@ -723,7 +726,7 @@
       - 如果一定要做，明确异步方法自己的事务边界（REQUIRES_NEW）并评估连接池压力与锁竞争
 
 - 小结（一句话复盘）
-  - Spring 事务=代理拦截+事务模板：TransactionInterceptor 解析 @Transactional 并调用 DataSourceTransactionManager 在 JDBC 层开启/提交/回滚；TransactionSynchronizationManager 用 ThreadLocal 绑定 Connection 与回调以保证同线程共享事务资源；因此异步天然断开事务上下文，生产上应以 afterCommit 触发异步或用 Outbox/事务消息实现一致性。
+  - 对命令式 JDBC/MyBatis 而言，Spring 事务=代理拦截+事务模板：TransactionInterceptor 解析 @Transactional 并调用 DataSourceTransactionManager 在 JDBC 层开启/提交/回滚；TransactionSynchronizationManager 用 ThreadLocal 绑定 Connection 与回调以保证同线程共享事务资源，因此异步天然断开该上下文。Reactive 事务改由 Reactor Context 传播，需使用对应的 ReactiveTransactionManager 与响应式操作符设计边界。
 
 ---
 
@@ -897,6 +900,8 @@
 ---
 
 ## 4. 事务隔离级别在 Spring 设置后，真正语义在哪？MySQL RR 下“幻读”怎么理解？（含追问：什么 SQL 会触发 next-key lock？索引不命中会发生什么？）
+
+> 本节的 MVCC、间隙锁和 next-key lock 结论以 MySQL InnoDB 为前提，并会随 MySQL 版本、索引设计、SQL 形态和事务隔离级别变化；它们不是 Spring 或 SQL 标准的统一保证。
 ### 1) 结论（标准答案）
 - Spring 能做的是：在开启新事务时把隔离级别设置到 JDBC `Connection`（例如 `SET SESSION TRANSACTION ISOLATION LEVEL ...` 的效果）；真正决定“读到什么、锁怎么加、幻读怎么表现”的语义在数据库（这里是 MySQL InnoDB）的 MVCC（多版本并发控制）与锁实现（记录锁/间隙锁/next-key lock）里。
 - MySQL 的默认隔离级别通常是 `REPEATABLE READ (RR)`：一致性读（普通 SELECT）依赖 MVCC 快照，能避免“同一事务内两次一致性读看到不同结果”；但“幻读”要分场景讨论：一致性读通常不会出现“结果集变化”，而加锁读（SELECT ... FOR UPDATE/LOCK IN SHARE MODE）是否出现幻读，取决于是否使用 next-key lock 把范围锁住。
@@ -1064,7 +1069,9 @@
 - 事务内直发 MQ/调远程会因无法跨系统原子提交而产生丢失/重复/不一致，并扩大锁持有时间；生产上用 Outbox/事务消息实现“本地事务保证不丢 + 异步可靠投递 + 消费幂等”，再用对账补偿与可观测指标形成闭环，才能在真实故障模型下长期稳定运行。
 
 ---
-# Spring Boot 自动配置（原理 + 扩展点 + 排障）
+# Spring Boot 源码级补充（自动配置、扩展点与排障）
+
+> `SpringBoot.md` 负责 Starter、基础自动配置和外部化配置。本章只保留“条件评估、覆盖顺序、Starter 冲突治理”等进阶解释；使用前先阅读 [[SpringBoot|《SpringBoot》]]，避免在两篇笔记中分别维护相同的基础结论。
 ## 1. Boot 自动配置是怎么生效的？@SpringBootApplication 启动时加载了哪些关键东西？（含追问：Conditional 决策发生在哪？@ConditionalOnMissingBean 的 Missing 怎么判断？）
 ### 1) 结论（标准答案）
 - Spring Boot 自动配置的核心是：启动时把一批“自动配置类”作为普通的 `@Configuration` 导入到容器里；这些配置类通过 `@Conditional...` 条件注解决定“要不要生效”，再通过 `@Bean` 提供默认实现，并用 `@ConditionalOnMissingBean` 让用户自定义 Bean 可以覆盖默认 Bean。

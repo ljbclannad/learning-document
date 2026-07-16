@@ -1,23 +1,24 @@
-# 1. SpringCloud的组件
-Spring Cloud 是一组用于构建分布式系统的项目，而不是一套固定不变的“五大组件”。本节以 Spring Boot 3.x / 较新的 Spring Cloud 版本为默认背景；旧版 Netflix、Sleuth 和注解式 Stream API 会明确标注为历史方案。
+# Spring Cloud：组件、调用与治理
 
-> 快速导航  
-> - [服务注册、调用与容错](#1-服务注册调用与容错)
-> - [Spring Cloud Config](#2-spring-cloud-config分布式配置中心)  
-> - [Spring Cloud Gateway](#3-spring-cloud-gatewayapi-网关)  
-> - [Micrometer Tracing（链路追踪）](#4-micrometer-tracing分布式链路追踪)
-> - [Spring Cloud Stream](#5-spring-cloud-stream消息驱动)  
-> - [Spring Cloud LoadBalancer](#2spring-cloud-loadbalancer-详细解析)  
-> - [熔断与限流示例（Sentinel）](#3-熔断和限流示例)  
-> - [Sentinel 原理](#4--sentinel-的熔断和降级原理)
+> [!info] 文档定位
+> 本文覆盖 Spring Cloud 的常用组件、客户端负载均衡和 Sentinel 治理实践。默认面向 Spring Boot 3.x 与较新的 Spring Cloud Release Train；Netflix Ribbon、Hystrix、Spring Cloud Sleuth 和注解式 Stream API 仅用于识别存量项目。
+
+## 目录
+
+- [[#一、组件总览]]：注册发现、调用、配置、网关、链路追踪与消息
+- [[#二、Spring Cloud LoadBalancer]]：实例选择、接入方式与扩展
+- [[#三、Sentinel：熔断与限流]]：规则配置与工程接入
+- [[#四、Sentinel 熔断与降级原理]]：统计、状态转换与降级边界
 
 ---
 
-## **1. 服务注册、调用与容错**
+## 一、组件总览
+
+### 1. 服务注册、调用与容错
 
 Eureka 仍可用于服务注册与发现；但 Ribbon、Hystrix 已停止维护，不应作为新项目默认选型。新项目通常使用 Spring Cloud LoadBalancer，并按团队生态选择 Resilience4j 或 Sentinel 实现容错与限流。
 
-### **(1) Eureka（服务注册与发现）**
+#### (1) Eureka（服务注册与发现）
 
 Eureka 是 Netflix 提供的服务注册与发现组件，微服务启动时会向 Eureka Server 注册，其他服务可以从 Eureka 获取服务地址并进行调用。
 
@@ -48,7 +49,7 @@ Eureka 是 Netflix 提供的服务注册与发现组件，微服务启动时会�
     ```
     
 
-### **(2) Spring Cloud LoadBalancer（客户端负载均衡）**
+#### (2) Spring Cloud LoadBalancer（客户端负载均衡）
 
 `@LoadBalanced` 的 `RestTemplate` 示例在较新版本中由 Spring Cloud LoadBalancer 提供支持；它从注册中心获取实例并选择一个实例发起请求。
 
@@ -60,9 +61,9 @@ public RestTemplate restTemplate() {
 }
 ```
 
-### **(3) OpenFeign（声明式 HTTP 客户端）**
+#### (3) OpenFeign（声明式 HTTP 客户端）
 
-OpenFeign 可结合注册发现与 Spring Cloud LoadBalancer 简化服务调用；是否启用负载均衡取决于项目是否引入相应的 LoadBalancer 依赖和配置。
+Spring Cloud OpenFeign 适合维护既有的声明式客户端；该项目已进入功能完整（feature-complete）状态，新项目应优先评估 Spring Framework 的 HTTP Service Clients。若继续使用 OpenFeign，需显式引入并配置 `spring-cloud-starter-loadbalancer`，同时为下游调用设定连接/读取超时、只对幂等请求启用受控重试，并接入 Micrometer 的指标与链路追踪。
 
 ```java
 @FeignClient(name = "order-service")
@@ -72,7 +73,7 @@ public interface OrderClient {
 }
 ```
 
-### **(4) 容错：Resilience4j / Sentinel；Hystrix 为历史方案**
+#### (4) 容错：Resilience4j / Sentinel；Hystrix 为历史方案
 
 Hystrix 的以下代码仅用于阅读旧项目。新项目可用 Resilience4j 实现断路器、重试和限流；使用 Spring Cloud Alibaba + Nacos 时，Sentinel 还提供规则动态配置与热点参数限流。
 
@@ -88,11 +89,11 @@ public String fallback(String orderId) {
 
 ---
 
-## **2. Spring Cloud Config（分布式配置中心）**
+### 2. Spring Cloud Config（分布式配置中心）
 
 Spring Cloud Config 允许将应用的配置集中管理，通常存储在 Git 或本地文件系统中，所有微服务可以动态拉取最新配置。
 
-### **(1) 创建 Config Server**
+#### (1) 创建 Config Server
 
 ```java
 @SpringBootApplication
@@ -104,7 +105,7 @@ public class ConfigServerApplication {
 }
 ```
 
-### **(2) 客户端使用 Config**
+#### (2) 客户端使用 Config
 
 推荐使用 Config Data API，在 `application.yml` 中配置：
 
@@ -120,11 +121,11 @@ spring:
 
 ---
 
-## **3. Spring Cloud Gateway（API 网关）**
+### 3. Spring Cloud Gateway（API 网关）
 
 Spring Cloud Gateway 是 Spring 官方推出的 API 网关，它提供了路由、负载均衡、认证、限流等功能。
 
-### **(1) 配置 Gateway**
+#### (1) 配置 Gateway
 
 ```yaml
 spring:
@@ -137,7 +138,7 @@ spring:
             - Path=/orders/**
 ```
 
-### **(2) 启动 Gateway**
+#### (2) 启动 Gateway
 
 ```java
 @SpringBootApplication
@@ -150,11 +151,11 @@ public class ApiGatewayApplication {
 
 ---
 
-## **4. Micrometer Tracing（分布式链路追踪）**
+### 4. Micrometer Tracing（分布式链路追踪）
 
 Spring Boot 3.x 的链路追踪以 Micrometer Tracing 为主，可按所选实现桥接到 Brave 或 OpenTelemetry，并将追踪数据导出到 Zipkin、Tempo 等后端。Spring Cloud Sleuth 3.1 已功能冻结，以下不再把它作为新项目依赖。
 
-### **(1) 引入 Tracing 与 Zipkin 导出器**
+#### (1) 引入 Tracing 与 Zipkin 导出器
 
 ```xml
 <dependency>
@@ -186,11 +187,11 @@ management:
 
 ---
 
-## **5. Spring Cloud Stream（消息驱动）**
+### 5. Spring Cloud Stream（消息驱动）
 
 Spring Cloud Stream 用于构建基于消息的微服务，支持 Kafka、RabbitMQ 等。
 
-### **(1) 创建消息生产者**
+#### (1) 创建消息生产者
 
 ```java
 @Configuration
@@ -207,7 +208,7 @@ public class MessageFunctions {
 }
 ```
 
-### **(2) 配置函数绑定**
+#### (2) 配置函数绑定
 
 ```yaml
 spring:
@@ -226,7 +227,7 @@ spring:
 
 ---
 
-## **总结**
+### 小结
 
 | 组件                     | 作用                                      |
 | ------------------------ | ----------------------------------------- |
@@ -240,26 +241,26 @@ spring:
 
 这些能力可以组合使用，但具体依赖和配置必须与 Spring Boot、Spring Cloud release train、Spring Cloud Alibaba 版本保持兼容。
 
-# **2.Spring Cloud LoadBalancer 详细解析**
+## 二、Spring Cloud LoadBalancer
 
-Spring Cloud LoadBalancer 是 Spring Cloud 2020+ 版本中取代 Ribbon 的客户端负载均衡组件，它用于在多个服务实例之间均匀分配请求，提供高可用性、负载均衡能力，并减少服务器过载的风险。
+Spring Cloud LoadBalancer 是 Spring Cloud 2020+ 中取代 Ribbon 的客户端实例选择组件。它从实例列表中选择目标实例；默认轮询策略并不感知 CPU、连接数或业务负载，因此不能单独保证“均匀分配”或避免过载。生产环境仍应配合健康检查、超时、熔断、限流和容量治理。
 
 ---
 
-## **1. Spring Cloud LoadBalancer 的核心概念**
+### 1. 核心概念
 
 Spring Cloud LoadBalancer 作为 **Spring Cloud Commons** 组件的一部分，主要提供以下功能：
 
 1. **动态服务发现**：基于 **Spring Cloud Discovery Client** 获取可用的服务实例。
-2. **负载均衡策略**：提供 **轮询（Round-Robin）** 和 **随机（Random）** 等默认负载均衡策略，同时支持自定义策略。
+2. **负载均衡策略**：默认实现是 **轮询（RoundRobinLoadBalancer）**；也可选用 **随机（RandomLoadBalancer）** 或自行扩展策略。
 3. **与 RestTemplate、WebClient、Feign 结合**：支持多种方式进行负载均衡调用。
-4. **无缝集成 Spring Cloud Gateway**：在 API 网关中实现服务端负载均衡。
+4. **集成 Spring Cloud Gateway**：让网关作为调用方，在转发至后端服务时完成客户端实例选择。
 
 ---
 
-## **2. LoadBalancer 工作原理**
+### 2. 工作原理
 
-### **(1) 负载均衡的核心组件**
+#### (1) 负载均衡的核心组件
 
 Spring Cloud LoadBalancer 主要由以下几个核心组件组成：
 
@@ -267,7 +268,7 @@ Spring Cloud LoadBalancer 主要由以下几个核心组件组成：
 - **ReactorLoadBalancer**：实现负载均衡策略，决定请求如何分配到不同的服务实例。
 - **LoadBalancerClient**：封装负载均衡逻辑，为 `RestTemplate`、`WebClient`、`Feign` 提供支持。
 
-### **(2) 负载均衡流程**
+#### (2) 负载均衡流程
 
 1. **服务发现**：`ServiceInstanceListSupplier` 从服务注册中心获取可用实例列表。
 2. **选择实例**：`ReactorLoadBalancer` 根据负载均衡策略（如轮询、随机）选择一个实例。
@@ -275,11 +276,11 @@ Spring Cloud LoadBalancer 主要由以下几个核心组件组成：
 
 ---
 
-## **3. 在 RestTemplate 中使用 LoadBalancer**
+### 3. 在 RestTemplate 中使用 LoadBalancer
 
 在 Spring Cloud 2020+ 版本，RestTemplate 需要使用 `@LoadBalanced` 进行负载均衡。
 
-### **(1) 引入 LoadBalancer 依赖**
+#### (1) 引入 LoadBalancer 依赖
 
 ```xml
 <dependency>
@@ -288,7 +289,7 @@ Spring Cloud LoadBalancer 主要由以下几个核心组件组成：
 </dependency>
 ```
 
-### **(2) 配置 `RestTemplate`**
+#### (2) 配置 `RestTemplate`
 
 ```java
 @Configuration
@@ -302,7 +303,7 @@ public class LoadBalancerConfig {
 }
 ```
 
-### **(3) 通过 `RestTemplate` 进行服务调用**
+#### (3) 通过 `RestTemplate` 进行服务调用
 
 ```java
 @Autowired
@@ -317,11 +318,11 @@ public String getProductInfo(String productId) {
 
 ---
 
-## **4. 在 WebClient 中使用 LoadBalancer**
+### 4. 在 WebClient 中使用 LoadBalancer
 
 WebClient 是 Spring 5+ 的非阻塞式 HTTP 客户端，它可以与 LoadBalancer 结合使用。
 
-### **(1) 配置 `WebClient`**
+#### (1) 配置 `WebClient`
 
 ```java
 @Bean
@@ -331,7 +332,7 @@ public WebClient.Builder webClientBuilder() {
 }
 ```
 
-### **(2) 通过 WebClient 进行负载均衡调用**
+#### (2) 通过 WebClient 进行负载均衡调用
 
 ```java
 @Autowired
@@ -348,11 +349,11 @@ public Mono<String> getProduct(String productId) {
 
 ---
 
-## **5. 在 Feign Client 中使用 LoadBalancer**
+### 5. 在 OpenFeign 中使用 LoadBalancer
 
-Feign 是一个声明式 HTTP 客户端，默认使用 Spring Cloud LoadBalancer 进行负载均衡。
+OpenFeign 只有在类路径上存在 `spring-cloud-starter-loadbalancer` 时，才会通过 Spring Cloud LoadBalancer 选择服务实例；仅引入 OpenFeign starter 并不等于已经启用客户端负载均衡。
 
-### **(1) 引入 Feign 依赖**
+#### (1) 引入 Feign 依赖
 
 ```xml
 <dependency>
@@ -361,7 +362,7 @@ Feign 是一个声明式 HTTP 客户端，默认使用 Spring Cloud LoadBalancer
 </dependency>
 ```
 
-### **(2) 启用 Feign**
+#### (2) 启用 Feign
 
 在 Spring Boot 启动类上添加 `@EnableFeignClients`：
 
@@ -376,7 +377,7 @@ public class ProductServiceApplication {
 }
 ```
 
-### **(3) 定义 Feign 客户端**
+#### (3) 定义 Feign 客户端
 
 ```java
 @FeignClient(name = "order-service")
@@ -387,7 +388,7 @@ public interface OrderClient {
 }
 ```
 
-### **(4) 通过 FeignClient 进行调用**
+#### (4) 通过 FeignClient 进行调用
 
 ```java
 @Autowired
@@ -398,15 +399,15 @@ public String fetchOrder(String orderId) {
 }
 ```
 
-**Feign 内部会自动使用 Spring Cloud LoadBalancer 来选择 `order-service` 的可用实例并进行调用**。
+若已引入 LoadBalancer starter，调用 `order-service` 时会由 Spring Cloud LoadBalancer 选择可用实例。上线前还应明确连接/读取超时、重试范围（仅幂等操作）以及 Micrometer 指标和链路追踪。
 
 ---
 
-## **6. 自定义负载均衡策略**
+### 6. 自定义负载均衡策略
 
-Spring Cloud LoadBalancer 默认使用 **RoundRobin（轮询）** 策略，你可以自定义负载均衡策略，如 **随机（Random）** 或 **最少连接（Least Connection）**。
+Spring Cloud LoadBalancer 默认使用 **RoundRobin（轮询）** 策略。可以为特定服务接入 **随机（Random）** 或自定义的 `ReactorLoadBalancer`；“最少连接”不是内置策略，若确有需要，应自行维护所需的连接/负载指标并实现选择逻辑。
 
-### **(1) 自定义 LoadBalancer 规则**
+#### (1) 自定义 LoadBalancer 规则
 
 创建一个 `LoadBalancerConfiguration` 类：
 
@@ -423,26 +424,26 @@ public class CustomLoadBalancerConfig {
 }
 ```
 
-### **(2) 在 `application.yml` 中指定自定义规则**
+#### (2) 将规则绑定到指定服务
 
-```yaml
-spring:
-  cloud:
-    loadbalancer:
-      clients:
-        product-service:
-          hint: customLoadBalancer
+```java
+@Configuration
+@LoadBalancerClient(
+        value = "product-service",
+        configuration = CustomLoadBalancerConfig.class)
+public class ProductServiceLoadBalancerConfiguration {
+}
 ```
 
-此时，`product-service` 将使用 **随机（Random）负载均衡策略**。
+`CustomLoadBalancerConfig` 不应被主应用的组件扫描直接扫描到；上述配置只会让 `product-service` 使用随机策略。
 
 ---
 
-## **7. Spring Cloud Gateway 结合 LoadBalancer**
+### 7. Spring Cloud Gateway 结合 LoadBalancer
 
-Spring Cloud Gateway 作为 API 网关，可以使用 LoadBalancer 进行服务端负载均衡。
+Spring Cloud Gateway 作为 API 网关，可以在转发到后端服务时使用 LoadBalancer 进行客户端实例选择。
 
-### **(1) Gateway 配置**
+#### (1) Gateway 配置
 
 ```yaml
 spring:
@@ -459,7 +460,7 @@ spring:
 
 ---
 
-## **8. Spring Cloud LoadBalancer vs Ribbon**
+### 8. Spring Cloud LoadBalancer vs Ribbon
 
 Spring Cloud LoadBalancer 取代了 Ribbon，并进行了许多优化：
 
@@ -472,29 +473,28 @@ Spring Cloud LoadBalancer 取代了 Ribbon，并进行了许多优化：
 
 ---
 
-## **总结**
+### 小结
 
 - **Spring Cloud LoadBalancer** 是 **Ribbon 的官方替代方案**，支持 **RestTemplate、WebClient、Feign、Spring Cloud Gateway** 等。
-- **默认使用轮询策略**，但可以通过 **自定义 `ReactorLoadBalancer`** 来更改策略，如 **随机、最少连接等**。
+- **默认使用轮询策略**，也可使用随机策略或通过 **自定义 `ReactorLoadBalancer`** 实现特定的选择逻辑。
 - **相比 Ribbon，LoadBalancer 支持异步编程**，并与 Spring Reactor 深度集成，更适合现代微服务架构。
 
-如果你有任何具体的问题或想要更详细的示例，欢迎继续提问！🚀
+## 三、Sentinel：熔断与限流
 
-# 3. 熔断和限流示例
-如果你的微服务架构使用的是 **Spring Cloud Alibaba（Cloud-Nacos）**，那么 **最佳的熔断与限流方案** 是 **Sentinel**，原因如下：
+如果项目采用 **Spring Cloud Alibaba + Nacos**，Sentinel 是与该生态集成度很高的治理方案；若更偏向纯 Java 库和代码化配置，也可评估 Resilience4j。选型应看规则动态化、可观测性和团队运维方式，而非将任何一个方案视为绝对默认。
 
-### **1. 为什么选择 Sentinel？**
+### 1. 为什么选择 Sentinel？
 
 ✅ **官方推荐**：Sentinel 是阿里巴巴团队开发的，**Spring Cloud Alibaba** 原生集成了 Sentinel，适配性更好。  
-✅ **强大的功能**：Sentinel **不仅支持熔断降级，还支持限流、热点参数限流、系统保护等**，比 Resilience4j 适用场景更广。  
+✅ **治理能力完整**：Sentinel 支持熔断降级、限流、热点参数限流和系统保护，尤其适合需要控制台与动态规则的场景。
 ✅ **可视化控制台**：Sentinel 提供了一个 **Web 控制台**，可以动态调整熔断、限流规则，而不用重启服务。  
 ✅ **与 Nacos 无缝结合**：可以 **从 Nacos 读取限流规则**，实现动态限流。
 
 ---
 
-## **2. 如何在 Spring Cloud Alibaba（Nacos）中使用 Sentinel？**
+### 2. 如何在 Spring Cloud Alibaba（Nacos）中使用 Sentinel？
 
-### **（1）引入 Sentinel 依赖**
+#### （1）引入 Sentinel 依赖
 
 在 `pom.xml` 中添加以下依赖：
 
@@ -507,7 +507,7 @@ Spring Cloud LoadBalancer 取代了 Ribbon，并进行了许多优化：
 
 ---
 
-### **（2）配置 Sentinel**
+#### （2）配置 Sentinel
 
 在 `application.yml` 配置 Sentinel：
 
@@ -535,11 +535,11 @@ spring:
 
 ---
 
-### **（3）在 FeignClient 上启用 Sentinel**
+#### （3）在 FeignClient 上启用 Sentinel
 
 默认情况下，**Spring Cloud OpenFeign** 结合 Sentinel 时，需要手动开启 Sentinel 支持。
 
-#### **① 在 `application.yml` 启用 Feign + Sentinel**
+##### ① 在 `application.yml` 启用 Feign + Sentinel
 
 ```yaml
 feign:
@@ -547,7 +547,7 @@ feign:
     enabled: true
 ```
 
-#### **② 定义 FeignClient**
+##### ② 定义 FeignClient
 
 ```java
 @FeignClient(name = "product-service", fallback = ProductFallback.class)
@@ -557,7 +557,7 @@ public interface ProductClient {
 }
 ```
 
-#### **③ 创建 `ProductFallback` 降级逻辑**
+##### ③ 创建 `ProductFallback` 降级逻辑
 
 ```java
 @Component
@@ -571,7 +571,7 @@ public class ProductFallback implements ProductClient {
 
 ---
 
-### **（4）在 Controller 上使用 Sentinel 熔断**
+#### （4）在 Controller 上使用 Sentinel 熔断
 
 如果你希望在 `RestController` 方法上直接加熔断，可以使用 `@SentinelResource`。
 
@@ -609,9 +609,9 @@ public class OrderController {
 
 ---
 
-## **3. 限流（流控）配置**
+### 3. 限流（流控）配置
 
-### **（1）在 Sentinel 控制台添加限流规则**
+#### （1）在 Sentinel 控制台添加限流规则
 
 1. 启动 Sentinel 控制台 `http://localhost:8080`
 2. 在 **流控规则** 中，添加：
@@ -622,9 +622,9 @@ public class OrderController {
 
 ---
 
-## **4. 熔断规则**
+### 4. 熔断规则
 
-### **（1）在 Sentinel 控制台添加熔断规则**
+#### （1）在 Sentinel 控制台添加熔断规则
 
 1. 在 **熔断降级** 规则中，添加：
     - 资源名称：`getOrder`
@@ -634,7 +634,7 @@ public class OrderController {
 
 ---
 
-## **5. Nacos + Sentinel 配置动态化**
+### 5. Nacos + Sentinel 配置动态化
 
 如果你希望 **将 Sentinel 限流、熔断规则存储在 Nacos**，可以：
 
@@ -655,22 +655,22 @@ spring:
 
 ---
 
-## **6. Sentinel vs Resilience4j**
+### 6. Sentinel vs Resilience4j
 
 如果你使用 **Spring Cloud Alibaba**（Nacos），那 **Sentinel** 是最佳选择。但如果你没有使用 Alibaba 生态，建议用 **Resilience4j**。
 
-| 特性         | Sentinel                               | Resilience4j             |
-| ------------ | -------------------------------------- | ------------------------ |
-| 维护方       | 阿里巴巴                               | Spring 官方              |
-| 适用场景     | **Nacos、Dubbo、Spring Cloud Alibaba** | **Spring Cloud Netflix** |
-| 熔断策略     | **响应时间、失败率、流量**             | **失败率、慢调用**       |
-| 限流         | **支持**                               | **不支持**               |
-| 控制台       | **有**                                 | **无**                   |
-| 规则动态配置 | **支持 Nacos 配置**                    | **不支持**               |
+| 特性         | Sentinel                               | Resilience4j                         |
+| ------------ | -------------------------------------- | ------------------------------------ |
+| 维护方       | 阿里巴巴                               | resilience4j 社区                    |
+| 适用场景     | **Nacos、Dubbo、Spring Cloud Alibaba** | 独立 Java 应用、Spring Boot 应用     |
+| 熔断策略     | **慢调用、异常比例、异常数**           | **失败率、慢调用**                   |
+| 限流         | **支持**                               | **支持 `RateLimiter` 模块**          |
+| 控制台       | **有 Sentinel Dashboard**              | 无官方默认控制台                      |
+| 规则动态配置 | 可通过 Nacos 等数据源接入              | 需自行结合配置中心与刷新机制         |
 
 ---
 
-## **7. 总结**
+### 7. 小结
 
 - **你使用 Spring Cloud Alibaba + Nacos，最佳选择是 Sentinel**
 - **Sentinel 适用于熔断、限流、降级、热点流控**
@@ -680,13 +680,13 @@ spring:
 
 ---
 
-# 4. **Sentinel 的熔断和降级原理**
+## 四、Sentinel 熔断与降级原理
 
-## **1. Sentinel 熔断和降级的基本概念**
+### 1. 基本概念
 
 在 **分布式微服务架构** 中，某些服务可能会因为高并发、超时、故障等原因而无法正常工作。**Sentinel** 提供了 **熔断（Circuit Breaker）** 和 **降级（Fallback）** 机制，确保系统的稳定性和高可用性。
 
-### **（1）熔断（Circuit Breaker）**
+#### （1）熔断（Circuit Breaker）
 
 - **目的**：当某个服务的失败率或响应时间超过阈值，Sentinel 会**临时中断请求**，防止系统崩溃。
 - **触发条件**：
@@ -694,7 +694,7 @@ spring:
     - **异常比例熔断**（Failure Ratio）
     - **异常数熔断**（Exception Count）
 
-### **（2）降级（Fallback）**
+#### （2）降级（Fallback）
 
 - **目的**：当一个服务熔断后，Sentinel 会触发**降级策略**，返回**预设的默认值**，而不是直接报错。
 - **实现方式**：
@@ -704,11 +704,11 @@ spring:
 
 ---
 
-## **2. Sentinel 熔断机制的工作原理**
+### 2. 熔断机制的工作原理
 
 Sentinel 的熔断策略基于**滑动窗口统计**，它会维护一个时间窗口，并基于窗口内的请求统计数据决定是否开启熔断。
 
-### **（1）滑动窗口（Sliding Window）**
+#### （1）滑动窗口（Sliding Window）
 
 - Sentinel 使用 **滑动窗口计数**（Sliding Window Counter）来记录请求状态。
 - 窗口内的请求 **成功/失败/慢调用** 统计值会决定熔断是否触发。
@@ -718,7 +718,7 @@ Sentinel 的熔断策略基于**滑动窗口统计**，它会维护一个时间�
 > - 假设滑动窗口大小为 10s，每秒处理 100 个请求。
 > - 如果 10s 内失败率达到 50%，就触发熔断。
 
-### **（2）熔断状态转换**
+#### （2）熔断状态转换
 
 Sentinel 熔断器的状态主要有 **3 种**：
 
@@ -738,11 +738,11 @@ Sentinel 熔断器的状态主要有 **3 种**：
 
 ---
 
-## **3. Sentinel 降级机制的工作原理**
+### 3. 降级机制的工作原理
 
 **降级（Fallback）** 主要是为了保证核心业务的可用性。即使某个服务出现故障，系统也能提供基本功能。
 
-### **（1）降级的触发条件**
+#### （1）降级的触发条件
 
 Sentinel 的降级策略基于 **服务端性能和健康状态**：
 
@@ -750,7 +750,7 @@ Sentinel 的降级策略基于 **服务端性能和健康状态**：
 - **异常降级**：如果请求失败率过高，触发降级。
 - **自定义规则**：可以在 **Sentinel 控制台** 设定降级策略。
 
-### **（2）降级的实现方式**
+#### （2）降级的实现方式
 
 1. **Feign 降级**
     - 在 FeignClient 上定义 `fallback` 方法。
@@ -761,21 +761,21 @@ Sentinel 的降级策略基于 **服务端性能和健康状态**：
 
 ---
 
-## **4. Sentinel 熔断和降级的示例**
+### 4. 熔断和降级的示例
 
-### **（1）Feign + Sentinel 实现熔断降级**
+#### （1）Feign + Sentinel 实现熔断降级
 
 依赖、Feign 开关和 `ProductFallback` 的完整代码已在上文「如何在 Spring Cloud Alibaba（Nacos）中使用 Sentinel」给出。本节只强调：`fallback` 用于处理业务调用异常；若需要处理 Sentinel 的限流/熔断拦截，应配置 `blockHandler` 或使用 Sentinel 适配层提供的降级机制。
 
 ---
 
-### **（2）`@SentinelResource` 实现熔断**
+#### （2）`@SentinelResource` 实现熔断
 
 若不使用 Feign，而是直接保护本地资源或调用逻辑，可以使用上文已经给出的 `@SentinelResource` 示例。`fallback` 用于处理业务方法抛出的异常；限流、熔断等 Sentinel block 异常由 `blockHandler` 处理。两类方法的参数都要与原方法匹配，并在末尾分别增加 `Throwable` 或 `BlockException`。
 
 ---
 
-### **（3）在 Sentinel 控制台配置熔断**
+#### （3）在 Sentinel 控制台配置熔断
 
 1. 访问 `http://localhost:8080`
 2. 在 **熔断规则** 中，添加：
@@ -787,7 +787,7 @@ Sentinel 的降级策略基于 **服务端性能和健康状态**：
 
 ---
 
-## **5. Sentinel 熔断和降级 vs Hystrix**
+### 5. Sentinel 熔断和降级 vs Hystrix
 
 | 关键点       | **Sentinel**                 | **Hystrix（已过时）** |
 | ------------ | ---------------------------- | --------------------- |
@@ -802,7 +802,7 @@ Sentinel 的降级策略基于 **服务端性能和健康状态**：
 
 ---
 
-## **6. 总结**
+### 6. 小结
 
 ✅ **Sentinel 采用滑动窗口计数** 来统计失败率，决定是否触发熔断。  
 ✅ **Sentinel 提供 3 种熔断策略**（慢调用熔断、异常比例熔断、异常数熔断）。  
@@ -812,7 +812,7 @@ Sentinel 的降级策略基于 **服务端性能和健康状态**：
 
 ---
 
-## 落地建议（高并发场景）
+### 落地建议（高并发场景）
 - 注册发现优先用 Spring Cloud LoadBalancer 搭配 Nacos/Eureka，减少 Ribbon 旧依赖。
 - 网关统一走 Spring Cloud Gateway，限流过滤器接 Sentinel。
 - 配置集中放 Config Server/Git，变更后配合 `bus-refresh` 热推送。
