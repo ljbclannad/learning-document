@@ -126,7 +126,9 @@
 	2. 跨分片比例：patient_id 查询中，有多少是跨分片的
         - patient_qps：所有带 patient_id 条件的查询数量
         - patient_cross_shard_qps：其中命中分片数量 > 1 的
-        - patient_cross_shard_p99_latency：patient_cross_shard_qps / patient_qspatient_cross_shard_p99_latency
+		- `cross_shard_ratio = patient_cross_shard_qps / patient_qps`：跨分片比例（注意分母为 0 时单独处理）。
+		- `patient_cross_shard_p99_latency`：跨分片查询自身的 P99 延迟；不要把“比例”和“延迟”混成一个指标。
+		- 同时按 `api_name` 统计 QPS、P95/P99、错误率和命中分片数分布，才能区分“低频但很慢”和“高频且扇出大”。
 	3. 业务维度：是哪些接口在疯狂按 patient_id 聚合？
 
 #### 1.1.4.2 发现跨分片比例很高，怎么迭代分片策略？
