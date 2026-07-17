@@ -1,21 +1,29 @@
-# 安装部分
+# Docker 安装 RabbitMQ
 
-1. 查找镜像：`docker search rabbitmq`
+使用带管理插件的镜像，持久化 `/var/lib/rabbitmq`。示例只将端口发布到本机；生产环境不应把 AMQP 或管理端口直接暴露到公网。
 
-   
+```bash
+docker volume create rabbitmq-data
+docker run -d --name rabbitmq \
+  --hostname rabbitmq \
+  -p 127.0.0.1:5672:5672 \
+  -p 127.0.0.1:15672:15672 \
+  -e RABBITMQ_DEFAULT_USER='<管理员用户名>' \
+  -e RABBITMQ_DEFAULT_PASS='<强密码>' \
+  -v rabbitmq-data:/var/lib/rabbitmq \
+  rabbitmq:4-management
+```
 
-2. 拉取镜像：`docker pull rabbitmq`
-3. 启动镜像：`run --name rabbitmq -p 15672:15672 -p 5672:5672 -d rabbitmq`
+管理控制台地址为 `http://localhost:15672/`。`-management` 标签已包含管理插件，通常不需要进入容器执行 `rabbitmq-plugins enable rabbitmq_management`。
 
+## 用户与权限
 
+```bash
+docker exec -it rabbitmq rabbitmqctl list_users
+docker exec -it rabbitmq rabbitmqctl add_user <用户名> '<密码>'
+docker exec -it rabbitmq rabbitmqctl set_user_tags <用户名> management
+docker exec -it rabbitmq rabbitmqctl set_permissions -p / <用户名> '.*' '.*' '.*'
+docker exec -it rabbitmq rabbitmqctl list_user_permissions <用户名>
+```
 
-# 配置部分
-
-1. 启动前端控制台：    1. `docker exec -it rabbitmq bash`
-    2. `rabbitmq-plugins enable rabbitmq_management`
-2. 其他基础操作：    1. 查看当前所有用户：`sudo rabbitmqctl list_users`
-    2. 查看默认guest用户的权限：`sudo rabbitmqctl list_user_permissions guest`
-    3. 添加新用户：`sudo rabbitmqctl add_user username password`
-    4. 设置用户tag：`sudo rabbitmqctl set_user_tags username administrator`
-    5. 赋予用户默认host的全部操作权限：`sudo rabbitmqctl set_permissions -p / username ".*" ".*" ".*"`
-    6. 查看用户的权限：`sudo rabbitmqctl list_user_permissions username`
+最后一条授权对默认 vhost 的配置、写入、读取均为全量匹配，仅适合管理员或开发环境。业务账户应使用独立 vhost，并按资源名的正则表达式收窄权限。默认 `guest` 用户默认只能从 localhost 登录，不能作为远程生产账户。
