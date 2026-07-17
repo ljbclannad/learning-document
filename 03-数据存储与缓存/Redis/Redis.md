@@ -1,5 +1,25 @@
 # Redis
 
+> **本文定位：Redis 的主线知识笔记。**用于系统学习数据类型、运行机制、持久化、高可用与常见实践；概念定义和底层原理以本文为准。
+>
+> - 需要按问题复习或准备表达时，阅读 [Redis 常见问答与复习清单](Redis-Q.md)。
+> - 需要把 Redis 放进支付回调、幂等、缓存与消息链路时，阅读 [Redis 在支付场景中的设计题](Redis场景题.md)。
+> - 需要组合多条命令并保证原子性时，阅读 [Redis Lua：原子组合操作与使用边界](RedisLua.md)。
+> - 需要处理复制确认、Stream Pending、安全基线或客户端治理时，阅读 [Redis 生产高频专题](Redis生产高频专题.md)。
+> - 场景题只讨论“如何组合能力”，不替代本文对命令语义、数据模型和一致性边界的说明。
+
+## 专题阅读地图
+
+本文保留为主线参考；阅读时可按专题直达，避免从头扫描整篇。
+
+| 目标 | 优先入口 |
+| --- | --- |
+| 数据类型、编码与命令 | [数据类型](#3-redis中常用的数据类型)、[跳表](#4-跳表)、[Hash](#5-hash) |
+| 运行机制与性能 | [为什么快](#1-redis为什么这么快)、[I/O 多路复用](#2-io多路复用)、[热点 Key](#9-热点key) |
+| 数据安全与高可用 | [持久化](#10-持久化)、[主从同步](#18-redis的主从同步) |
+| 缓存一致性与并发 | [缓存问题](#11-缓存击穿缓存穿透缓存雪崩)、[一致性](#12-数据库缓存一致性)、[分布式锁](#13-redis分布式锁) |
+| Lua 原子组合 | [Redis Lua 专题](RedisLua.md) |
+
 ```
 docker run -d --name redis \
   -p 6379:6379 \
@@ -28,7 +48,7 @@ services:
           memory: 512M
 ```
 
-## 目录
+## 完整目录
 1. [Redis为什么这么快](#1-redis为什么这么快)
 2. [I/O多路复用](#2-io多路复用)
 3. [redis中常用的数据类型](#3-redis中常用的数据类型)
@@ -44,10 +64,10 @@ services:
 13. [Redis分布式锁](#13-redis分布式锁)
 14. [Redisson原理](#14-redisson原理)
 15. [Redisson使用场景](#15-redisson使用场景)
-16. [读写锁保证双写强一致性](#16-读写锁保证双写强一致性)
+16. [读写锁减少双写并发冲突，不能保证强一致性](#16-读写锁减少双写并发冲突不能保证强一致性)
 17. [Redisson的可重入](#17-redisson的可重入)
 18. [Redis的主从同步](#18-redis的主从同步)
-19. [看门狗为什么不能适用于setNx](#19-看门狗为什么不能适用于setNx)
+19. [原生 SET NX PX 为什么没有内置看门狗？如何安全续期？](#19-原生-set-nx-px-为什么没有内置看门狗如何安全续期)
 
 ## 1. Redis为什么这么快
 
@@ -56,8 +76,9 @@ services:
 - 内存操作的典型延迟在纳秒级别，而磁盘操作通常需要毫秒级。
 
 ### *1.2 单线程模型*
-- Redis采用单线程模型处理请求，避免了多线程的上下文切换和锁竞争。
-- 单线程通过高效的I/O多路复用（epoll/kqueue等）处理多个客户端请求，确保高性能。
+- Redis 的命令执行路径主要由主线程串行处理，因而避免了同一份数据上的锁竞争和频繁线程切换；这不表示进程中只有一个线程。
+- Redis 6.0 起可选择启用 I/O 线程分担网络读写；命令执行仍以主线程串行为主。单线程也不能抵消慢命令的影响。
+- 主线程通过 I/O 多路复用处理多个客户端连接；Linux 通常使用 `epoll`，其他平台会选择 `kqueue`、`select` 等后端。
 
 ### *1.3 高效的数据结构*
 - Redis的数据结构（如字符串、哈希、列表、集合、有序集合等）经过高度优化，内存和时间复杂度都非常低。
@@ -75,11 +96,11 @@ services:
 
 ### *1.6 数据压缩与优化*
 - Redis对存储数据进行了紧凑化的内存优化，例如：
-    - 小数据量的字符串存储为SDS（简单动态字符串）。
-    - 小型哈希、列表等结构会以特殊编码方式存储（如ziplist或intset），减少内存占用。
+    - String 值使用 SDS（简单动态字符串）；SDS 记录长度并支持二进制安全，而不是“小字符串专用”的编码。
+    - 小型聚合类型会使用紧凑编码；以当前 Redis 版本为例，Hash、List、ZSet 常见为 listpack，Set 在满足条件时可使用 intset。具体阈值由配置和版本决定。
 
 ### *1.7 持久化异步处理*
-- 虽然支持持久化（RDB和AOF），但Redis将持久化操作放在单独的线程中，避免影响主线程的高效处理。
+- `BGSAVE` 和 `BGREWRITEAOF` 通常通过 `fork` 出子进程完成主要持久化工作，父进程继续处理请求；并非简单地“放到单独线程”。`fork` 和写时复制（COW）仍可能造成延迟抖动与额外内存压力。
 
 ### *1.8 优化的分布式架构*
 - Redis支持主从复制和集群模式，分散了压力。
@@ -252,7 +273,7 @@ I/O多路复用是一种高效管理多个网络连接的技术。通过单个�
 
     - 架构层隔离
         - 在线缓存实例 vs 离线扫描/分析实例分离（避免 “稽核大查询” 打死在线 Redis）
-        - 读写分离：读走 replica，写在 master（但注意复制延迟）
+        - 读写分离：读走 replica，写在 primary（但注意复制延迟）
 
 4. 总结
     - Redis 之所以会被慢命令卡死，是因为单线程事件循环：命令执行占满主线程时，网络读写和其他请求都无法被处理；治理要么减少 O(N) 命令和 BigKey，要么用 SCAN/分页/UNLINK/lazyfree 把工作拆小或挪到后台，并用 slowlog/latency/输出缓冲限制做监控与护栏。
@@ -469,14 +490,14 @@ Redis支持多种数据类型，每种类型适合不同的应用场景。以下
         ```
 
     **问题4：Hash内存编码切换导致内存突增**
-    - 现象：Hash从ziplist编码切换到hashtable编码，内存占用突然增加
-    - 触发条件：字段数超过512或单个value超过64字节（默认配置）
+    - 现象：现代 Redis 中，小 Hash 通常从 `listpack` 编码切换到 `hashtable` 编码，内存占用可能突然增加；旧版本资料中常见的 `ziplist` 仅适用于相应旧版本。
+    - 触发条件：受 Redis 版本和 `hash-max-listpack-entries`、`hash-max-listpack-value` 配置影响；不要把 512 个字段、64 字节当作所有版本的固定阈值。
     - 影响：内存使用量可能增加数倍
     - 解决方案：
         ```shell
-        # 调整编码切换阈值
-        CONFIG SET hash-max-ziplist-entries 1000  # 字段数阈值
-        CONFIG SET hash-max-ziplist-value 128     # 值大小阈值
+        # 现代 Redis：调整 listpack 编码切换阈值
+        CONFIG SET hash-max-listpack-entries 1000  # 字段数阈值
+        CONFIG SET hash-max-listpack-value 128     # 值大小阈值
         ```
         ```java
         // 代码层面控制
@@ -769,7 +790,7 @@ SREM fruits "apple"             # 删除元素
 2. 常用操作：
     - 添加元素：`ZADD key score value`
     - 获取范围元素：`ZRANGE key start stop [WITHSCORES]`
-    - 按分数范围获取：`ZRANGEBYSCORE key min max`
+    - 按分数范围获取：`ZRANGE key min max BYSCORE`（`ZRANGEBYSCORE` 为兼容写法）
     - 删除元素：`ZREM key value`
 
 3. 示例：
@@ -777,7 +798,7 @@ SREM fruits "apple"             # 删除元素
 ZADD leaderboard 100 "Alice"    # 添加元素及其分数
 ZADD leaderboard 200 "Bob"
 ZRANGE leaderboard 0 -1 WITHSCORES  # 按分数排序返回 ["Alice", 100, "Bob", 200]
-ZRANGEBYSCORE leaderboard 50 150  # 获取分数范围内的元素，返回 ["Alice"]
+ZRANGE leaderboard 50 150 BYSCORE  # 获取分数范围内的元素，返回 ["Alice"]
 ZREM leaderboard "Alice"         # 删除元素
 ```
 
@@ -813,7 +834,7 @@ ZREM leaderboard "Alice"         # 删除元素
         ```
 
     **问题2：ZSet作为延迟队列消息重复消费**
-    - 现象：多个消费者同时ZRANGEBYSCORE获取到期消息，导致重复处理
+    - 现象：多个消费者同时按 score 范围查询到期消息，导致重复处理
     - 影响：消息被重复消费，业务逻辑错误
     - 解决方案：
         ```java
@@ -838,7 +859,8 @@ ZREM leaderboard "Alice"         # 删除元素
             String.valueOf(System.currentTimeMillis()), 
             "10");  // 每次最多取10条
         
-        // 正确做法2：使用ZPOPMIN（Redis 5.0+）
+        // 备选：ZPOPMIN 只能弹出最小 score，不能保证已经到期。
+        // 只有确认队首 score <= now 时才可消费；否则需放回或等待。
         Set<Tuple> messages = jedis.zpopmin("delay:queue", 10);
         ```
 
@@ -856,7 +878,9 @@ ZREM leaderboard "Alice"         # 删除元素
         String member = userId + ":" + System.currentTimeMillis();
         jedis.zadd("leaderboard", actualScore, member);
         
-        // 方案3：分数相同时按字典序排序（Redis 6.2+ ZRANGE支持BYLEX）
+        // 方案3：明确并列规则。ZSet 同分 member 会按字节序排序；
+        // 若业务需要“同分按创建时间”，应在 member 中编码次级排序字段，
+        // 或使用可逆的复合 score，并评估 double 精度与更新成本。
         ```
 
     **问题4：ZSet无限增长成为BigKey**
@@ -1464,115 +1488,13 @@ GEODIST locations "Palermo" "Catania" km       # 返回距离，单位公里
 7. 热key考虑本地缓存或分片
 
 ## 4. 跳表
-### *4.1 Redis中的跳表详解*
-跳表（Skip List）是一种动态数据结构，提供了一种快速的有序数据访问方式。它是Redis实现**有序集合（Sorted Set）**的核心数据结构之一。
-https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/ea6a591ff380479bac6e11f90d55146b~tplv-k3u1fbpfcp-zoom-in-crop-mark:1512:0:0:0.awebp
+跳表是 Redis 有序集合（ZSet）在超过紧凑编码阈值后使用的有序索引结构。理解这一节只需抓住三点：
 
-![跳表结构](跳表详解.md)
+1. **为什么需要它：**ZSet 既要按 `member` 快速定位，又要按 `score` 做范围查询和排名。常规编码下 Redis 同时维护 `dict`（`member → score`）与跳表（按 `score` 排序）。
+2. **为什么适合范围与排名：**跳表通过多层前向指针把查找、插入和删除的平均复杂度控制在 `O(log N)`；底层顺序链表用于范围遍历，节点的 `span` 支持按 rank 定位。
+3. **不要忽略编码前提：**小 ZSet 通常采用 listpack 等紧凑编码；是否升级为“字典 + 跳表”取决于 Redis 版本和 `zset-max-listpack-*` 配置阈值。
 
-### *4.2 什么是跳表？*
-跳表是一种基于链表的数据结构，用于高效地实现有序集合。通过在链表上增加多级“跳跃”指针，跳表实现了类似于二分查找的效率，可以在O(log n)时间复杂度内完成插入、删除和查找操作。
-
-### *4.3 跳表的基本结构*
-1. *节点（Node）*：
-    - 每个节点包含三个部分：
-        - *值（value）*：实际存储的元素（在Redis中是member）。
-        - *分数（score）*：节点排序的依据。
-        - *前向指针数组*：指向当前节点的不同层级的下一个节点。
-2. *层级（Level）*：
-    - 每个节点随机分配一个层数，层数越高，跳跃的跨度越大。
-    - 层数的分布服从几何分布，通常是1/2概率递减，即高层节点的数量较少。
-    - 层级的最高高度与节点总数的对数成正比。
-3. *头节点（Header）*：
-    - 特殊节点，不存储任何值，作为跳表的起点。
-4. *尾节点（Tail）*：
-    - 特殊节点，标志跳表的终点。
-
-### *4.4 跳表操作详解*
-#### *4.4.1 查找*
-1. 查找操作从最高层的头节点开始：
-    - 如果当前节点的下一个节点分数小于目标值，沿当前层继续向右移动。
-    - 如果当前节点的下一个节点分数大于或等于目标值，向下一层继续查找。
-    - 最终定位到目标节点，时间复杂度为O(log n)。
-
-#### *4.4.2 插入*
-1. 插入一个新节点的步骤：
-    - 随机生成该节点的层级（通过随机数决定层数）。
-    - 从最高层开始，寻找插入点（同查找操作）。
-    - 在每一层插入新节点的指针，更新相关节点的前向和后向指针。
-    - 如果新节点的层数超过当前跳表的最大层数，扩展跳表的高度。
-
-#### *4.4.3 删除*
-1. 删除一个节点的步骤：
-    - 从最高层开始，查找到目标节点（同查找操作）。
-    - 更新各层中与目标节点相关的指针。
-    - 如果删除节点后某些层级没有节点，减少跳表的高度。
-
-### *4.5 Redis中跳表的实现*
-Redis使用跳表作为有序集合（Sorted Set）的底层实现之一，具体包括以下特点：
-1. 组合结构：
-    - Redis的有序集合由两部分组成：
-        - 跳表（Skip List）：用于快速的范围查找和排序。
-        - 哈希表（Hash Table）：用于快速的分数和成员映射。
-2. 跳表节点（zskiplistNode）：
-    - 包含字段：
-        - `score`：排序依据。
-        - `ele`：存储的元素值（member）。
-        - `forward[]`：前向指针数组，用于不同层级的跳跃。
-        - `backward`：后向指针。
-3. 跳表结构（zskiplist）：
-    - 包含字段：
-        - `header`：头节点。
-        - `tail`：尾节点。
-        - `level`：当前最大层级。
-        - `length`：跳表的节点数。
-4. 随机层数生成：
-    - Redis通过随机算法为每个节点分配层数，控制在1到32之间。
-    - 层数的概率分布为几何分布，高层节点的数量较少。
-
-### *4.6 跳表的优点*
-1. 效率高：时间复杂度为O(log n)，接近于平衡树。
-2. 实现简单：相比于红黑树等复杂的平衡树，跳表更容易实现。
-3. 动态调整：插入和删除操作可以自动维护层次结构。
-
-### *4.7 跳表的缺点*
-1. 空间占用较高：每个节点需要额外的指针存储。
-2. 随机性依赖：性能受随机数生成质量的影响。
-
-### *4.8 Redis跳表的应用场景*
-跳表主要用于以下Redis功能：
-1. Sorted Set的实现：
-    - 跳表实现有序集合中基于分数的排序功能。
-    - 支持范围查找（如`ZRANGEBYSCORE`、`ZREVRANGEBYSCORE`）。
-2. 排行榜功能：
-    - 跳表可高效地实现排行榜的插入、查找和更新。
-3. 延迟队列：
-    - 基于分数存储时间戳，跳表可以高效实现延迟任务调度。
-
-### *4.9 示例操作*
-
-```shell
-# 添加元素到有序集合
-ZADD leaderboard 100 "Alice"
-ZADD leaderboard 200 "Bob"
-ZADD leaderboard 150 "Charlie"
-# 按分数范围获取元素
-ZRANGEBYSCORE leaderboard 100 200  # 返回 ["Alice", "Charlie", "Bob"]
-# 获取指定排名的元素
-ZRANGE leaderboard 0 -1 WITHSCORES  # 返回按分数排序的所有元素及分数
-# 删除元素
-ZREM leaderboard "Alice"
-# 获取元素的排名
-ZRANK leaderboard "Bob"  # 返回排名（从0开始）
-```
-
-### *4.10 跳表与其他数据结构对比*
-
-| 数据结构 | 时间复杂度 | 空间效率 | 适用场景                   |
-| -------- | ---------- | -------- | -------------------------- |
-| 跳表     | O(log n)   | 较高     | 高效范围查询，动态数据排序 |
-| 红黑树   | O(log n)   | 较高     | 全局有序，但实现复杂       |
-| 哈希表   | O(1)       | 较低     | 无序，适合快速键值映射     |
+业务上，排行榜、延迟任务和按分数范围检索对应的是 ZSet 命令语义，而不是直接操作跳表。跳表的节点、层高、`span`、插入/删除源码与复杂度比较，统一见 [跳表详解](跳表详解.md)。
 
 
 ## 5. Hash
@@ -1586,7 +1508,7 @@ ZRANK leaderboard "Bob"  # 返回排名（从0开始）
 3. 字段操作支持
     - 支持对单个字段或多个字段的高效操作。
 4. 内部实现
-    - 当字段数量较少时，使用紧凑表（ziplist）存储。
+    - 现代 Redis 在小对象场景通常使用紧凑编码（如 listpack）；旧版本可能使用 ziplist。
     - 字段数量较多或字段值较长时，使用真正的哈希表。
 
 ### 5.2 Hash常用命令
@@ -1648,10 +1570,10 @@ HKEYS stock                      # 返回所有商品 ["product1"]
     - 将相关数据集中在一个键中，方便管理。
 
 ### 5.5 Hash的内部实现
-1. `ziplist`（压缩列表）
-    - 如果Hash的字段数量较少（默认小于512个）且值较短（默认小于64字节），使用压缩列表。
-    - 优点：节省内存。
-    - 缺点：操作复杂度较高，插入、删除效率较低。
+1. `listpack`（紧凑编码，现代 Redis）
+    - 当 Hash 的字段数量和字段/值大小仍在 `hash-max-listpack-*` 阈值内时，通常使用 listpack 以节省内存；具体阈值由版本和配置决定。
+    - 旧版本资料中的 `ziplist` 是历史实现，阅读时应注意版本边界。
+    - 紧凑编码在中间位置插入、删除的成本更高，因此不适合无限增长的大 Hash。
 2. `hashtable`（哈希表）
     - 当字段数量较多或值较长时，自动切换为哈希表。
     - 优点：读写效率高。
@@ -1799,8 +1721,8 @@ Redis事务是通过一组命令的原子性操作来实现的。事务由以下
 4. 放弃事务：如果需要取消事务，可以使用`DISCARD`命令。
 
 ### 6.2 事务的特性
-- 单独执行：事务中的命令按顺序执行，不会被其他命令打断。
-- 非原子性：Redis事务不支持部分回滚。如果事务中的某条命令执行失败，其他命令仍然会执行。
+- 执行隔离：`EXEC` 开始后，已入队命令会按顺序连续执行，其他客户端命令不会插入其中。
+- 无回滚：Redis 不会因为运行期某条命令报错而撤销此前已经成功的命令；其“原子性”不能等同于关系型数据库的全成功/全回滚。
 - 乐观锁支持：通过`WATCH`命令可以监控键的变化，确保事务的执行前数据未被修改。
 
 ### 6.3 Redis事务的实现流程
@@ -2677,7 +2599,7 @@ public class HotKeyLuaExample {
 
 4. 优点：
     - 数据安全：支持更频繁的持久化策略（如每秒写入），数据丢失量较少。
-    - 文件可读性：AOF文件以文本形式存储，便于查看和编辑。
+    - 可检查性：AOF 使用 RESP 命令流，通常可用文本方式检查；但生产环境不应直接手工编辑，应先备份并使用官方工具校验或修复。
 
 5. 缺点：
     - 文件较大：AOF文件比RDB文件更占用磁盘空间。
@@ -2703,7 +2625,7 @@ aof-use-rdb-preamble yes          # 开启混合持久化
 | 恢复速度       | 恢复较快                   | 恢复较慢（需要执行所有日志）    |
 | 性能开销       | 写入效率高，对性能影响较小 | 写入频繁，对性能影响较大        |
 | 文件大小       | 文件较小                   | 文件较大                        |
-| 文件可读性     | 二进制格式，不易读         | 文本格式，可读性强              |
+| 文件可读性     | 二进制格式，不易读         | RESP 命令流，通常较易检查       |
 | 备份与迁移     | 便于备份和迁移             | 文件较大，不便于迁移            |
 
 
@@ -2937,13 +2859,14 @@ redis.del(key);
 | 模式                | 一致性               | 写入开销          | 适用场景                             |
 | ------------------- | -------------------- | ----------------- | ------------------------------------ |
 | Cache Aside         | 最终一致             | 写 DB + 删缓存    | 读多写少、改造成本低                 |
-| Read/Write Through  | 强一致（取决于实现） | 由缓存代理写 DB   | 对延迟敏感但可接受缓存为单点         |
+| Read/Write Through  | 一致性取决于写路径与故障恢复 | 由缓存代理写 DB   | 需要由缓存层统一管理读写的场景       |
 | Write Behind        | 最终一致             | 写缓存 + 异步刷盘 | 写压力大、允许短暂延迟               |
 | MQ+Cache Invalidate | 最终一致（可重放）   | 写 DB + 发消息    | 需要顺序消费、可提供补偿的高并发场景 |
 
 
 ## 13. Redis分布式锁
-以下是使用 Java 实现 Redis 分布式锁的示例代码，包含基本的锁获取和释放，以及一些高级功能的实现。
+
+本节只说明**原生锁的最小正确实现**：`SET NX PX`、唯一 token、Lua 解锁。长任务如何安全续期见 [19. 原生 `SET NX PX` 为什么没有内置看门狗？如何安全续期？](#19-原生-set-nx-px-为什么没有内置看门狗如何安全续期)；需要可重入、读写锁或公平锁等客户端能力见 [14. Redisson原理](#14-redisson原理) 与 [15. Redisson使用场景](#15-redisson使用场景)。无论使用哪种实现，最终正确性仍应由幂等、状态机、唯一约束或 fencing token 承担。
 
 ### 13.1 基础实现：使用 `SET NX PX`
 
@@ -2957,10 +2880,10 @@ import redis.clients.jedis.Jedis;
 import java.util.UUID;
 
 public class RedisLock {
-    private Jedis jedis;
-    private String lockKey;
-    private String lockValue; // 用于标识客户端
-    private int expireTime;   // 锁的过期时间（毫秒）
+    protected Jedis jedis;
+    protected String lockKey;
+    protected String lockValue; // 用于标识客户端
+    protected int expireTime;   // 锁的过期时间（毫秒）
 
     public RedisLock(Jedis jedis, String lockKey, int expireTime) {
         this.jedis = jedis;
@@ -3022,9 +2945,9 @@ public class RedisLock {
 }
 ```
 
-### 13.2 看门狗机制（自动续期锁）
+### 13.2 原生实现的安全续期（自动续期锁）
 
-对于长时间运行的任务，锁可能在任务完成前过期。以下实现了一个简单的“看门狗”机制，定期续约锁的过期时间。
+对于长时间运行的任务，锁可能在任务完成前过期。以下示例只说明“token 相等才续期”的实现要点；何时应该续期、续期不能解决哪些故障、以及 fencing token 的边界，以第 19 节为准。
 ```java
 import java.util.Timer;
 import java.util.TimerTask;
@@ -3059,8 +2982,26 @@ public class RedisLockWithWatchdog extends RedisLock {
         watchdog.scheduleAtFixedRate(new TimerTask() {
             @Override
             public void run() {
-                jedis.pexpire(lockKey, expireTime);
-                System.out.println("锁续期成功");
+                String renewScript = """
+                    if redis.call('get', KEYS[1]) == ARGV[1] then
+                        return redis.call('pexpire', KEYS[1], ARGV[2])
+                    else
+                        return 0
+                    end
+                """;
+                Long renewed = (Long) jedis.eval(
+                    renewScript,
+                    1,
+                    lockKey,
+                    lockValue,
+                    String.valueOf(expireTime)
+                );
+                if (renewed == 1) {
+                    System.out.println("锁续期成功");
+                } else {
+                    // 锁已过期或所有权已变化：停止续期，业务应依赖幂等/状态机兜底
+                    cancel();
+                }
             }
         }, expireTime / 2, expireTime / 2); // 每半个过期时间续约一次
     }
@@ -3099,8 +3040,8 @@ public class RedisLockWithWatchdog extends RedisLock {
 }
 ```
 
-### 13.3 高级实现：Redlock算法
-Redlock 是 Redis 作者提出的一种高可靠分布式锁算法。以下是使用多个 Redis 节点实现 Redlock 的伪代码：
+### 13.3 多主仲裁：Redlock 算法
+Redlock 是 Redis 作者提出的多实例锁算法；它通过多数节点持锁降低单实例故障带来的影响，但不是通用的强一致协调器，也不能替代业务幂等、状态机或 fencing token。
 1. 核心逻辑：
     1. 尝试在多个 Redis 实例中获取锁。
     2. 获取大多数节点的锁（如 5 个节点中的 3 个）即认为锁获取成功。
@@ -3110,22 +3051,18 @@ Redlock 是 Redis 作者提出的一种高可靠分布式锁算法。以下是�
 ### 13.4 注意事项
 1. 锁的超时时间：必须设置一个合理的过期时间，确保死锁问题不会影响系统。
 2. 锁的唯一性：锁的 `value` 必须唯一，确保锁的释放不会误操作其他客户端的锁。
-3. 锁续期的竞争：在高并发场景下可能会出现锁续期的竞争，Redlock 能减少这种风险。
+3. 锁续期：续期与解锁都必须原子校验持有者 token；Redlock 不是解决 GC 暂停、网络分区或旧持有者继续执行副作用的通用答案。
 4. Redis的性能：对于高流量场景，建议使用 Redis Cluster 提升性能和可靠性。
 
 
 ## 14. Redisson原理
 
+本节说明 Redisson 在原生锁之上封装的客户端能力。它减少了实现错误，但不改变 Redis 锁的故障边界；原生 `SET NX PX` 的安全续期与旧持有者问题仍以第 19 节为准。
+
 ### 14.1 原理
 1. 获取锁：
-    - 使用 Redis 的 `SET` 命令：
-        ```bash
-        SET key value NX PX timeout
-        ```
-        - `key` 是锁的名称，唯一标识一把锁。
-        - `value` 是锁的值，通常是一个唯一标识（如 UUID），用于标识哪个客户端持有该锁。
-        - `NX` 确保只有当键不存在时才能设置键，保证互斥性。
-        - `PX` 设置锁的过期时间（毫秒），防止死锁。
+    - `RLock` 通过 Lua 脚本维护锁 key、持有者标识和重入计数；它的存储结构与原生 `SET NX PX` 字符串锁并不相同。
+    - 对读者而言，关键不是背诵内部字段，而是理解：同一持有者可重入、非持有者不能解锁、相关检查在 Redis 内原子执行。
 2. 自动续期：
     - 锁的持有者在业务执行过程中，会启动一个“看门狗”线程。
     - “看门狗”定期检查，如果锁未释放且持有者仍存活，则自动延长锁的过期时间。
@@ -3140,8 +3077,8 @@ Redlock 是 Redis 作者提出的一种高可靠分布式锁算法。以下是�
         ```
         
     - 确保只有锁的持有者才能释放锁，避免误删。
-4. 高可用支持（Redlock）：
-    - Redisson 支持 Redlock 算法，通过多个 Redis 节点实现分布式锁的高可用。
+4. 多实例锁：
+    - 多实例仲裁只能改善部分故障模型，不能把 Redis 锁提升为强一致协调器；高风险写入仍需业务侧的幂等、状态机或 fencing token。
 
 ### 14.2 Redisson 的核心代码实现
 
@@ -3210,36 +3147,29 @@ public class RedissonLockExample {
 ### 14.3 Redisson 锁的关键点
 
 1. 自动续期机制：
-    - Redisson 内部启动一个“看门狗”线程，在锁快到期时，自动延长锁的过期时间，防止锁在业务执行中被误释放。
-    - 默认的“看门狗”过期时间为 30 秒，可通过配置修改：
+    - 只有未指定 `leaseTime` 的 `lock()` / `tryLock()` 调用才会使用看门狗；显式指定 `leaseTime` 时，锁会在该时长后自动释放，不会继续续期。
+    - 默认的看门狗超时时间为 30 秒，可通过配置修改：
         ```java
         config.setLockWatchdogTimeout(30000); // 设置看门狗超时时间为 30 秒
         ```
         
-2. 分布式高可用：
-    - 如果使用 Redis 集群或哨兵模式，Redisson 支持自动切换，保证锁的可靠性。
-    - 可以配置为使用 Redlock 算法，以增强锁的高可用性。
+2. 分布式部署边界：
+    - 哨兵、Cluster 或多实例部署提升可用性，但故障切换与网络分区下的互斥边界仍需业务兜底。
+    - 多实例仲裁不等于强一致；高风险动作仍应配合幂等、状态机或 fencing token。
 
 ### 14.4 Lua 脚本源码解析
 
 Redisson 使用 Lua 脚本实现了获取锁和释放锁的原子性。
 
-1. 获取锁（`SET` 实现）
+1. 获取锁（概念化伪代码）
 ```lua
-redis.call('set', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2])
+-- 实际 RLock 会在 Lua 中维护 Hash 的持有者与重入计数；此处仅表示原子获取的意图
+-- 若锁不存在则创建；若持有者相同则递增重入计数；否则返回剩余 TTL
 ```
 
-2. 释放锁（确保安全性）
-```lua
-if redis.call('get', KEYS[1]) == ARGV[1] then
-    return redis.call('del', KEYS[1])
-else
-    return 0
-end
-```
-- `KEYS[1]`：锁的名称。
-- `ARGV[1]`：锁的值（唯一标识持有者）。
-- `ARGV[2]`：过期时间。
+2. 释放锁（概念说明）
+
+`RLock` 的真实解锁脚本还要处理 Hash 中的持有者与重入计数，不能直接复制原生字符串锁的 `GET` / `DEL` 脚本。业务侧应调用 `unlock()`；只有手写原生 `SET NX PX` 锁时才使用“token 相等才删除”的 Lua 脚本。
 
 ### 14.5 Redisson 的优势
 1. 简单易用：封装了分布式锁的复杂实现，只需调用简单的接口即可。
@@ -3424,14 +3354,15 @@ try {
 ```
 
 
-## 16. 读写锁保证双写强一致性
+## 16. 读写锁减少双写并发冲突，不能保证强一致性
 
 ### 16.1 读写锁的基本概念
 1. 读锁（Shared Lock）：多个线程可以同时读取缓存，但不能进行写入操作。
 2. 写锁（Exclusive Lock）：只允许一个线程写入数据，同时阻止所有读取操作。
-3. 使用读写锁可以保证：
-    - 写操作的原子性：在写数据库和更新缓存的过程中，其他线程无法读取旧数据。
-    - 读操作的并发性：多个线程可以同时从缓存中读取数据，减少数据库压力。
+3. 使用读写锁可以做到：
+    - 在**同一把锁被所有相关请求正确遵守**的前提下，减少本进程或多个实例之间的读写并发冲突。
+    - 读操作可并发，写操作可互斥，从而降低缓存重建或更新时的竞争。
+    - 它不能保证数据库与缓存的分布式强一致：进程崩溃、锁过期、绕过锁的写入、DB 提交与缓存更新之间的失败窗口仍会造成不一致。双写仍应以 Cache Aside、失效重试、消息补偿或版本校验等机制收敛。
 
 ### 16.2 代码实现（Java + Redis + ReentrantReadWriteLock）
 ```java
@@ -3600,7 +3531,7 @@ public class RedisRedissonReadWriteLock {
 
 ### 16.4 总结
 - 单机应用可以使用 ReentrantReadWriteLock，提高读性能，减少数据库访问。
-- 分布式应用推荐使用 Redisson 分布式读写锁，确保多个实例之间的一致性。
+- 分布式应用可使用 Redisson 分布式读写锁减少多个实例之间的并发冲突；它不是数据库与缓存强一致性的证明。
 - 适用于高并发读、多线程写场景，如：
     - 商品库存管理
     - 用户资料修改
@@ -3700,14 +3631,14 @@ main 释放锁（最终释放）
 
 ### 17.4 可重入锁的超时问题
 
-1. 在 Redisson 中，默认情况下，锁的过期时间是 30 秒，但可以使用 `lock(long leaseTime, TimeUnit unit)` 设置锁的自动释放时间。
+1. 未指定 `leaseTime` 的 `lock()` 使用默认 30 秒的 watchdog 超时时间并持续续期；使用 `lock(long leaseTime, TimeUnit unit)` 时，锁会在指定时间自动释放且不启用 watchdog。
 2. 设置过期时间
 ```java
 lock.lock(10, TimeUnit.SECONDS); // 10秒后自动释放锁
 ```
 
 3. WatchDog 机制
-    - 如果 `lock.lock()` 方法没有指定超时时间，Redisson 会启动看门狗（WatchDog）机制，每隔 10 秒自动续期，防止锁被其他线程抢占：
+    - 如果 `lock.lock()` 方法没有指定 `leaseTime`，Redisson 会启动看门狗（WatchDog）机制；默认 30 秒超时时间下通常约每 10 秒续期一次：
     ```java
     lock.lock(); // 默认30秒，但会自动续期
     ```
@@ -3726,7 +3657,7 @@ lock.lock(10, TimeUnit.SECONDS); // 10秒后自动释放锁
 
 ### 17.6 总结
 - Redisson 分布式锁是可重入的，支持同一线程多次获取同一把锁，并通过 `count` 记录重入次数。
-- 默认 30 秒自动续期，防止业务执行时间过长导致锁被释放（WatchDog 机制）。
+- 不指定 `leaseTime` 时默认以 30 秒 watchdog 超时时间自动续期；指定 `leaseTime` 时则按固定租约到期释放。
 - 适用于高并发分布式环境，比 `Redis SETNX` 实现的简单分布式锁更安全可靠。
 - 适用于：
     - 库存扣减
@@ -3736,11 +3667,11 @@ lock.lock(10, TimeUnit.SECONDS); // 10秒后自动释放锁
 
 ## 18. Redis的主从同步
 ### 18.1 什么是Redis主从同步？
-1. Redis主从同步（Master-Slave Replication）是一种数据复制机制，允许多个Redis实例协同工作，以提高数据可用性、实现读写分离并增强系统的高可用性。
-    - 主节点（Master）：处理写操作，将数据同步给从节点。
-    - 从节点（Slave）：接收主节点的更新，可提供读操作，缓解主节点压力。
-    - 同步方向：Master -> Slave
-    - 支持级联复制：Slave 可以作为 Master 的 Slave（即多级复制）。
+1. Redis 主从同步（primary-replica replication）是一种数据复制机制，允许多个 Redis 实例协同工作，以提高可用性、实现读写分离并增强高可用能力。
+    - 主节点（primary，旧资料常称 Master）：处理写操作，将数据同步给副本节点。
+    - 副本节点（replica，旧资料常称 Slave）：接收主节点更新，可按业务一致性要求承担读请求。
+    - 同步方向：primary -> replica。
+    - 支持级联复制：replica 也可作为其他 replica 的上游。
 
 ### 18.2 Redis主从同步的作用
 1. 读写分离：主库负责写入，从库负责读取，提高系统吞吐量。
@@ -3758,7 +3689,7 @@ lock.lock(10, TimeUnit.SECONDS); // 10秒后自动释放锁
         - 主库执行 `BGSAVE` 生成 RDB 快照，并将快照文件发送给从库。
         - 从库加载 RDB 文件，并应用数据。
         - 主库将同步期间的新写入操作（增量数据）通过 缓冲区（Replication Buffer） 发送给从库。
-        - 同步完成，主从库数据一致。
+        - 同步完成后，副本会追上该同步阶段的数据；后续复制仍通常是异步的。
 
     - 缺点：
         - 消耗较高的 CPU 和内存（因为 `BGSAVE` 创建 RDB 需要 fork 进程）。
@@ -3780,17 +3711,18 @@ lock.lock(10, TimeUnit.SECONDS); // 10秒后自动释放锁
 ### 18.4 Redis主从同步的配置
 
 1. 配置主从
-    - 步骤 1：启动 Redis 主库
-    - 步骤 2：启动 Redis 从库
-    - 步骤 3：配置从库 在 `redis.conf` 中配置：
+    - 步骤 1：启动 Redis 主库（primary）
+    - 步骤 2：启动 Redis 副本库（replica）
+    - 步骤 3：在副本库的 `redis.conf` 中配置：
         - replicaof 127.0.0.1 6379  # 指定主库的 IP 和端口
         - 或者使用命令：
-            - SLAVEOF 127.0.0.1 6379
+            - REPLICAOF 127.0.0.1 6379
+        - `SLAVEOF` 是旧命令名称，保留兼容时才使用；新配置和文档优先使用 `replicaof` / `REPLICAOF`。
 
 2. 验证主从同步
-    - 在 主库 中设置值：
+    - 在主库中设置值：
         - SET key "hello"
-    - 在 从库 中读取：
+    - 在副本库中读取：
         - GET key
     - 如果配置成功，从库应该返回相同的数据。
 
@@ -3805,11 +3737,11 @@ Redis 主从同步依赖 `replication backlog buffer` 进行增量数据同步�
 ### 18.5 Redis主从同步的故障处理
 
 1. 主库宕机
-    - 如果主库実，**从库仍然可以提供读操作**。
+    - 如果主库宕机，副本库通常仍可提供读操作；读到的数据可能落后于主库最后写入。
     - 但 从库不能接收新的写入（因为 Redis 只支持 单向同步）。
     - 解决方案：
         - 手动提升从库为主库：
-            - SLAVEOF NO ONE
+            - REPLICAOF NO ONE
         - 使用 Redis Sentinel 进行自动故障切换（推荐）。
 
 2. 从库宕机
@@ -3830,8 +3762,8 @@ Redis Sentinel 主要用于 监控主库状态 并在主库宕机时自动进行
 
 2. Redis Cluster（集群）+ 主从模式
     - Redis Cluster 结合 主从复制 和 分片（Sharding），实现高可用和扩展性。
-    - 每个主节点（Master）都有多个从节点（Slave），用于故障恢复。
-    - 当主节点宕机时，从库会自动升级为主库，保证数据可用性。
+    - 每个主节点（primary）可配置副本节点（replica），用于故障恢复。
+    - 当主节点宕机时，副本节点可被提升为新的主节点；异步复制窗口内最近写入仍可能丢失。
 
 3. 创建 Redis 集群
 ```shell
@@ -3853,7 +3785,7 @@ Redis Sentinel 主要用于 监控主库状态 并在主库宕机时自动进行
 2. Sentinel 自动切换，提升系统可用性。
 3. Redis Cluster 进行分片，支持大规模数据存储。
 
-## 19. 看门狗为什么不能适用于setNx
+## 19. 原生 `SET NX PX` 为什么没有内置看门狗？如何安全续期？
 
 1. `SETNX` 简单分布式锁的原理
 
@@ -3864,17 +3796,13 @@ Redis Sentinel 主要用于 监控主库状态 并在主库宕机时自动进行
         - EXPIRE lock_key 10  # 设置10秒超时
     - 或者使用 `SET` 命令一次性完成：
         - SET lock_key unique_value NX EX 10  # NX: 仅当键不存在时设置；EX: 过期时间10秒
-    - 这种方式是一次性超时，无法自动续期。
+    - 原生命令只负责一次性加锁与设置 TTL；它**没有内置**自动续期能力，但客户端可以在保存唯一 token 的前提下实现安全续期。
 
-2. 为什么 `SETNX` 不能使用 Watchdog？
-    - `SETNX` 锁不会记录持有者线程
-        - `SETNX` 只是存储了一个 Key-Value，不能区分哪个线程或哪个实例持有锁。
-        - Redisson 的 Watchdog 需要记录当前线程的信息，并判断是否续期。
+2. 原生 `SET NX PX` 的边界是什么？
+    - Redis 不知道“业务是否仍在执行”，也不会自行启动后台任务续期；看门狗是客户端/框架提供的能力，不是 `SET` 命令的语义。
+    - 但 String value 可以保存唯一 token（如 `UUID + instanceId + threadId`），用它识别锁持有者；并不要求必须使用 Hash 结构。
 
-    - `SETNX` 没有内置的 Watchdog 机制
-        - `SETNX` 是 原生 Redis 命令，只会设置键值，不会自动续期。
-        - Redisson Watchdog 是 Redisson 客户端实现的，而 `SETNX` 本身不支持自动续期。
-        - Watchdog 依赖的是 Redisson 的 Lua 脚本 + Redis 的 `Hash` 结构，而 `SETNX` 仅仅是一个简单的 Key-Value 存储，没有续期逻辑。
+    - 安全续期必须把“校验 token”和“延长 TTL”放在同一个 Lua 脚本中。先 `GET` 再单独 `EXPIRE` 有竞态：锁过期并被其他请求获得后，旧持有者可能给新锁续期。
 
 3. Redisson 的 Watchdog 机制
     - Redisson 通过 `Hash` 结构 和 后台线程 实现 Watchdog，自动续期 Redis 分布式锁：
@@ -3893,34 +3821,48 @@ Redis Sentinel 主要用于 监控主库状态 并在主库宕机时自动进行
         - 127.0.0.1:6379> TTL lock_key
         - (integer) 30  # Watchdog 自动续期
     ```
-    - `SETNX` 方式的锁不能支持这种续期机制，因为它的 Key-Value 结构不支持线程信息存储，也不具备 Lua 脚本自动更新 TTL 的能力。
+    - Redisson 使用 Hash 支持可重入计数和持有者信息；这是它实现丰富锁语义的选择，而不是原生 String 锁无法续期的原因。
 
 4. 解决方案：如何让 `SETNX` 支持 Watchdog？
     1. 定时续期（定时任务）
-        - 在后台启动一个线程，每隔一定时间手动调用 `EXPIRE` 续期：
+        - 在后台启动一个线程；续期与解锁均通过 Lua 原子校验 token：
         ```java
         String lockKey = "lock_key";
         String uniqueId = UUID.randomUUID().toString();
+        String renewScript = """
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('pexpire', KEYS[1], ARGV[2])
+            end
+            return 0
+            """;
+        String unlockScript = """
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('del', KEYS[1])
+            end
+            return 0
+            """;
 
         // 获取锁
-        boolean acquired = redis.set(lockKey, uniqueId, "NX", "EX", 10) != null;
+        boolean acquired = redis.set(lockKey, uniqueId, "NX", "PX", 10_000) != null;
 
         if (acquired) {
             // 启动续期线程
             ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
             scheduler.scheduleAtFixedRate(() -> {
-                if (uniqueId.equals(redis.get(lockKey))) {
-                    redis.expire(lockKey, 10);  // 续期 10 秒
+                Long renewed = (Long) redis.eval(
+                    renewScript, 1, lockKey, uniqueId, "10000"
+                );
+                if (renewed == 0) {
+                    // 已失去锁，不再续期；业务写入还应由状态机/幂等兜底
+                    scheduler.shutdown();
                 }
-            }, 0, 5, TimeUnit.SECONDS);
+            }, 3, 3, TimeUnit.SECONDS);
 
             // 业务逻辑
             Thread.sleep(20000);
 
             // 释放锁
-            if (uniqueId.equals(redis.get(lockKey))) {
-                redis.del(lockKey);
-            }
+            redis.eval(unlockScript, 1, lockKey, uniqueId);
             scheduler.shutdown();
         }
         ```
@@ -3938,8 +3880,8 @@ Redis Sentinel 主要用于 监控主库状态 并在主库宕机时自动进行
             - 锁只有在 `unlock()` 时才会真正释放
 
 5. 总结
-| 实现方式                    | 是否支持 Watchdog | 优缺点                                  |
-| --------------------------- | ----------------- | --------------------------------------- |
-| Redis `SETNX`               | 不支持            | 需手动设置 `EXPIRE`，超时后无法自动续期 |
-| 手动续期 (`SETNX` + 线程池) | 支持              | 需要额外线程管理，复杂度高              |
-| Redisson `RLock`            | 自动支持          | 推荐，看门狗自动续期                    |
+| 实现方式 | 是否内置自动续期 | 优缺点 |
+| --- | --- | --- |
+| 原生 `SET NX PX` | 否 | 只提供一次性租约；适合短临界区 |
+| 原生锁 + 客户端定时续期 | 否（自行实现） | 续期/解锁必须 Lua 校验 token，并限制总时长 |
+| Redisson `RLock` | 是 | 提供 watch dog 与可重入等语义；仍不能替代业务幂等和状态机 |
