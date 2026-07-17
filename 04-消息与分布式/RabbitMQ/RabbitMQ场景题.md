@@ -1,404 +1,663 @@
-## 1. 场景：门诊挂号高峰（早上 8:00–9:00），挂号服务把“挂号成功事件”投递到 RabbitMQ，供收费、排队叫号、短信通知等多个系统消费。突然某天高峰期队列消息大量堆积，叫号延时 5–10 分钟，患者在窗口排队骂人。问题：你会如何排查这个队列堆积问题？从生产者侧、Broker 配置、消费者侧分别会看哪些指标和日志？
-先判断是“生产太快”还是“消费太慢”，再看有没有 MQ 本身配置瓶颈，最后给出扩容 + 优化消费逻辑 + 队列分片 + 限流告警的综合方案。
-1. 生产者侧怎么排查
-    - 目标：先确认是不是“挂号服务把消息发得太猛/重复发”。
-	1.	发送 QPS & 挂号量对比
-        - 看业务监控：单位时间内挂号量 vs 发到 MQ 的消息数，是不是 1:1 对得上。
-        - 如果消息数远大于挂号量，怀疑有重复发送 / 失败重试逻辑写炸。
-	2.	发送异常和重试逻辑
-        - 检查生产者日志：
-        - 是否大量出现 send timeout / confirm timeout，然后 while/for 重试导致重复消息。
-        - 看有没有错误的“发送失败就无限重试”逻辑，应该是有限重试 + 打标 + 人工补偿。
-	3.	发布变更 / 配置变更
-        - 最近有没有上线新版本：
-        - 把原来同步调用改成 MQ 通知时，可能挂号服务的“每个子流程都发了一条事件”，导致总量暴涨。
-        - 是否把原本多个业务事件合并成一条了/反过来拆散了。
+# RabbitMQ 场景化排障与架构决策
 
-2. Broker（RabbitMQ）侧怎么排查
-    - 重点看这些指标（管控台里都有）：
-        - 队列级监控
-        - 重点看这个“挂号成功事件队列”：
-            - messages_ready：待消费消息数量是否持续上涨；
-            - messages_unacked：投给 consumer 但未 ack 的数量是否卡死不动；
-            - messages_in / messages_out：每秒入队/出队速率。
-            - 如果 in ≫ out 且持续一段时间 → 确认是消费能力不足。
-        - 单队列热点问题：
-            - RabbitMQ 单队列吞吐有限，如果所有挂号事件都进同一个 queue：
-            - 无论你加多少消费者实例，最终吞吐可能被单队列锁住。
-            - 面试里可以提："如果是单 queue 模式，我会考虑按科室/院区/业务线做多 queue 分片，或者做 hash 分片。"
-        - 资源告警
-            - 看 broker 级别：
-            - 内存是否触发 mem_alarm；
-            - 磁盘是否触发 disk_free_alarm；
-            - CPU 是否打满。
-            - 一旦告警，RabbitMQ 会触发流控，主动减慢接受速度，影响整体吞吐。
-        - 持久化与镜像队列开销
-            - 持久化 + 镜像队列（或者 quorum queue）：
-            - 会显著增加 broker 写入延迟；
-            - 如果这个队列是镜像到 N 个节点，且挂号高峰写入很猛，broker 可能在“复制 + 刷盘”上被打爆。
+> [!abstract] 文档定位
+> 本文把医疗与支付场景整理成可执行的诊断手册。每个场景都按“建立事实 → 在线止血 → 定位根因 → 长期修复 → 验证结果”展开，不把 Management UI 的一个数字或一条应用日志当作完整结论。
 
-3. 消费者（叫号 / 收费 / 短信等）侧怎么排查
-    - 题目的直接业务影响是“叫号延迟 5–10 分钟”，所以消费者是重灾区，答题要多说一点。
-    - 消费吞吐 vs 入队吞吐
-        - 看消费者侧监控：
-            - 每秒 ack 数量（消费 QPS）；
-            - 与队列 messages_in 对比。
-        - 如果消费 QPS 远小于生产 QPS → 消费端能力不够。
-    - 消费逻辑是否太重
-        - 检查消费代码是不是“一条消息里做了一堆事”：
-            - 查多张表、远程调用 HIS/Redis、还要写多张记录。
-        - 思路：
-            - 把消费逻辑拆薄：消费只做必要入库/状态机推进，其它耗时操作拆成内部异步任务或再发一个 MQ 事件。
-    - prefetch / 并发配置
-        - 看是否使用了手动 ack，prefetch 是否还停留在默认（或者被错误设置为 1）：
-        - prefetch=1 + 耗时消费 → 整体吞吐爆炸式下降。
-        - 调整建议：
-        - 根据消费处理耗时，把 prefetch 调到比如 10 / 50 / 100，配合多线程消费。
-    - 实例数量 & 部署资源
-        - 消费者实例数是否太少（比如只有 1～2 个 pod 抗早高峰）。
-            - CPU/内存是否成为瓶颈（GC 频繁、线程池满）。
-        - 正常做法：
-            - 高峰期扩容消费实例数；
-            - 队列分片后，每个分片绑定一组消费者。
-    - 异常与重试
-        - 看日志里是否大量异常 + requeue：
-            - 消费失败时如果 nack(requeue=true)，可能同一批问题消息被反复投递、占用 prefetched 槽位，拖慢整体消费。
-        - 正确做法：
-            - 区分“临时错误”和“逻辑错误”，超过重试阈值路由到死信队列，由人工/后台补偿。
+> [!info] 版本基线
+> 本文以 **RabbitMQ 4.3.x、AMQP 0-9-1** 为主要基线，最后核验于 2026-07-17。协议原理和版本差异见 [[RabbitMQ]]。
 
-4. 综合来看，这个门诊挂号高峰队列堆积，大概率是消费能力不足 + 队列设计不合理。排查时我会：
-    - 先在 RabbitMQ 控制台看该队列的 ready/unacked/in/out 指标，确认是 in≫out；
-    - 对比挂号业务的真实 QPS 和生产者发送 QPS，排除重复发送/重试风暴；
-    - 再看消费者的消费 QPS 和单条耗时，优化消费逻辑、提高并发（调整 prefetch、增加实例），必要时按业务维度拆成多个队列做分片消费；
-    - 同时给这个队列加好堆积告警阈值，比如 Ready 超过 N 条或延迟超过 X 秒，提前预警，不要等叫号延迟 10 分钟才发现问题。
+## 1. 通用排障框架
 
-## 2. 场景：住院系统中，医嘱开立后通过 MQ 异步下发给 LIS（检验）、PACS（影像）、药房等多个子系统。有一次 RabbitMQ 集群某个节点宕机，重启后运维只说“恢复了”，但业务方反馈“部分病人的化验单没生成”。问题：你如何基于 RabbitMQ 的特性和业务日志，追查这批“可能丢失/未消费”的消息？需要设计哪些“事后审计/对账”机制来避免这种黑盒情况？
+### 1.1 先画对拓扑
 
-1. 这题本质是两块：
-    - 这波到底是消息没发、没路由、没存上，还是没消费 / 消费失败？
-    - 以后再有节点挂了，不能靠“运维说恢复了”，而是要有可追可补的机制。
+发布/订阅不是“多个系统共同消费一个队列”。同一个队列上的消费者是竞争关系，一条消息通常只交给其中一个消费者。需要收费、叫号、短信三个系统都收到挂号事件时，应让每个下游拥有独立队列：
 
-### 2.1 追查“可能丢失/未消费”的消息
+```text
+                              ┌─> registration.billing.q ─> 收费服务
+appointment.event.x (topic) ─┼─> registration.calling.q ─> 叫号服务
+                              └─> registration.sms.q     ─> 短信服务
+```
 
-2. 住院医嘱系统（Producer）
-    - RabbitMQ Exchange / Queue
-    - LIS 消费端（Consumer）
-    - LIS 自己落库/调用检验平台
+排障开始前记录：
 
-    1. 先在业务侧把“可疑样本”找出来
-        - 从住院库查：医嘱表 t_order
-        - 条件：状态 = 已开立 && 已发送到LIS标记 = true（或者“状态已进入‘待检验’”）
-        - 从 LIS 查：检验申请表 t_lis_request
-        - 条件：按同一 order_id / patient_id + order_no 查
+- RabbitMQ 版本、协议、客户端和框架版本；
+- cluster、vhost、exchange、routing key、queue、binding；
+- queue type、leader/member、副本数、durable、消息 delivery mode；
+- Producer/Consumer 应用版本、实例、connection/channel；
+- 事故时间窗、变更记录和受影响业务范围。
 
-    2. 做一把差集：
-        - 理想状态：住院侧“已下发到LIS”的医嘱，在LIS一定有记录
-        - 查询：
-        ```sql
-        SELECT o.order_id
-        FROM t_order o
-        LEFT JOIN t_lis_request l ON o.order_id = l.order_id
-        WHERE o.status = 'SENT_TO_LIS'
-        AND l.order_id IS NULL;
-        ```
-        - 这批就是“疑似丢的医嘱列表”，后面所有排查都围绕这些 order_id 展开。
+如果这些信息不确定，同名队列、错误 vhost、旧集群和历史拓扑都可能制造假象。
 
-3. Producer侧（住院系统）查：有没有真发出去
-    - 对每个“疑似 order_id”：
-        1. 查医嘱发送日志表 / 业务日志：
-            - 是否记录了“发送 MQ 成功”的日志（最好带 messageId 或 correlationId）。
-            - 有没有异常：连接失败 / confirm 超时，然后代码又无限重试之类。
-        2. 看当时有没有启用 publisher confirm：
-            - 有 confirm 记录（ack=true）→ RabbitMQ 已经收到了，不大可能在“发之前”丢。
-            - 没 confirm 或 nack → 当时可能消息就没真正进入队列。
+### 1.2 用证据链定位消息停在哪一段
 
-    - 这一步能把问题分成两类：
-        - 类 A：压根没成功发到 MQ（生产侧问题）
-        - 类 B：Producer 明确收到 confirm，说明进 MQ 了，往后查。
+| 阶段 | 要回答的问题 | 优先证据 | 不能单独证明什么 |
+| --- | --- | --- | --- |
+| 业务事件产生 | 业务事实是否成立、是否应发事件 | 业务状态、Outbox、事件 ID | 一条“开始发送”日志不能证明已发布 |
+| 发布 | Broker 是否接管本次发布 | confirm/return、连接异常、Outbox 状态 | confirm 不证明消费者处理；不可路由也可能 confirm `ack` |
+| 路由 | 是否进入所有预期队列 | 版本化 binding、历史入队指标、拓扑测试 | `mandatory` 只发现“零队列匹配”，不能发现部分订阅缺失 |
+| Broker 存储 | 队列当时是否可用并保留消息 | queue type、leader/member、告警、日志、历史队列指标 | 当前 `Ready=0` 不能还原过去 |
+| 投递 | 消费者是否收到 | deliver/unacked/redelivery、Consumer received 日志 | 收到不等于业务提交 |
+| 业务处理 | 副作用是否成功并可幂等重放 | Inbox、业务事务、唯一约束、结果表 | ack 记录不等于所有外部副作用成功 |
+| 最终状态 | 上下游业务是否一致 | 对账数据集、差集、补偿记录 | RabbitMQ 指标不能代替业务对账 |
 
-4. RabbitMQ 侧查：有没有进队列 / 被哪个节点持有
-    - 针对类 B（Producer 已 confirm）：
-        1. 查当时的 Exchange / RoutingKey / Queue 绑定：
-            - 配置是否被改过，是否有写错 routing key、exchange 名的情况；
-            - 是否配置了 alternate-exchange / mandatory + return callback，防止“无人接收”的消息黑洞。
-        2. 看节点宕机前后的队列情况（如果有历史监控就更好）：
-            - 这个队列是不是只在“那个宕机节点”上（非镜像队列）；
-            - 队列是否持久化（durable=true），消息是否持久（deliveryMode=2）；
-            - 宕机前是否有 disk full / mem alarm 日志，可能导致刷盘失败。
+对关键事件，所有阶段应使用同一个稳定 `event_id`，并同时携带订单号、支付单号或医嘱号等 `aggregate_id`。confirm 结果未知后重发时不能生成新的业务事件 ID。
 
-    - 如果结论是：
-        - 队列非镜像、消息未持久化、节点突然挂了 → 这批未刷盘的消息确实可能丢了。
-        - 这种只能靠后面的“业务补偿 + 对账作业”追回，不要指望 MQ 帮你找回。
+### 1.3 队列指标诊断矩阵
 
-5. Consumer（LIS）侧：是不是已经消费但是业务失败 / 没落库
-    - 针对类 B（Producer 已 confirm）：
-        - 针对“Producer confirm 了、队列也确认是持久化队列”的情况，再看 LIS：
-        1. 查 LIS 消费日志：
-            - 是否能按 order_id / messageId 搜到“收到 MQ 消息”的日志；
-            - 是否有消费异常（反序列化失败、调用下游超时、DB 写失败等）。
-        2. 看 消费者 ack 策略：
-            - 如果是 autoAck=true，那极有可能是先 ack 后抛异常，导致 MQ 认为消费成功但 LIS 没真正落库；
-            - 如果是 manual ack，看是否在 try 块末尾 ack，异常分支是否没 ack 或 nack 到 DLX。
-        3. 看 DLX（死信队列）：
-            - 有没有专门的 LIS_ORDER_DLX 队列；
-            - 这批 order_id 有没有出现在 DLX 里；
-            - 如果有，就是业务自己处理失败，但没人去扫死信。
+| 现象 | 优先假设 | 下一步证据 |
+| --- | --- | --- |
+| `messages_ready` 持续上升，unacked 较低 | 消费者不足、离线或暂停 | consumer count/capacity、deliver/ack rate、Consumer 日志 |
+| ready 低，`messages_unacknowledged` 很高 | 消费慢、卡死、prefetch/并发过大、ack 缺失 | 处理 p95/p99、线程/连接池、下游调用、ack timeout |
+| publish rate 长期高于 ack rate | 手动 ack 模式下可持续容量不足 | 净增长速率、业务 lag、下游容量；其他确认模式使用对应 delivery 指标 |
+| redelivery/reject 突增 | 依赖故障、毒消息、重投循环 | 异常分类、delivery count、DLX、Consumer 版本 |
+| confirm 延迟升高，connection 出现 `flow` | Broker/队列复制/磁盘跟不上 | 节点 CPU、iowait、磁盘、queue leader、网络 |
+| memory/disk alarm | 资源水位触发 | 全集群告警、发布连接 blocked 状态 |
+| Ready=0，但业务结果缺失 | 未发布、部分 binding 缺失、快速消费后失败、过早 ack、TTL/DLX/purge、环境错误 | Outbox、拓扑历史、deliver/ack 历史、Inbox、业务对账 |
 
-6. 到这里为止，你能把每一条“缺失医嘱”归类成：
-    - 没发出去（Producer 错误 / 未开启 confirm）；
-    - 发出去了但没路由成功（绑定问题 / 未配置 AE/mandatory）
-    - 发出去了、也入队了，但由于 crash + 未持久化 等导致真的丢（MQ 级别问题）
-    - 被消费了但业务未落库或异常没有补偿（Consumer 侧问题）
-    - 被打到死信队列但没人处理（运维/流程问题）
+两个常用估算：
 
-### 2.2 设计“事后审计 / 对账 + 可重放”机制
-1. 业务层 Outbox + 状态机
-    - 住院系统侧：
-        - 为“医嘱下发到 LIS”设计一个 Outbox/发送表，例如：
-        ```sql
-            CREATE TABLE t_order_lis_outbox(
-                id,
-                order_id,
-                msg_body,
-                msg_id,
-                status: NEW / SENT / CONSUMED_OK / FAILED,
-                send_count,
-                last_send_time,
-                last_error
-                )
-        ```
-        - 写本地事务时，一次性做两件事：
-            - 写医嘱表（order 表）
-            - 写 outbox = NEW
-        - 后台 job 负责扫描 status=NEW/FAILED 的记录，发送到 MQ，收到 confirm 后改成 SENT。
-        - LIS 消费成功后，通过*回调/接口/二次消息*把结果写回这个 outbox：标记为 CONSUMED_OK。
-        - 这样你事后只要：
-            ```sql
-                SELECT order_id FROM t_order_lis_outbox
-                WHERE status != 'CONSUMED_OK'
-                AND create_time < now() - 10min;
-            ```
-            - 就能秒级定位“所有疑似异常医嘱”，支持批量补偿或人工核查。
+```text
+观察到的净积压速率
+  = Δ(messages_ready + messages_unacknowledged) / Δt
 
-2. LIS 侧幂等 + 结果表
-    - LIS 侧：
-        - 所有通过 MQ 下落的医嘱，落一张“请求表/结果表”，必须包含上游的 order_id：
-        ```sql
-            CREATE TABLE t_lis_order_in(
-                id,
-                order_id,
-                status,
-                raw_message,
-                create_time,    
-                update_time
-                )
-        ```
-        - order_id 上加唯一索引，保证幂等。
-        - 好处：任意时候都可以做 住院 Outbox vs LIS t_lis_order_in 的对账；无论 MQ 重投几次，LIS 都只处理一次。
+若该斜率持续小于 0：
+预计排空时间 ≈ 当前 messages / |净积压速率|
+```
 
-3. 定时对账 / 巡检作业
-    - 搞两个定时任务：
-        - “住院 → LIS 差集巡检”
-            - 每 5~10 分钟跑一遍；
-            - 查出“住院 outbox 状态 SENT，但 LIS 没有记录 or 状态不是成功”的订单；
-            - 写入一张 t_order_lis_mismatch，发告警（钉钉/飞书/短信）。
-        - “死信队列扫描 + 自动重放”
-            - 对 LIS 相关队列配置 DLX；
-            - 定时消费 DLX：
-                - 对临时性错误（网络抖动）可尝试重放；
-                - 对数据问题（字段不合法）可以标记后交给人工处理。
+`publish_rate - ack_rate` 只能在同一队列、同一时间窗、手动 ack 且 reject、TTL、DLX、purge 等其他移除路径可忽略时，作为容量缺口的辅助估算。生产告警应优先关注**最老业务消息年龄和端到端延迟**，队列条数只作为容量信号。
 
-4. RabbitMQ 级别的 Trace / Audit
-    - 利用 RabbitMQ 自带特性 + 插件做“消息轨迹”：
-        - 开启 rabbitmq_tracing 或类似“firehose”机制，把消息发布、路由、投递、ack 事件镜像到一个 Trace exchange；
-        - Trace 消费端把这些事件写到 ES/日志库；
-        - 事后可以通过 messageId / correlationId 把某条医嘱的“消息旅程”完整还原出来：
-            - Producer publish → Exchange route → Queue store → Deliver to consumer → Consumer ack / nack
-            - 这样当某个 order 丢时，你不需要瞎猜，而是有“轨迹记录”佐证：
-                - 看得到是不是根本没 publish；
-                - 是不是 publish 了但没路由；
-                - 是不是被 deliver 了但没 ack。
+### 1.4 证据使用原则
 
-5. 最后再加一句：队列本身要配好 HA
-    - 医嘱下发这种 核心医疗流程，MQ 层面也要打满 buff：
-        - 队列 durable=true，消息 deliveryMode=2（持久化）；
-        - 用 镜像队列 / quorum queue，避免单节点宕机带走队列和消息；
-        - 配监控告警：节点宕机、磁盘爆满、内存告警、队列堆积等要第一时间弹出来。
+1. **看时间序列，不只看事故后的截图**：当前状态不能还原已经投递、过期或删除的消息。
+2. **区分事实与推断**：例如“confirm 超时”是结果未知，不是已确认发送失败。
+3. **一次只追一个代表事件**：用一个 `event_id` 贯穿 Outbox、Broker、Inbox 和最终业务表，再扩大样本。
+4. **先保护数据，再追求恢复速度**：不确定 DLX/重放是否可靠时，不要批量 ack 或 purge。
+5. **RabbitMQ 负责传输，业务对账负责闭环**：最终一致性必须有业务侧证据。
 
+## 2. 场景一：挂号高峰导致叫号延迟
 
-### 2.3 总结
-实际上，我不会把“有没有丢消息”的判断权交给 RabbitMQ，而是通过Outbox + 状态机 + 对账作业 + Trace 轨迹，让每一条医嘱的下发链路都能被追溯和补偿。
-RabbitMQ 负责“尽量不丢”，业务系统负责“即使丢了也能查出来、补得回来”。
+### 2.1 场景与目标
 
-## 3. 场景：电子处方审核系统通过 RabbitMQ 接收“待审核处方消息”，药师客户端消费队列并展示给药师人工审核。由于审核速度慢，队列里有大量未处理消息。此时业务提出新需求：紧急处方（急诊、ICU）要优先处理。问题：在不废弃现有队列的前提下，你如何利用 RabbitMQ 的路由/队列/优先级能力改造这个流程，让“高优先级处方”能被优先消费？
+早上 8:00～9:00，挂号服务发布 `appointment.registered`。收费、排队叫号和短信各自消费独立队列。叫号队列积压，患者等待 5～10 分钟。
 
-1. 在不废弃现有队列的前提下，我会优先选择“按优先级分流到不同队列 + 客户端优先消费紧急队列”：
-    - 保留现有队列 rx.audit.queue 给普通处方使用；
-    - 在原来的 Exchange 上新增一个 rx.audit.queue.urgent，绑定到 rx.urgent 这样的 routing key；
-    - 生产者在开立处方时，根据急诊/ICU 标记选择不同 routing key，把紧急处方打到 urgent 队列；
-    - 药师客户端同时监听两个队列，但消费策略是“先拉 urgent 队列，空了再拉 normal 队列”，配合更高的并发和 prefetch；
-    - 这样既不用强制迁移老队列，又能保证后续新产生的紧急处方不会被堆积的普通处方拖死。
-2. 如果允许后续演进，我还会考虑用带 x-max-priority 的新队列替换旧队列，把优先级能力直接下沉到 RabbitMQ 层，但那属于第二阶段的优化。
+目标不是立刻“把消费者加到最大”，而是：
 
-## 4. 场景：支付平台（微信/支付宝 + 医保 + 第三方支付）统一接入 MQ，支付回调通过 payment_result Topic 广播给挂号系统、住院系统、电子票据系统。某次切换支付服务版本后，发现部分支付成功记录在挂号系统能看到，但电子票据没有生成，相应队列中 Ready=0。问题：你如何区分这是“消息没发出去”“发了但路由有问题”“发对 Topic 但某个队列的 Binding 错了”，以及如何在设计初期就降低这类问题的排查成本？
+1. 判断新增量是否异常；
+2. 区分 Producer、Broker、Consumer 或下游依赖瓶颈；
+3. 在不制造重复扣费、数据库雪崩或消息丢失的前提下恢复业务 lag；
+4. 验证积压消退后没有遗留业务差异。
 
-### 4.1 区分三种情况
-1. 消息根本没发出去（Producer 问题）
-    - 检查点：支付平台发送日志 + publisher confirm
-        - 查询支付平台业务库：
-            - 是否存在该笔支付记录，状态 = 成功
-        - 看发送 MQ 的日志（强烈建议平时就统一埋一条）：
-            - 日志里按 payOrderId / outTradeNo 查：
-                - 有没有 "send payment_result to MQ" 这样的记录？
-                - 是否带 messageId / correlationId？
-        - 看 publisher confirm 结果（如果有）：
-            - 有没有记录到：
-                - confirm ack=true？
-                - 还是压根没有 confirm 回调？
-                - 或者 nack？
-    - 判断：
-        - 日志中 压根没有“发送 MQ”记录，或“一直发送失败/重试失败” → 很大概率就是没发出去。
-        - 有发送日志，但一直没收到 confirm、或收到 nack，又没做好重试 → 同样归类为“没成功发到 MQ”。
-2. 发了，但路由有问题（Exchange 没找到队列）
-    - 检查点：mandatory / return callback / alternate-exchange
-        - 配置：
-            - mandatory = true
-            - 配置 return callback：
-                - 只要消息发进 Exchange 但没有任何队列匹配到，就会走 return 回调
-                - 或者给 payment_result 配一个 alternate-exchange，所有“无人接收”的消息统一打到 payment_result.unroutable 队列
-        - 排查：
-            - 按 messageId / payOrderId 查支付平台日志：
-                - 有没有触发 return callback，返回 NO_ROUTE？
-                - 或者在 payment_result.unroutable 队列里是否存在这条消息？
-            - 看 RabbitMQ 管理界面 / rabbitmqctl list_bindings：
-                - payment_result exchange 有没有绑定到预期的队列：
-                    - Q.registration
-                    - Q.inpatient
-                    - Q.invoice
-                - 切换版本时有没人把 Exchange 名写错了、新老 Topic 搞混了。
-    - 判断：
-        - 满足下面特征时，可以判定是“路由层问题”：
-            - Producer 日志里：confirm ack=true（说明消息进了 Exchange）
-            - return callback 有记录 / AE 队列里有消息
-            - 或者：
-                - 挂号系统、住院系统的队列都完全收不到任何新的 payment_result，三个系统一起“安静”，那大概率是 exchange / routingKey 写挂了，而不是某一个队列单飞。
-3. 发对 Topic，但电子票据队列 Binding/消费出问题
-    - 检查点：payment_result exchange 有没有绑定到预期的队列
-    - 判断：
-        - 挂号系统看得到成功，电子票据系统看不到，且 Q.invoice 的 Ready=0
-        - 这已经很关键了：意味着同一个 routing key 至少成功进入挂号队列，所以：
-            - Exchange 名、Producer 发送逻辑、routing key 大概率是对的
-            - 问题更可能出在：
-                - Q.invoice 没绑或者绑错；
-                - 队列被删重建、换了 vhost；
-                - 或者电子票据服务压根连的是别的环境的 MQ
-        - 具体排查：
-            - 确认 Exchange → 队列 Binding
-                - 有没有一条：
-                    - payment_result → Q.invoice 的 binding？
-                    - routing key 是否与代码中发送的一致？
-                    - 切版本时有没有把 Q.invoice 改名了，但忘了改 binding？
-            - 看 Q.registration vs Q.invoice 的消息轨迹
-            - 对同一个 payOrderId：
-            - 在 Q.registration 中：
-                - 是否可以在队列历史/消费日志中查到该消息？
-            - 在 Q.invoice 中：
-                - 是否完全没有任何记录？
+### 2.2 建立事故时间线
 
-    - 如果现象是：
-        - payment_result exchange 的 Messages in 指标正常增长；
-        - Q.registration 有消息、有消费；
-        - Q.invoice 的 Messages in 永远为 0，Ready=0，Unacked=0；
-        - 那基本可以下结论：Binding 配错 / 队列没绑上 / 连错 vhost / 连接到错集群。
+先记录：
 
-### 4.2 设计
-1. 统一消息 ID & 结构化日志
-    - 所有支付回调消息约定：
-        - messageId = 全局唯一（可用雪花 ID / UUID）
-        - headers/body 里统一携带：
-            - payOrderId
-            - outTradeNo
-            - bizType（门诊挂号 / 住院押金 / 处方支付 …）
+- 最老叫号消息的业务时间、当前 ready/unacked；
+- publish、deliver、ack、redelivery 在事故前后的趋势；
+- 叫号消费者数量、版本、CPU/内存、线程池和数据库连接池；
+- 当日挂号量、事件量与历史同一时段基线；
+- 最近发布、配置、扩缩容、RabbitMQ 节点和下游系统变更。
 
-    - 所有参与系统必须记这样的日志：
-        - 支付平台发送时：
-            - 支付成功 → send payment_result → messageId=xxx, payOrderId=xxx
-        - 挂号 / 住院 / 电子票据消费时：
-            - received payment_result → messageId=xxx, payOrderId=xxx
-        - 成功落库时再打一条 handle ok 日志
+按 `event_id` 抽取早期、峰值、近期各一组样本，避免只研究一条毒消息或只看总体平均值。
 
+### 2.3 Producer 侧
 
-2. Producer 必须打开：publisher confirm + mandatory/AE
-    - 这可以当“团队规范”讲：
-    - 所有“支付相关事件”：
-        - 必须启用 publisher confirm，不允许 fire-and-forget
-        - 必须设置 mandatory=true 或配置 alternate-exchange
-        - 所有 return callback / AE 队列里的失败路由，要有告警：
-        - 有任意一条支付结果消息无人路由成功，直接报警。
-    - 这样“发了但路由有问题”的情况不会悄悄地存在几天才被发现。
+检查“业务事件产生率”和“实际发布率”是否一致：
 
-3. 业务对账机制：支付表 vs 各下游表
-    - 支付这种强一致性要求高的业务，必须有“事后对账”。
-    - 典型做法：
-        - 支付平台本地有 t_payment：
-            - 每一笔支付都有状态：SUCCESS / REFUND / CLOSED ...
-        - 每个下游（挂号、住院、电子票据）都落自己的结果表，例如：
-            - t_registration_payment
-            - t_invoice_payment
-        - 定时任务（例如每 5 分钟）做对账：
-            - 从 t_payment 中找出：
-            - 最近 X 分钟内状态 = SUCCESS 的记录；
-            - 左连接对应系统的结果表，看谁没跟上：
-            - 挂号有、票据无 → 电子票据漏了；
-            - 住院有、挂号没有 → 挂号漏了。
-    - 发现差异后：
-        - 可以自动重发一条 payment_result（带重试标记），或
-        - 写到 t_payment_mismatch，告警 + 人工排查。
-        - 这样即便 MQ 端出了事，你也能**“用业务数据反推消息问题”**。
+- 挂号成功数、Outbox 新增数、publish attempt 数应有可解释的比例；
+- 同一个 `event_id` 是否因 confirm 超时被重复发送；
+- 是否出现连接恢复、confirm timeout、`basic.return`、`nack`；
+- 是否新增了重复触发点，例如事务监听和定时补偿同时发消息；
+- 批任务或流量入口是否在短时间制造了超出设计容量的峰值。
 
-5. RabbitMQ 级 Trace / 审计（可选加分）
-    - 如果你想再进阶一点，可以提：
-    - 对支付这类关键 Topic，我会启用 RabbitMQ 的 trace/firehose，把 publish / route / deliver / ack 事件镜像到一个独立的 Trace exchange，再写入日志系统做消息轨迹审计。
-    - 好处：不仅能知道“某消息有没有被发”，还能知道“被路由到了哪些队列、哪天被哪个 consumer ack 了”。
+不能把客户端 `send()` 未抛异常当作 Broker 已接管。应检查 publisher confirm；也不能把 confirm `ack` 当作所有订阅队列均收到。
 
-### 4.3 总结
-- 我会先选一笔“挂号成功但没电子票据”的支付单，用它贯穿整条链路排查：
-    - 在支付平台侧，通过业务记录 + 发送日志 + publisher confirm 确认是否真的把 payment_result 发到了 MQ；
-    - 若确认发到了 payment_result exchange，再通过 mandatory/AE/return callback 和 binding 配置区分是“无人路由”还是“某个队列没绑好”；
-    - 结合现象（挂号队列有消费、电子票据队列 Ready=0），大概率定位为电子票据队列的 binding 或环境配置问题。
-- 从设计上，我会提前统一 messageId 和业务 ID 的日志规范，强制开启 confirm + mandatory/AE、防止静默丢路由；再配合自动化的 binding 自检和定时的“支付表 vs 各下游表”的业务对账，让这类问题即使发生，也能很快定位到是“没发、没路由还是没绑/没消费”，而不是靠人肉翻 MQ 控制台。
+### 2.4 Broker 侧
 
+对叫号队列检查：
 
-## 5. 场景：医院夜间跑批任务会批量发送“住院费用汇总消息”到 MQ，供财务系统消费生成日报。某天凌晨跑批过程中，Redis 故障导致消费逻辑大量抛出异常，开发误把 basicNack(requeue=true) 写在了所有异常分支。结果 RabbitMQ CPU 飙高，消费日志刷屏。问题：你如何在线“止血”，避免这类“消息风暴”继续扩大？从代码规范和队列设计上，你会要求团队做哪些约束？
-1. 队列设计：主队列 + 重试队列 + 死信队列 三件套
-    - 给这种“夜间跑批”类队列设计一个标准模板：
-        - 主队列：Q.inpatient_fee_summary
-        - 只消费一次，失败时不 requeue；
-        - 失败消息按类别发往：
-            - 重试交换机 fee.summary.retry.ex
-            - 死信交换机 fee.summary.dlx
-        - 重试队列：Q.inpatient_fee_summary.retry.delayN
-        - 配 TTL + DLX：
-            - 比如延迟 1 分钟 / 5 分钟 / 30 分钟 再回到主队列；
-            - 利用 RabbitMQ 的延迟队列 / TTL + DLX 组合，实现指数回退。
-        - 死信队列：Q.inpatient_fee_summary.dlq
-        - 最终失败消息统一沉淀到这里；
-            - 有页面/脚本可查看、人工重放或导出分析。
+| 指标/状态 | 解释 |
+| --- | --- |
+| ready、unacked、total | 区分尚未投递与投递后未确认 |
+| publish、deliver、ack、redelivery rate | 找到净积压来自生产、处理慢还是失败重投 |
+| consumer count/capacity | 判断是否无消费者、消费者饥饿或队列仍有投递余量 |
+| queue type、leader/member | 判断复制、leader 所在节点与多数派状态 |
+| 队首 timestamp / 业务事件时间 | 队首 timestamp 可能缺失或由 Producer 错填；SLO 优先用可信 `occurred_at`、Outbox 时间和 Consumer 观测计算 |
+| memory/disk alarm、connection blocked | 资源告警会阻塞发布连接 |
+| connection/channel/queue 的 `flow` | 内部背压，需结合磁盘、复制和消费能力解释 |
 
-2. 简单流程图：
-    ```text
-    主队列 Q.main
-        ↓ 成功
-    正常处理完毕
-        ↓ Transient 异常
-    发送到重试 exchange → 各级重试队列（TTL） → TTL 到期后经 DLX 回到 Q.main
-        ↓ Business 异常 或 重试超限
-    发送到 DLX → Q.dlq → 人工/补偿服务处理
-    ```
+不要在没有证据时断言“单队列被锁死”。先确认 queue leader、磁盘或 CPU 是否饱和，consumer capacity 是否接近瓶颈。分片会增加拓扑与顺序复杂度，只有在单队列确实限制吞吐时才采用。
 
-3. 总结
-    - 线上这类“消息风暴”的第一要务是止血，我会先停掉该批处理队列的消费者，避免同一批错误消息被不断 nack(requeue=true) 打回来造成 CPU 飙升。然后快速调整消费逻辑：把所有异常的处理从 requeue=true 改成 nack(requeue=false)，配合死信交换机把异常消息导入 DLQ，Redis 恢复后再从 DLQ 做限速重放。
-    - 事后我会从规范上要求两点：
-        - 代码层面，禁止在 catch 里简单粗暴地统一 requeue，而是按“临时错误/业务错误”分类处理，设计有限次数的重试机制，把重试和死信逻辑固化成统一封装；
-        - 队列层面，统一采用“主队列 + 重试队列 + 死信队列”的三段式设计，配合 TTL + DLX 做回退重试，同时给队列配置监控和告警。
-    - 这样即便 Redis 或其他依赖再出问题，也不会演变成 RabbitMQ CPU 打满、日志刷屏的风暴，而是可控的“有限重试 + 可观测的失败沉淀”。
+### 2.5 Consumer 与依赖侧
+
+分解单条消息耗时，而不是只看总 QPS：
+
+```text
+排队等待
+  + 反序列化
+  + 幂等检查
+  + 数据库事务
+  + HIS/Redis/远程接口
+  + commit
+  + ack
+```
+
+检查：
+
+- p50/p95/p99 处理时延和各阶段耗时；
+- 错误率、超时率、GC、线程池/连接池等待；
+- 下游数据库慢查询、锁冲突、Redis 或 HIS 限流；
+- prefetch、listener concurrency 与实际 unacked 的关系；
+- 是否存在 `nack(requeue=true)` 循环；
+- 是否在业务事务提交前 ack，或提交后漏 ack；
+- 多实例是否共享同一幂等约束，扩容后是否会并发写冲突。
+
+prefetch 没有通用的 `10/50/100` 最佳值。它是未确认窗口，不是每秒限流器；过大增加 unacked、故障重投和不公平，过小则可能让网络往返限制吞吐。必须压测。
+
+### 2.6 在线处置
+
+按风险从低到高执行：
+
+1. 若出现重投风暴，按 [[#6.2 在线止血 Runbook|安全停机步骤]] 盘点在途副作用、unacked、delivery limit 和 DLX 后暂停问题消费者；不要盲目强杀。
+2. 若下游整体不可用，限制或暂停叫号 Consumer，而不是盲目增加并发。
+3. 对非关键 Producer 或批任务限流，保留核心挂号流量。
+4. 修复慢查询、线程池、连接池或远程依赖后，用单个实例 canary 恢复。
+5. 在下游余量明确时逐步增加 Consumer concurrency/实例。
+6. 调整 prefetch 时同时观察 unacked、处理时延、内存和故障恢复成本。
+7. 确认单队列已成瓶颈后，再按院区/稳定业务键分片；同一需要有序的实体必须进入同一分片。
+8. 追平阶段限制重放速率，确保在线新消息仍满足 SLO。
+
+### 2.7 长期修复与验收
+
+- 以最老消息年龄、端到端叫号 lag 建 SLO 和分级告警；
+- 根据峰值到达率、p95 处理时间和目标利用率做容量模型；
+- 高峰前自动扩容，但扩容上限受数据库和外部接口容量约束；
+- 对重试率、Outbox age、DLQ age、confirm latency 单独告警；
+- 事故后用挂号事实表与叫号结果数据集做差集，不以队列清空作为唯一完成条件；
+- 压测同时覆盖正常峰值、依赖慢、单条毒消息、节点故障和恢复追平。
+
+验收标准至少包括：lag 回到 SLO、ready/unacked 稳定、无异常 redelivery、对账差异归零、下游资源未越过安全水位。
+
+## 3. 场景二：节点宕机后部分 LIS 化验申请缺失
+
+### 3.1 场景与风险
+
+住院系统发布医嘱事件，LIS、PACS、药房各自有独立队列。RabbitMQ 某节点宕机并恢复后，部分病人的化验申请没有生成。
+
+“运维说节点恢复”只能说明某个基础设施状态，不能证明：
+
+- 每个医嘱都生成了事件；
+- 每次发布都被 Broker 接管并正确路由；
+- 队列内容在故障中可用；
+- LIS 已提交业务事务；
+- 上下游最终状态一致。
+
+### 3.2 先建立疑似缺失样本
+
+从业务数据构建对账数据集，而不是直接假设微服务可以跨库 JOIN：
+
+1. 住院系统导出事故窗口内“应下发 LIS”的医嘱及 `event_id`、医嘱版本；
+2. LIS 通过 API、CDC、报表库或受控导出提供已接收/已落库结果；
+3. 按 `(aggregate_id, event_type, version)` 比较业务结果，按 `event_id` 查传输去重记录；
+4. 把差集写入 reconciliation/mismatch 表，记录发现时间和处理状态。
+
+仅以 `order_id` 作为唯一键可能误伤同一医嘱的修改、撤销等合法后续事件。
+
+### 3.3 逐段追查
+
+#### 业务事务与 Outbox
+
+- 医嘱状态是否真的达到“应下发”条件；
+- 同一本地事务中是否创建 Outbox；
+- Outbox 是 `NEW`、`CONFIRMED` 还是结果未知；
+- 是否有未发送、重复发送或 relay 停滞。
+
+Outbox 只管理生产者的本地业务事务和发布状态。不要把 `CONSUMED_OK` 当作 Outbox 固有状态；若业务要求下游回执，应建立独立 receipt/业务协议。
+
+#### Producer 发布
+
+- 按 `event_id` 查 publish attempt、confirm、return、连接中断；
+- confirm `ack` 表示 RabbitMQ 对本次发布完成其责任，但不表示 LIS 消费成功；
+- confirm 超时/连接断开表示结果未知，不能直接归类为发送失败；
+- 重发必须复用 `event_id`，LIS 必须幂等。
+
+#### 路由与拓扑
+
+- 事故时的 exchange、routing key、LIS queue binding 是否存在；
+- vhost、集群和队列名是否一致；
+- 应用升级是否删除并重建队列，或改变 binding；
+- `mandatory`/AE 是否捕获“没有任何队列匹配”的消息。
+
+若其他下游队列成功匹配，`mandatory` 和 AE 都无法发现“LIS binding 单独缺失”。这类错误需要拓扑契约测试、历史入队指标和业务对账。
+
+#### Queue 与节点故障
+
+记录：
+
+- RabbitMQ 版本；
+- LIS queue 是 classic、quorum 还是 stream；
+- durable、消息 delivery mode、publisher confirms；
+- queue leader/member 位于哪些节点，事故期间 quorum 是否仍满足；
+- 是进程 crash、正常重启、网络分区，还是磁盘损坏/节点替换；
+- 节点日志、资源告警和队列状态时间线。
+
+不能简单推导“非复制队列 + 节点重启 = 消息已丢”。磁盘完好的普通重启后，durable classic queue 中的 persistent 消息可以恢复；节点不可用期间队列可能不可用。节点磁盘永久损坏、classic queue 中的非持久消息或未完成持久化则是不同风险。RabbitMQ 4.3 quorum queue 会持久化发布给它的消息，但原 delivery mode 仍会影响后续 dead-letter 目标的重启恢复语义。Publisher confirm 是判断 Broker 是否已安全接管发布的重要证据，不能只看 `durable` 和 `delivery_mode`。
+
+RabbitMQ 4.x 中 classic queue 不复制；关键医嘱队列应评估 quorum queue。Quorum queue 只有在多数副本存活时才保持可用和数据安全，集群节点数量本身不是保证。
+
+#### LIS Consumer
+
+- 是否有 `CONSUMER_RECEIVED` 结构化日志或 Inbox 记录；
+- ack 模式是自动还是手动，ack 在业务 commit 前还是后；
+- 反序列化、schema、数据库、远程调用是否失败；
+- 失败消息是 requeue、dead-letter 还是被丢弃；
+- DLQ 中是否存在相同 `event_id`；
+- LIS 已收到但业务事务回滚后，是否因过早 ack 无法重投；
+- LIS 业务落库成功但响应/日志丢失时，幂等记录能否证明结果。
+
+### 3.4 根因分类
+
+| 分类 | 最强证据 | 恢复来源 |
+| --- | --- | --- |
+| 业务未生成事件 | 应下发医嘱存在，但无同事务 Outbox | 根据业务事实补建事件 |
+| 发布结果未知/失败 | 无 confirm、nack、连接中断，Outbox 未确认 | 复用 event ID 重新发布 |
+| 最终完全不可路由 | 经过 AE 链后仍收到 `basic.return` | 修复拓扑后重放 |
+| 原业务 exchange 未匹配、AE 已捕获 | AE 捕获队列收到消息且无 return | 修复业务 binding 后，从捕获队列受控重放 |
+| 部分订阅 binding 缺失 | 其他队列收到，LIS 历史入队为 0，事故时 binding 缺失 | 从 Outbox/业务事实定向补发 |
+| Queue/节点数据风险 | queue type、持久化和故障证据共同支持 | Outbox 或业务对账补偿 |
+| 已投递但业务失败 | Inbox/received 存在，业务结果缺失或 DLQ 命中 | 修复 Consumer 后幂等回放 |
+| 已 ack 但过早确认 | Consumer 的逐消息 ack 日志/代码路径存在，业务事务失败且无消息留存 | 从业务事实重新生成补偿事件 |
+
+### 3.5 建立可追溯闭环
+
+#### Producer Outbox
+
+建议字段：
+
+| 字段 | 作用 |
+| --- | --- |
+| `event_id` | 全局稳定事件 ID，唯一 |
+| `aggregate_id` / `event_type` / `version` | 表达业务实体和事件版本 |
+| `payload` / `schema_version` | 可重建的事件内容与协议版本 |
+| `publish_status` | `NEW / CONFIRMED / UNKNOWN / FAILED` |
+| `attempt_count` / `next_attempt_at` | 有界重试 |
+| `last_error` / `created_at` / `confirmed_at` | 排障和延迟监控 |
+
+#### LIS Inbox 与处理结果
+
+Inbox 的 `(consumer_name, event_id)` 唯一约束和 LIS 业务变更应在同一事务。处理状态、错误类型和业务结果可以放在独立处理表中，避免把传输去重与业务状态混成一个字段。
+
+#### 对账与补偿
+
+- 按业务时限持续计算“应存在结果 - 实际结果”；
+- 差异包含 owner、严重度、首次发现时间、补偿状态；
+- 自动回放前检查依赖健康、幂等能力和重试预算；
+- 永久数据错误进入人工流程，不自动循环；
+- 回放限速、可暂停、保留审批和结果审计。
+
+#### Trace 的边界
+
+RabbitMQ Firehose / tracing 只在**事先开启**后复制 `publish.*` 和 `deliver.*` 事件：
+
+- 它不记录逐消息 consumer ack/nack，也不能证明业务 commit；
+- 它按节点和 vhost 开启，重启后默认关闭；
+- 开启会增加消息和路由开销；
+- 可能复制含患者隐私的完整 payload。
+
+因此它只适合短时诊断，不能替代 Outbox、Inbox、结构化日志和业务对账。医疗 payload 必须最小化采集、脱敏、加密、限制访问并设置保留期限。
+
+### 3.6 在线恢复与验收
+
+1. 冻结非必要拓扑变更，先修复 LIS queue/binding、Consumer 和幂等约束，再用无业务副作用的 canary 验证链路。
+2. 从 reconciliation/mismatch 数据集确定受影响事件集合，按根因分批，不能把整个时间窗无差别重放。
+3. 若所有原订阅者都已验证幂等，可把原事件以同一 `event_id` 重放到原 exchange；否则使用 LIS 专用 recovery exchange/补偿命令，只修复 LIS，并用 `recovery_id` 关联原事件、独立审计。
+4. AE 捕获消息遵循同一规则：直接重放原 topic 会再次投递给已成功订阅者，不天然是“定向补发”。
+5. 小批 canary 后限速扩大，持续观察 confirm/return、LIS Inbox、业务错误、DLQ 和下游容量，并保留暂停开关。
+6. 只有“受影响医嘱差集归零、无意外重复业务效果、Outbox/AE/DLQ 无遗留、队列 lag 回到 SLO”同时成立，才宣布恢复完成。
+
+## 4. 场景三：紧急处方优先审核
+
+### 4.1 先明确优先级语义
+
+业务要求至少回答：
+
+- 只要求新产生的急诊/ICU 处方优先，还是历史积压中的紧急处方也要迁移？
+- 紧急处方的最大等待时间是多少？
+- 普通处方允许等待多久，是否允许被持续饿死？
+- 审核药师是共享资源还是紧急流程有专属人员？
+- 是否需要同一患者或同一处方版本有序？
+
+“优先”通常是低延迟 SLO，不等于跨队列全局严格排序或抢占已经开始的人工审核。
+
+### 4.2 首选：独立紧急队列和预留容量
+
+保留现有普通队列，新增紧急队列：
+
+```text
+rx.audit.x
+  ├─ routing_key=rx.audit.urgent ─> rx.audit.urgent.q ─> 紧急专用容量
+  └─ routing_key=rx.audit.normal ─> rx.audit.normal.q ─> 现有普通容量
+```
+
+实施步骤：
+
+1. 把现有队列明确为 normal queue，不删除；
+2. 新建 durable urgent queue，并按可靠性需求选择 quorum；
+3. Producer 根据可信业务字段选择 routing key，字段校验失败不能默认伪装成普通处方；
+4. 检查现有宽泛 binding（如 `rx.#`）是否会让紧急消息同时进入普通队列；
+5. 为 urgent queue 部署独立且预留的 Consumer/药师容量；
+6. 为 normal queue 保留最低服务能力，防止持续紧急流量让普通处方永久饥饿；
+7. 分别设置 lag、最老处方年龄、错误率和 DLQ 告警。
+
+仅让同一个客户端“同时监听两个队列”不会自动形成跨队列严格优先调度。RabbitMQ push consumer 会各自收到 delivery，客户端还需要显式调度；独立容量更容易保证 SLO。
+
+安全切流优先使用版本化拓扑：
+
+1. 新建 `rx.audit.v2.x`，把 `rx.audit.normal` 绑定到**现有 normal queue**，把 `rx.audit.urgent` 绑定到新 urgent queue；
+2. 先启动 urgent Consumer，并在隔离环境验证“routing key → queue”矩阵；
+3. 再滚动切换 Producer 到 v2 exchange；混合版本期间，旧 Producer 仍经 v1 进入 normal，新 Producer 按 v2 分流；
+4. 监控 return、两个队列的入队数和重复审核，所有路径共享同一业务幂等约束；
+5. 旧 Producer 全部退出且旧消息处理完后，再移除 v1 规则。
+
+若必须在同一 exchange 上收窄 `rx.#` 等宽泛 binding，新增与删除 binding 之间没有跨 Producer 的原子切换保证；必须设计明确的重叠窗口/路由空窗回滚方案，不能随意调整顺序。
+
+历史普通队列中已经存在的紧急处方不会自动跃过前面的积压。**首选从处方/待审核业务事实表重建“仍待处理的紧急处方”集合**，先部署 urgent queue、Consumer 和幂等约束，再切换新消息路由，最后发布显式的历史重新调度事件。
+
+RabbitMQ 没有按任意业务字段浏览并原子移动 ready 消息的通用操作。若无法从业务事实重建、不得不 consume-republish：
+
+1. 暂停 normal Consumer，定义明确 cutoff，并盘点 unacked；
+2. 迁移程序持久化每个任务的迁移状态；
+3. 使用原 `event_id` 或明确的迁移幂等键，发布到 urgent routing key；
+4. 收到 confirm 且排除 return 后，才 ack 原 delivery；
+5. 接受 confirm UNKNOWN 和进程崩溃会产生重复，normal/urgent 共享同一业务幂等约束；
+6. 限速、可暂停，并对账 normal、urgent、在途和业务结果。
+
+### 4.3 何时使用消息优先级
+
+| 方案 | 适用条件 | 版本与限制 |
+| --- | --- | --- |
+| 多队列 + 独立容量 | 需要资源隔离、独立 SLO、公平策略 | 通常首选；拓扑更多，但行为可解释 |
+| Classic priority queue | 单队列内少量优先级、可创建新队列 | 创建时声明 `x-max-priority`；不能通过 policy 给既有队列追加；层级越多开销越高 |
+| Quorum priority queue | 已使用 quorum 且版本语义明确 | 4.0～4.2 仅两档相对优先；4.3 起固定 0～31 严格优先级 |
+
+即使 RabbitMQ 4.3 quorum queue 支持严格优先级，也有边界：
+
+- 已 prefetch 到 Consumer 的普通消息不能被后来紧急消息抢占；
+- 高 prefetch 会增加紧急消息的端到端等待；
+- 持续高优先级流量可能让低优先级饿死；
+- 多 Consumer 的实际完成顺序仍不严格；
+- classic queue 的 `x-max-priority` 对 quorum queue 不适用。
+- 返回的 quorum 消息进入 returns queue，不保留原 priority，而是按返回顺序重排；未设置 priority 的消息在 4.3 中按 4 处理。
+
+### 4.4 验收
+
+- 紧急和普通处方分别满足最大等待时间 SLO；
+- 持续紧急流量下普通处方仍有最低处理份额；
+- 同一处方没有在两个队列产生重复审核；
+- Producer 路由字段、binding 和权限有自动化契约测试；
+- Consumer 扩缩容、故障重投和积压恢复经过压测；
+- 历史紧急处方迁移有数量对账和审计。
+
+## 5. 场景四：支付成功但电子票据缺失
+
+### 5.1 正确理解现象
+
+支付平台把 `payment.succeeded` 发布到 topic exchange，挂号、住院、电子票据各有独立队列：
+
+```text
+payment.result.x
+  ├─> registration.payment.q
+  ├─> inpatient.payment.q
+  └─> invoice.payment.q
+```
+
+某笔支付在挂号系统已生效，电子票据未生成，`invoice.payment.q` 当前 `Ready=0`。
+
+这组事实只说明：
+
+- 业务事件至少通过某条路径到达挂号系统，或挂号通过其他路径更新；
+- 电子票据当前没有 ready 消息。
+
+它不能直接证明 invoice binding 错误。消息可能已经投递并 ack、处于 unacked、过期、dead-letter、被 purge，或 Consumer 过早 ack 后业务失败；也可能看错 vhost/集群。
+
+### 5.2 用一笔支付贯穿证据链
+
+#### 业务事件是否产生
+
+- 支付记录是否确实为 `SUCCESS`；
+- 同一事务是否写入 `payment.succeeded` Outbox；
+- 是否有稳定 `event_id`、`payment_order_id`、schema version；
+- 是否存在支付成功但 Outbox 缺失的事务窗口。
+
+#### 是否发布
+
+- publish attempt 是否发生；
+- confirm 是 `ack`、`nack` 还是 UNKNOWN；
+- 是否发生 `basic.return`；
+- Producer 是否因超时重发且保持同一 `event_id`。
+
+Confirm `ack` 不证明电子票据队列收到。不可路由消息也可能收到 confirm；而该事件既然匹配了挂号队列，即使 invoice binding 缺失，`mandatory` 也不会 return，AE 也不会接管。
+
+#### 是否路由到 invoice queue
+
+检查事故时而非当前猜测的拓扑：
+
+- exchange 名、类型、vhost；
+- Producer routing key；
+- invoice queue 名、类型、是否发生删除重建；
+- binding pattern 是否匹配；
+- 应用是否连接到错误 cluster/vhost；
+- 版本发布是否改变了 exchange、routing key 或 queue；
+- invoice queue 的历史 publish 入队、deliver 和 ack 指标。
+
+管理台不保存可按 `messageId` 查询的队列历史。没有预先保存的指标、应用日志或 Inbox 时，事故后可能无法从 Broker 还原单条消息。
+
+#### Invoice Consumer 是否收到并完成业务
+
+- 按 `event_id` 查 Consumer received 日志和 Inbox；
+- 检查 deliver、unacked、ack/redelivery 的历史趋势；
+- ack 是在票据事务 commit 后还是之前；
+- 是否因 schema、金额、患者信息或税务接口失败；
+- 是否进入 DLQ，或在无 DLX 时被 `requeue=false` 丢弃；
+- 票据已创建但查询索引/通知链路是否延迟。
+
+最后以支付事实和票据结果做业务对账，而不是以队列状态决定支付是否完成。
+
+### 5.3 判断矩阵
+
+| 观察到的证据 | 更合理的分类 | 仍需确认 |
+| --- | --- | --- |
+| 支付成功，无 Outbox/event | 业务事务未生成事件 | Outbox 是否与支付事务原子提交 |
+| Outbox 有记录，未 confirm 或连接中断 | 发布结果未知 | Broker 可能已收到；应幂等重发 |
+| 经过 AE 链后收到 `basic.return` | 最终没有任何队列匹配 | exchange、routing key、binding、AE 链 |
+| Unroutable AE 捕获队列命中 | 原业务 exchange 无匹配，但 AE 已成功路由 | 修复业务 binding 后受控重放 |
+| 挂号已收到，invoice 历史入队始终为 0 | invoice 订阅/环境问题可能性高 | 事故时 binding、vhost、队列生命周期 |
+| invoice deliver/received 有记录，无业务结果 | Consumer 处理问题 | ack 时机、事务、DLQ |
+| Consumer 逐消息 ack 日志存在，无业务结果 | 过早 ack 或业务审计缺口 | ack 与 commit 的代码路径；Broker 指标本身不能按 event ID 证明 ack |
+| Inbox 和业务结果都有 | 展示/索引/后续流程问题 | 查询路径和异步后续链路 |
+
+### 5.4 降低未来排查成本
+
+#### 拓扑契约
+
+- exchange、queue、binding、vhost 和 policy 版本化；
+- CI/部署验证每个事件类型的所有必需订阅；
+- 关键 binding 删除或队列重建触发审计与告警；
+- 在隔离 vhost/预生产环境发布 canary；若必须在生产验证，应定义所有 Consumer 都识别且绝不执行业务副作用的正式 canary schema，再检查每个必需订阅的独立回执。
+
+`mandatory`/AE 仍应开启，用于发现“零队列匹配”，但不能替代多订阅完整性检查。
+
+#### 消息与日志规范
+
+- 同一 `event_id` 贯穿 Outbox、confirm、return、每个 Consumer Inbox 和业务结果；
+- 结构化记录 exchange、routing key、queue、vhost、schema version、应用版本；
+- 不记录完整支付凭证、患者隐私或敏感 payload；使用字段白名单、脱敏和访问控制。
+
+#### 对账与补偿
+
+- 按业务时限比较 `payment SUCCESS` 与挂号、住院、票据处理结果；
+- 每个下游独立标记结果，不以“至少一个下游成功”代表 fan-out 完成；
+- 差异自动告警；所有订阅者都已验证幂等时，才把原事件以同一 event ID 重放到原 exchange；
+- 若只需修复 invoice 且其他订阅者不能安全重放，使用 invoice 专用 recovery exchange/补偿命令，并用独立 `recovery_id` 关联原事件；
+- 补发前验证下游幂等，设置速率、预算、暂停开关和人工审批边界。
+
+### 5.5 在线恢复与验收
+
+1. 修复并版本化 invoice binding/queue/Consumer，先用无业务副作用 canary 验证正确 vhost、routing key 和处理链路。
+2. 从支付与票据对账差集得到受影响 `event_id`，排除已开票但展示/索引延迟的记录。
+3. 按上一节的 fan-out 安全边界选择“原 exchange 全量幂等重放”或“invoice 定向补偿”，AE 捕获消息也不能未经判断直接重发。
+4. 先小批、后限速扩大，监控 confirm/return、invoice Inbox、票据结果、DLQ、税务接口和重复约束。
+5. 以“支付成功与票据结果差集归零、无重复票据、AE/DLQ/Outbox 无遗留、端到端 lag 回到 SLO”为完成标准。
+
+## 6. 场景五：`requeue=true` 引发消息风暴
+
+### 6.1 场景与故障机制
+
+夜间费用汇总 Consumer 依赖 Redis。Redis 故障后，所有异常都执行 `basicNack(requeue=true)`：
+
+```text
+delivery → Redis 失败 → nack(requeue=true)
+   ▲                              │
+   └──────── 立即重新可投递 ───────┘
+```
+
+同一批消息反复经过网络、反序列化、日志和失败调用，造成 RabbitMQ CPU、应用 CPU、日志系统和 Redis 恢复流量同时上升。它不是“有重试能力”，而是没有延迟和预算的反馈环。
+
+### 6.2 在线止血 Runbook
+
+#### 第一步：冻结新增风险
+
+- 声明事故并只冻结故障 Consumer 相关的部署、HPA 和应用自动重启策略，不扩大到 RabbitMQ 节点或无关服务；
+- 暂停夜间 Producer/批任务，或把新增流量限制到安全速率；待发布业务事实仍须保存在 Outbox/源数据中，不能通过“停止发消息”静默丢弃；
+- 禁止人工 purge、批量 ack 或临时改成 auto-ack。
+
+#### 第二步：停止重投循环
+
+- 先停止新 delivery；单独 `basic.cancel` 不会替应用处理已有 unacked delivery；
+- 盘点 unacked、queue type、delivery limit、DLX 和 Consumer 当前业务事务：能安全完成的在途消息先 drain；
+- 对无法完成且消费端幂等已验证的 delivery，再关闭 channel/connection 触发重投；若外部副作用可能已发生或幂等未知，先记录事件集合并准备对账，不能盲目强杀；
+- RabbitMQ 4.3 quorum queue 会把连接/Channel 丢失计为失败投递；达到 delivery limit 后可能 dead-letter，未配置 DLX 时可能丢弃；
+- 记录停止前后的 ready、unacked、redelivery、consumer count 和可信业务 lag；
+- 确认其他业务队列是否被同一节点资源争用。
+
+不要在未知 DLX 状态下直接把所有异常改成 `nack(requeue=false)`：没有 DLX、binding 错误或默认不安全的 dead-letter 转发都可能导致消息丢失。
+
+#### 第三步：保护 Broker 和依赖
+
+- 检查 memory/disk alarm、connection blocked/flow、节点 CPU/iowait；
+- 保留足够磁盘承载 ready 和故障恢复；
+- 隔离或采样重复异常日志，避免日志系统成为第二故障点；
+- 恢复 Redis 前先确认连接风暴、缓存预热和下游数据库承载能力。
+
+#### 第四步：修复失败策略
+
+将错误分类：
+
+| 错误 | 动作 |
+| --- | --- |
+| 单条暂时失败 | 有限、延迟重试 |
+| Redis 整体不可用 | 暂停 Consumer，依赖恢复后再继续 |
+| 数据/schema 永久错误 | `requeue=false` → 已验证的 DLX/DLQ |
+| 未知错误 | 小预算重试后隔离并告警 |
+
+RabbitMQ 4.3 quorum queue 可用内部 delayed retry；具体动作必须与策略匹配：
+
+| AMQP 0-9-1 动作 | `delivery-count` | delivery limit 能否终止 | delayed retry type |
+| --- | --- | --- | --- |
+| `basic.nack(requeue=true)` | 不增加 | 不能 | `returned` 或 `all` |
+| `basic.reject(requeue=true)` | 增加 | 能 | `failed` 或 `all` |
+| Channel/connection 丢失 | 增加 | 能 | `failed` 或 `all` |
+
+真实处理失败可使用 `basic.reject(requeue=true)`，配合 delayed retry、delivery limit 和已验证 DLX；若保留 `basic.nack`，必须由应用持久化重试次数/时间预算。否则它可能一直使用最小延迟且不受默认 20 次限制。旧版本可使用固定 TTL + DLX 重试桶，但要考虑默认 dead-letter 转发的 at-most-once 风险。Classic queue 也不提供 quorum 的默认 delivery limit。
+
+#### 第五步：Canary 恢复
+
+1. Redis 健康并有足够容量；
+2. 单个修复版 Consumer 启动，低 concurrency、受控 prefetch；
+3. 观察一小批消息的成功率、幂等冲突、Redis/DB 负载和 ack；
+4. 逐步扩容，限制总恢复速率；
+5. 同时保证在线消息的处理 SLO；
+6. 检查 ready、unacked、delayed message count、DLQ、Outbox 和业务差集；不能因 ready/unacked 暂时清零就认定恢复完成。
+
+### 6.3 代码与拓扑规范
+
+Consumer 统一使用可审计的决策模型：
+
+```text
+try:
+    幂等检查
+    业务事务
+    commit
+    ack
+catch NonRetryable:
+    reject_to_verified_dlx
+catch DependencyUnavailable:
+    open_circuit_and_pause_consumer
+catch Retryable:
+    schedule_bounded_delayed_retry
+catch Unknown:
+    small_retry_budget_then_quarantine
+```
+
+团队约束：
+
+- 禁止在顶层 `catch (Exception)` 中无条件 `requeue=true`；
+- 重试必须有次数、时间窗口、退避、抖动、速率和最终去向；
+- 同一依赖整体不可用时使用熔断/暂停，不对每条消息单独高速重试；
+- DLX 优先用 policy 配置，并验证目标存在、binding 正确、容量充足；
+- 关键 quorum source queue 评估 at-least-once dead-lettering，同时接受额外资源和重复风险；
+- DLQ 有 owner、SLO、告警、脱敏、保留期限、回放审批和限速；
+- 回放必须复用 event ID，Consumer 用 Inbox/唯一约束保证幂等；
+- 定期演练 Redis 故障、DLX 目标不可用、DLQ 满、Consumer 重启和恢复追平。
+
+### 6.4 验收
+
+- redelivery/reject rate 恢复正常，无重复日志风暴；
+- RabbitMQ 告警和 flow/blocked 恢复；
+- Redis、数据库与 Consumer 都在安全水位；
+- ready 和最老消息年龄按预期下降；
+- 同一费用汇总未重复入账；
+- 业务对账差异归零；
+- 事故时间线、根因、配置变更和回放批次有完整审计。
+
+## 7. 场景复盘模板
+
+每次事故完成以下记录，才能把临时处理沉淀为长期能力：
+
+### 7.1 事实
+
+- 事故起止时间、发现方式、业务影响与数据范围；
+- RabbitMQ/客户端版本和完整拓扑；
+- 代表 `event_id` 的端到端证据链；
+- ready、unacked、publish/deliver/ack/redelivery、lag、资源指标时间线；
+- 部署、配置、依赖和节点事件。
+
+### 7.2 决策
+
+- 为什么暂停 Producer/Consumer、限流、扩容或回放；
+- 每个动作的数据安全前提；
+- 失败或回滚条件；
+- 谁批准了丢弃、补偿或人工修复。
+
+### 7.3 根因与修复
+
+- 直接技术原因；
+- 为什么监控、测试或流程没有更早发现；
+- 临时修复与长期修复分别是什么；
+- 如何通过故障注入、压测、拓扑测试和对账验证；
+- 剩余风险、owner 和截止时间。
+
+## 8. 官方资料
+
+- [Reliability Guide](https://www.rabbitmq.com/docs/reliability)
+- [Publisher Confirms and Consumer Acknowledgements](https://www.rabbitmq.com/docs/confirms)
+- [Publishers and Unroutable Messages](https://www.rabbitmq.com/docs/publishers)
+- [Alternate Exchanges](https://www.rabbitmq.com/docs/ae)
+- [Queues](https://www.rabbitmq.com/docs/queues)
+- [Quorum Queues](https://www.rabbitmq.com/docs/quorum-queues)
+- [Dead Letter Exchanges](https://www.rabbitmq.com/docs/dlx)
+- [Priority Queues](https://www.rabbitmq.com/docs/priority)
+- [Monitoring](https://www.rabbitmq.com/docs/monitoring)
+- [Memory and Disk Alarms](https://www.rabbitmq.com/docs/alarms)
+- [Flow Control](https://www.rabbitmq.com/docs/flow-control)
+- [Firehose Tracer](https://www.rabbitmq.com/docs/firehose)
+- [RabbitMQ 4.3 Highlights](https://www.rabbitmq.com/blog/2026/04/23/rabbitmq-4.3-release)
