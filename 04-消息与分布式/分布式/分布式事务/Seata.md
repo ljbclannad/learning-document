@@ -5,21 +5,34 @@
 - [2. XA事务模式](#2-xa事务模式)
 - [3. AT模式](#3-at模式)
 - [4. TCC模式](#4-tcc模式)
-- [5. AT模式技术题汇总](#5-at模式技术题汇总)
-- [6. AT性能稳定性极限](#6-at性能稳定性极限)
-- [7. TCC问题汇总](#7-tcc问题汇总)
-- [8. 最终一致方案vs强一致事务](#8-最终一致方案vs强一致事务)
-- [9. 生产事故级](#9-生产事故级)
+- [5. AT 核心机制与边界](#5-at-核心机制与边界)
+- [6. AT 性能、稳定性与降级](#6-at-性能稳定性与降级)
+- [7. TCC 核心机制与可靠性](#7-tcc-核心机制与可靠性)
+- [8. 事务模式选择：最终一致与强协调](#8-事务模式选择最终一致与强协调)
+- [9. 综合场景：医疗挂号、支付与医保](#9-综合场景医疗挂号支付与医保)
+- [10. 调用链路：从业务请求到二阶段](#10-调用链路从业务请求到二阶段)
 - [11. Seata的3个核心表](#11-seata的3个核心表)
 - [12. Seata架构与通信机制](#12-seata架构与通信机制)
 - [13. 事务隔离与读一致性](#13-事务隔离与读一致性)
 - [14. 异常场景处理（空回滚/幂等/悬挂）](#14-异常场景处理空回滚幂等悬挂)
-- [15. SAGA 模式详解](#15-saga-模式详解)
-- [16. 性能优化实战](#16-性能优化实战)
-- [17. 高可用部署方案](#17-高可用部署方案)
-- [18. Spring Cloud 集成原理](#18-spring-cloud-集成原理)
+- [Seata Saga 模式](Seata-SAGA.md)
+- [15. SAGA 模式](#15-saga-模式)
+- [Seata 性能优化运行手册](Seata-性能优化.md)
+- [Seata 高可用部署运行手册](Seata-高可用部署.md)
+- [Seata 监控与故障排查运行手册](Seata-监控与故障排查.md)
+- [16. 性能优化](#16-性能优化)
+- [17. 高可用部署](#17-高可用部署)
+- [Seata Spring Cloud 集成](Seata-Spring%20Cloud%20集成.md)
+- [18. Spring Cloud 集成](#18-spring-cloud-集成)
 - [19. 监控与故障排查](#19-监控与故障排查)
-- [20. 面试高频题汇总](#20-面试高频题汇总)
+- [Seata 自测题](Seata-自测题.md)
+- [20. 自测与复习](#20-自测与复习)
+
+> **阅读路径与版本边界**
+>
+> - 初学：按 `1 → 2/3/4 → 11 → 13 → 14 → 15` 阅读；需要 Saga、Spring Cloud 集成、压测、部署和值班时转入对应专题文档。第 5～9 章用于把核心机制落到场景，第 20 章仅作为自测入口，避免与正文重复。
+> - 本文同时包含多个 Seata 版本的配置与源码片段。`store.mode`、客户端配置键、存储实现和 SQL 支持范围均可能随版本变化；落地时应以项目实际依赖版本的官方文档、默认配置和集成测试为准。
+> - 文中的 Java、YAML 和 SQL 如未明确标注版本或可运行项目，均应视为**机制示意**，不可直接复制到生产环境。
 
 # 1. Seata基础
 
@@ -34,17 +47,17 @@ Seata 采用 **TC（事务协调者）、TM（事务管理者）、RM（资源�
 
 ## 1.2 Seata 事务流程流程
 
-假设 **订单服务（order-service）** 需要调用 **库存服务（stock-serv  ice）** 和 **支付服务（pay-service）**，并保证事务一致性，Seata 事务的执行流程如下：
+假设 **订单服务（order-service）** 需要调用 **库存服务（stock-service）** 和 **支付服务（pay-service）**，并保证事务一致性，Seata 事务的执行流程如下：
 1. **TM 向 TC 申请开启全局事务**：
     - `order-service` 作为事务发起者（TM），向 Seata Server（TC）注册一个全局事务，TC 生成全局事务 ID。
 2. **RM 向 TC 注册分支事务**：
-    - `stock-service` 和 `pay-service` 作为参与者（RM），将本地事务（数据库操作）注册到 TC。
+    - 参与全局事务且实际执行了受 Seata 管理的资源操作的服务，会在相应分支执行时向 TC 注册分支事务；并非所有被调用服务都会无条件注册分支。
 3. **业务执行**：
     - `order-service` 调用 `stock-service` 扣减库存。
     - `order-service` 调用 `pay-service` 进行支付。
 4. **提交或回滚**：
-    - **业务成功**：TM 通知 TC **提交事务**，TC 通知所有 RM **提交本地事务**。
-    - **业务失败**：TM 通知 TC **回滚事务**，TC 通知所有 RM **回滚本地事务**。
+    - **业务成功**：TM 通知 TC 提交全局事务，TC 协调各 RM 完成相应模式的二阶段动作。AT 的本地事务已在一阶段提交，二阶段提交主要是确认并异步清理 `undo_log`；XA 才是在二阶段提交数据库事务。
+    - **业务失败**：TM 通知 TC **回滚事务**，TC 按事务模式协调 RM 执行二阶段动作：AT 对已提交的一阶段数据做镜像补偿，XA 回滚 prepared 分支，TCC 则执行 Cancel。
 
 ## 1.3 Seata 架构示意图
 ```text
@@ -105,28 +118,47 @@ Seata 采用 **TC（事务协调者）、TM（事务管理者）、RM（资源�
     - 维护 **分支事务表**
     - 处理事务超时、回滚、恢复机制
 - **存储方式**：
-    - **默认模式**：使用 **内存存储**
-    - **持久化存储**：支持 **MySQL / PostgreSQL / Redis** 作为事务日志存储
+    - `store.mode` 的默认值与可选项取决于 Seata 版本；常见模式包括 `file`、`db`、`redis` 与较新版本的 `raft`。
+    - `file` 适合单机开发或演示，不能据此推导为高可用部署；生产部署需要根据目标版本评估 DB、Redis 或 Raft 的一致性、恢复与运维边界。
 
 ## 1.5 Seata 事务模式
 
 | **模式**                      | **适用场景**                  | **特点**           |
 | ----------------------------- | ----------------------------- | ------------------ |
-| **AT（自动事务）**            | 适用于 **MySQL**，强一致性    | 自动补偿，支持回滚 |
-| **TCC（Try-Confirm-Cancel）** | 适用于 **金融支付**           | 业务定义补偿逻辑   |
-| **Saga（长事务）**            | 适用于 **跨国支付、订单流程** | 允许部分回滚       |
-| **XA（强一致性）**            | 适用于 **银行、金融**         | 基于 **2PC**       |
+| **AT（自动事务）**            | 受支持的关系型数据库、短事务 | 数据源代理生成镜像并自动补偿 |
+| **TCC（Try-Confirm-Cancel）** | 资源预留、需要业务语义控制的流程 | 业务定义冻结、确认与取消 |
+| **Saga（长事务）**            | 可补偿的长流程、跨服务编排 | 正向动作与补偿动作，通常不提供隔离 |
+| **XA（强一致性）**            | 支持 XA 的资源、可接受锁持有成本 | 基于 XA/2PC，由资源管理器 prepare/commit |
 
-### 1.5.1 AT 模式（自动事务）
-- 适用于 **MySQL/InnoDB** 数据库，Seata 自动管理事务。
+### 1.5.1 模式选型决策树
+
+```mermaid
+flowchart TD
+  A[需要跨资源保持一致] --> B{是否只涉及一个本地数据库？}
+  B -- 是 --> C[优先使用本地事务]
+  B -- 否 --> D{是否包含外部系统或不可控参与方？}
+  D -- 是 --> E[本地事务 + 可靠消息 + 对账/冲正]
+  D -- 否 --> F{是否需要显式冻结库存、额度、号源等资源？}
+  F -- 是 --> G[TCC：Try 预留，Confirm/Cancel 收敛]
+  F -- 否 --> H{是否是短链路且所有资源支持 XA？}
+  H -- 是 --> I[评估 XA：接受 Prepare 锁持有成本]
+  H -- 否 --> J{是否为受控关系型 DB 的短事务 CRUD？}
+  J -- 是 --> K[评估 AT：镜像、全局锁、SQL/方言支持]
+  J -- 否 --> L[Saga：正向动作 + 补偿；接受中间状态]
+```
+
+> 决策树用于缩小方案范围，不替代风险评估：资金账本、外部支付、税票等不可逆副作用仍应以可追溯流水、对账和冲正为准。
+
+### 1.5.2 AT 模式（自动事务）
+- 适用于当前 Seata 版本支持的关系型数据库与 JDBC 数据源；MySQL/InnoDB 是常见组合，但不是唯一前提。
 - **回滚方式**：在 `undo_log` 表中存储事务数据，事务失败时进行回滚。
 
-### 1.5.2 TCC 模式（Try-Confirm-Cancel）
+### 1.5.3 TCC 模式（Try-Confirm-Cancel）
 - 适用于 **金融支付**、**订单系统**，业务需要实现 `Try()`、`Confirm()`、`Cancel()` 方法。
 - **示例**
     ```java
     public class PaymentTCC implements TccAction {
-        public boolean tryPayment(...) { /* 扣款但不提交 */ }
+        public boolean tryPayment(...) { /* 校验并冻结资源，在本地事务中提交预留状态 */ }
         public boolean confirmPayment(...) { /* 提交扣款 */ }
         public boolean cancelPayment(...) { /* 退款 */ }
     }
@@ -145,19 +177,8 @@ Seata 采用 **TC（事务协调者）、TM（事务管理者）、RM（资源�
     ```
 
 ### 1.6.2 数据库初始化（AT 模式）
-- 执行 Seata `undo_log` SQL：
-    ```sql
-    CREATE TABLE `undo_log` (
-    `id` bigint(20) NOT NULL AUTO_INCREMENT,
-    `branch_id` bigint(20) NOT NULL,
-    `xid` varchar(100) NOT NULL,
-    `rollback_info` longblob NOT NULL,
-    `log_created` datetime NOT NULL,
-    `log_modified` datetime NOT NULL,
-    PRIMARY KEY (`id`),
-    UNIQUE KEY `ux_undo_log` (`xid`,`branch_id`)
-    );
-    ```
+
+AT 分支的业务库需要 `undo_log`。标准示例 DDL 与订单/库存表统一维护在 [3.4.1 数据库表](#341-数据库表)；实际建表脚本必须与项目使用的 Seata 版本和数据库类型匹配。
 
 ## 1.7 总结
 
@@ -177,7 +198,7 @@ XA 是 **X/Open 组织** 提出的 **分布式事务协议**，其核心思想�
 
 | **阶段**                          | **操作**                        | **说明**                                 |
 | --------------------------------- | ------------------------------- | ---------------------------------------- |
-| **第一阶段（Prepare, 预提交）**   | **TM 询问所有 RM 是否可以提交** | RM 执行 SQL，但不提交，仅写入 `undo_log` |
+| **第一阶段（Prepare, 预提交）**   | **TM 询问所有 RM 是否可以提交** | RM 执行业务 SQL，并通过 XA `PREPARE` 将分支置为可提交/可回滚的 prepared 状态；**不使用 Seata AT 的 `undo_log`** |
 | **第二阶段（Commit / Rollback）** | **TM 发送提交或回滚命令**       | RM 统一提交或回滚事务                    |
 
 ## 2.3 XA 事务执行流程
@@ -193,7 +214,7 @@ XA 是 **X/Open 组织** 提出的 **分布式事务协议**，其核心思想�
 3. XA END 'xid-1001';    -- 事务结束
 4. XA PREPARE 'xid-1001'; -- 预提交
 5. XA COMMIT 'xid-1001';  -- 提交事务
-    
+
 ## 2.5 Seata XA 事务模式
 ### 2.5.1 引入 Seata 依赖
 
@@ -228,27 +249,10 @@ XA 是 **X/Open 组织** 提出的 **分布式事务协议**，其核心思想�
 ## 2.6 Seata XA 事务完整示例
 
 ### 2.6.1 数据库表
-#### 2.6.1.1 订单表
-```sql
-    CREATE TABLE `t_order` (
-    `id` bigint(20) NOT NULL AUTO_INCREMENT,
-    `user_id` bigint(20) NOT NULL,
-    `amount` decimal(10,2) NOT NULL,
-    PRIMARY KEY (`id`)
-    );
-```
 
-#### 2.6.1.2 库存表
-```sql
-    CREATE TABLE `t_stock` (
-    `id` bigint(20) NOT NULL AUTO_INCREMENT,
-    `product_id` bigint(20) NOT NULL,
-    `count` int(11) NOT NULL,
-    PRIMARY KEY (`id`)
-    );
-```
+本示例复用 [3.4.1 数据库表](#341-数据库表) 的 `t_order` 与 `t_stock`；XA 是否可用取决于实际数据库、驱动和资源配置，不能仅凭表结构判断。
 
-### 2.6.2 订单服务  
+### 2.6.2 订单服务
 
 ```java
     @Service
@@ -273,8 +277,8 @@ XA 是 **X/Open 组织** 提出的 **分布式事务协议**，其核心思想�
         private StockMapper stockMapper;
         @Transactional
         public void reduceStock(Long productId, int count) {
-            stockMapper.updateStock(productId, count);
-            if (count > 10) {
+            int affected = stockMapper.updateStock(productId, count);
+            if (affected != 1) {
                 throw new RuntimeException("库存不足，回滚事务");
             }
         }
@@ -284,10 +288,10 @@ XA 是 **X/Open 组织** 提出的 **分布式事务协议**，其核心思想�
 ## 2.7 Seata XA 事务 vs TCC 事务
 | **对比项**   | **XA 事务（两阶段提交）**  | **TCC 事务（Try-Confirm-Cancel）** |
 | ------------ | -------------------------- | ---------------------------------- |
-| **一致性**   | **强一致性**（提交或回滚） | **最终一致性**（业务补偿）         |
+| **一致性模型** | 数据库 XA 两阶段提交；资源和协调器可用时提供原子提交/回滚 | 业务资源预留 + Confirm/Cancel，靠幂等、重试与补偿收敛 |
 | **事务管理** | **数据库级别事务**         | **业务代码控制**                   |
-| **性能**     | **较低**（锁定资源）       | **较高**（减少锁持有时间）         |
-| **适用场景** | **银行转账、订单支付**     | **库存扣减、秒杀**                 |
+| **资源占用** | Prepare 后通常持有数据库资源，长事务成本高 | 由业务决定冻结粒度与持有时间，仍需治理热点与超时 |
+| **适用场景** | 参与资源支持 XA、链路短且可接受锁持有成本 | 库存、额度、号源等可显式预留和补偿的业务资源 |
 
 ## 2.8 Seata XA 事务部署
 ### 2.8.1 启动 Seata Server
@@ -297,29 +301,24 @@ XA 是 **X/Open 组织** 提出的 **分布式事务协议**，其核心思想�
         -e SEATA_IP=192.168.1.100 \
         seataio/seata-server
 ```
-### 2.8.2 配置数据库模式
-```sql
-    CREATE TABLE `undo_log` (
-    `id` bigint(20) NOT NULL AUTO_INCREMENT,
-    `branch_id` bigint(20) NOT NULL,
-    `xid` varchar(100) NOT NULL,
-    `rollback_info` longblob NOT NULL,
-    PRIMARY KEY (`id`)
-    );
-```
+### 2.8.2 部署要点
+
+- Seata Server 的会话/锁存储应按所用版本初始化对应的 Server 端表或 Raft/Redis 等存储，而不是在业务库创建 AT 的 `undo_log`。
+- XA 分支要求参与资源、JDBC 驱动和数据库配置实际支持 XA；应通过目标数据库的 XA 配置、故障恢复演练与锁等待监控验证。
+- `undo_log` 是 AT 分支的回滚日志；只有同一业务库同时参与 AT 分支时才需要按 AT 的 DDL 创建它，不能把它当作 XA 的部署前置条件。
 
 # 3. AT模式
 ## 3.1 AT模式概述
-- **自动管理分支事务**（基于 MySQL/InnoDB）
-- **回滚时不锁定主键**，保证性能
-- **支持 SQL 解析**，无需业务代码修改  
- 
+- 在当前版本支持的关系型数据库和 JDBC 数据源上自动管理分支事务；MySQL/InnoDB 是常见组合，但不是唯一组合。
+- 一阶段通过前后镜像和全局锁实现可补偿更新；受支持的 DML 通常需要可识别的主键/唯一行定位，不能把 AT 理解为无约束的透明回滚。
+- 框架可解析受支持的 SQL 并生成镜像，但数据源代理、SQL 方言、表结构和写入路径都必须纳入适配与测试范围。
+
 ## 3.2 AT 模式的两阶段提交
 AT 模式采用 “两阶段提交（2PC）” 进行事务管理：
 | **阶段**                           | **操作**                                       | **数据库变化**                               |
 | ---------------------------------- | ---------------------------------------------- | -------------------------------------------- |
-| **第一阶段（Try, 预提交）**        | 业务 SQL 正常执行，Seata 记录 **undo_log**     | **插入 Undo Log**，但不提交                  |
-| **第二阶段（Confirm / Rollback）** | TM 发送 **提交/回滚** 指令，Seata 自动清理数据 | **提交：删除 undo_log，回滚：撤销 SQL 操作** |
+| **第一阶段（业务提交）**            | 执行业务 SQL，生成前后镜像并写入 `undo_log`    | **业务数据与 `undo_log` 在同一当地事务中提交** |
+| **第二阶段（Commit / Rollback）**  | TC 驱动全局提交或回滚                           | **提交：异步清理 `undo_log`；回滚：按镜像补偿业务数据** |
 
 ## 3.3 Seata AT 模式的工作流程
     ```text
@@ -362,7 +361,8 @@ AT 模式采用 “两阶段提交（2PC）” 进行事务管理：
     `rollback_info` longblob NOT NULL,
     `log_created` datetime NOT NULL,
     `log_modified` datetime NOT NULL,
-    PRIMARY KEY (`id`)
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `ux_undo_log` (`xid`,`branch_id`)
     );
 ```
 
@@ -442,15 +442,8 @@ AT 模式采用 “两阶段提交（2PC）” 进行事务管理：
 ```
 
 ### 3.6.2 数据库模式
-```sql
-    CREATE TABLE `undo_log` (
-    `id` bigint(20) NOT NULL AUTO_INCREMENT,
-    `branch_id` bigint(20) NOT NULL,
-    `xid` varchar(100) NOT NULL,
-    `rollback_info` longblob NOT NULL,
-    PRIMARY KEY (`id`)
-    );
-```
+
+业务库的 `undo_log` 使用 [3.4.1.3 Seata Undo Log 表](#3413-seata-undo-log-表) 的标准示例；TC 的会话/锁存储则按当前版本的 Server 端 DDL 与存储模式初始化，二者不要混淆。
 
 ## 3.7 AT 事务的优缺点
 | **优点**                     | **缺点**                       |
@@ -603,7 +596,7 @@ public boolean tryFreeze(BusinessActionContext ctx, Long productId, Integer coun
     // 3. 记录 fence 日志
     return true;
 }
-``` 
+```
 
 ### 4.5.3 Confirm 阶段实现（正式扣减）
 ```java
@@ -676,13 +669,11 @@ public boolean cancel(BusinessActionContext ctx) {
 Seata 的 TCC 模式是业务级的两阶段提交方案，一阶段 Try 负责资源预留，二阶段 Confirm 负责最终提交，Cancel 负责反向补偿。与 AT 不同，TCC 不依赖数据库 undo_log，而是完全由业务代码保证一致性。
 在工程上 TCC 最大的难点是三类问题：幂等、空回滚和资源悬挂，通常需要配合冻结日志或 Fence 表来解决。这使得 TCC 侵入性很强、开发成本高，但换来的是高性能、高可控性和对跨中间件事务的强支持，因此在支付、库存、医保结算、挂号这种“资金级/资源级强一致场景”中被广泛使用。
 
-# 5. AT模式技术题汇总
+# 5. AT 核心机制与边界
 
 ## 5.1 Seata AT 模式一次完整的全局事务，从 @GlobalTransactional 到最终提交，一共发生了几次 JDBC 本地事务？每一次分别由谁开启
 
-1. 每个分支事务（每个库 / 每个微服务）至少会有 2 次 JDBC 本地事务。**全局事务里有多少个分支，就乘以多少。**
-    - 第 1 次：业务本地事务（执行业务 SQL + 写 undo_log + 写 lock_table）
-    - 第 2 次：清理事务（删除 undo_log + 释放全局锁）
+> 不要把 AT 简化成固定的“每个分支恰好两次 JDBC 事务”。稳定的结论是：**一阶段每个 AT 分支会有一次业务本地事务；全局回滚时该分支必然还会有一次补偿本地事务；全局提交的 `undo_log` 清理由 RM 异步执行，其批次和事务边界属于实现细节。**此外，TC 使用 DB 存储时维护全局/分支/全局锁记录，也会产生自己的存储事务。
 
 ### 5.1.1 第一次本地事务：业务阶段（Phase 1）
 1. 参与角色：RM + 本地事务管理器（例如 Spring + DataSourceProxy）
@@ -703,33 +694,33 @@ Seata 的 TCC 模式是业务级的两阶段提交方案，一阶段 Try 负责�
         // 1. 根据业务 SQL 做 before image 查询
         // 2. 执行业务 update / insert / delete
         // 3. 根据影响行做 after image
-        // 4. 写 undo_log + lock_table
-        // 5. 提交本地事务
+        // 4. 写 undo_log
+        // 5. 在提交本地事务前向 TC 申请全局锁；成功后才提交
     }
 ```
-4. undo_log、lock_table 也一起落库
-5. 从数据库的角度：就跟普通本地事务没区别，只是多了几张“辅助表”。
+4. `undo_log` 与业务数据在**同一个业务库、本地事务**中提交；`lock_table`（DB 存储模式下）由 TC 的存储维护，不属于 RM 的业务库事务。
+5. 一阶段本地事务提交后，本地行锁会释放；全局锁会持续到全局事务进入最终状态。
 
 ### 5.1.2 第二次本地事务：全局提交后的清理（Phase 2 Commit）
 
 1. 参与角色：RM 内部的异步任务线程 + JDBC 连接
 2. 触发时机：当 TM 告诉 TC：这个全局事务可以 commit 了
 3. TC会给每个分支RM发BranchCommit请求。RM收到之后不会再改业务表，只会做“扫尾工作”：
-    - 删除对应的 undo_log 记录
-    - 删除 lock_table 里的全局锁记录
+    - 将对应的 `undo_log` 放入异步清理队列并批量删除
+    - TC 在推进全局事务状态时释放其维护的全局锁
 
 4. 这些操作也要保证原子性，所以会再开一个很短的本地事务：
 ```sql
-BEGIN;
-  DELETE FROM undo_log WHERE xid = ? AND branch_id = ?;
-  DELETE FROM lock_table WHERE xid = ? AND branch_id = ?;
-COMMIT;
+-- RM 侧：实现通常会异步、批量删除 undo_log
+DELETE FROM undo_log WHERE xid = ? AND branch_id = ?;
+
+-- TC 侧：由 TC 的存储事务更新全局状态并释放全局锁
 ```
 ### 5.1.3 谁开启？
-1. RM 内部的异步执行器（通常是 Seata 客户端里的一个线程池），通过 DataSourceProxy 拿连接，开启一个新的 JDBC 本地事务，快速删掉 undo / 锁。  
+1. RM 的异步任务负责清理 `undo_log`；TC 负责全局事务状态与全局锁。二者可能都使用 JDBC，但分别属于资源管理端和协调端，不能合并成“RM 删除 undo 与 lock_table 的同一事务”。
 
 ### 5.1.4 全局事务“总共几次本地事务”？
-严格一点讲（只考虑“正常提交”路径，不考虑 rollback）：全局层面：TM / TC 本身不做 JDBC（除非你让 TC 把全局事务状态落到 DB，那是另一个话题）。对于每一个分支（一个参与库 / 一个微服务）：1 次：业务本地事务（Phase 1，执行业务 SQL + 记录 undo_log + 上全局锁）。1 次：清理本地事务（Phase 2 Commit，删 undo_log + 释放全局锁）
+严格一点讲，不能用一个与部署无关的固定次数回答。对每个 AT 分支：一阶段有一次业务本地事务（业务数据与 `undo_log` 同提交）；成功提交后 `undo_log` 会被异步清理；全局回滚时则会启动补偿本地事务。若 TC 使用 DB/Raft 等持久化存储，协调端还会持久化全局、分支和锁状态。
 
 如果是回滚（Global Rollback），第二阶段不是删 undo_log，而是：
 1. 再开一次本地事务
@@ -739,7 +730,7 @@ COMMIT;
 也就是说：提交路径：业务事务 + 清理事务。回滚路径：业务事务 + 回滚补偿事务（也带清理）。
 
 ### 5.1.5 总结
-在 Seata AT 里，一个全局事务其实是 TC 管控下的多段本地事务拼接出来的。每个分支服务至少有两次 JDBC 本地事务：一次是业务事务（执行业务 SQL + 记录前后镜像、undo_log、加全局锁），一次是二阶段提交后的清理事务（删 undo_log、释放全局锁）。TC / TM 不直接开启 JDBC 事务，只负责全局事务状态和分支事务的协调。这样答，一般面试官会觉得你是真的走过源码而不是只会贴 @GlobalTransactional。
+在 Seata AT 里，一个全局事务由多个一阶段本地事务与 TC 的协调状态组成。回答时应区分：业务库的一阶段提交、RM 的异步 `undo_log` 清理、回滚时的补偿事务，以及 TC 的全局状态/全局锁持久化；不要把它们混成每个 RM 固定的“两次 JDBC 事务”。
 
 ## 5.2 AT 为什么必须“先查后改”
 
@@ -750,18 +741,19 @@ COMMIT;
 ### 5.2.2 Seata 内部到底做了什么？
 假设你写了业务 SQL：`update stock set count = count - 1 where id = 100;`
 在 AT 模式下，真正执行时大致是这样一套流程（在一个本地事务里）：
-1. before image：Seata 解析这条 UPDATE，然后生成一条等价的：`SELECT * FROM stock WHERE id = 100 FOR UPDATE;`拿到更新前的行数据（这就是“先查”）。
+1. before image：Seata 解析受支持的 DML，并按其主键与条件查询受影响行来构建前镜像；对 UPDATE 场景可近似理解为先锁定并读取目标行，但不要把所有 SQL 都机械等同为 `SELECT * ... FOR UPDATE`。
 2. 执行你的业务 SQL：`update stock set count = count - 1 where id = 100;`
 3. after image：再查一次更新后的数据：`SELECT * FROM stock WHERE id = 100;`
 4. 把 before image 和 after image 写进 undo_log
-5. 再在 lock_table 里加一把全局锁。
-这四步，都在同一个本地事务里完成，然后才 commit。
+5. 在提交该本地事务**之前**，RM 向 TC 注册分支并申请受影响主键的全局锁；只有成功拿到全局锁才提交本地事务。
+
+业务数据、前后镜像和 `undo_log` 在同一个本地事务内；全局锁由 TC 维护，不是业务库中与 `undo_log` 一起写入的 `lock_table`。
 
 ### 5.2.3 为什么必须先查？
 因为 AT 模式的回滚不是靠“反向业务逻辑”，而是靠 “数据前镜像 + 后镜像”：
 1. 回滚的时候，用 before image 生成反向 SQL，例如：
-`UPDATE stock 
-SET count = 10 
+`UPDATE stock
+SET count = 10
 WHERE id = 100 AND count = 9;`
 2. 这里 count = 9 就来自 after image，用来防止脏回滚。
 
@@ -771,8 +763,8 @@ WHERE id = 100 AND count = 9;`
 3. 无法做安全校验（WHERE … AND count = 9）
 那 AT 这套“透明增强”的魔法就没法玩了。
 
-所以：“先查后改”是 AT 能回滚的物理前提。
- 
+所以：“先取前镜像、再执行 DML、再取后镜像”是 AT 自动补偿的前提。它还隐含了重要限制：目标表通常需要可识别的主键，SQL 与数据库类型必须在当前 Seata 版本的 AT 支持范围内。
+
 ### 5.2.5 为什么 `update stock set count = count - 1` 在 AT 下被认为是“危险 SQL”？
 注意，这条 SQL 的危险点 不是 Seata 无法拦截它（Seata 是能拦截并生成镜像的），而是它在 分布式 + 重试 + 高并发 语境下，会放大一堆问题。
 
@@ -955,17 +947,19 @@ AT 的行冲突控制是靠：数据库行锁（SELECT ... FOR UPDATE 拿的）�
 UPDATE stock SET count = count - 1 WHERE id = 100;
 
 -- 回滚时生成类似：
-UPDATE stock 
-SET count = 10, update_time = '2024-01-01 10:00:00', ... 
-WHERE id = 100 
-  AND count = 9 
-  AND update_time = '2024-01-01 10:00:01' 
+UPDATE stock
+SET count = 10, update_time = '2024-01-01 10:00:00', ...
+WHERE id = 100
+  AND count = 9
+  AND update_time = '2024-01-01 10:00:01'
   ...;
 ```
 3. SET 部分来自 before image（要恢复的老值）
 4. WHERE 部分来自 after image（保护条件，防止当前行已经被其他事务改过）
 
 ### 5.4.2 遇到触发器 / 默认值 / DB 自动填充，还安全吗？
+
+> **结论先行：不能把 AT 的镜像回滚理解成“对所有数据库副作用都绝对安全”。**能否正确补偿取决于当前 Seata 版本对该 DML、数据库方言与表结构的支持，以及回滚时当前数据能否通过脏数据校验。对触发器、存储过程、跨表副作用和人工直改，应优先用集成测试验证；资金与审计流水更应采用显式冲正和对账。
 
 #### 5.4.2.1 同一条 DML 内部的自动修改：基本是安全的
 
@@ -999,17 +993,15 @@ UPDATE stock SET count = count - 1 WHERE id = 100;
     - 根据 before image 生成 SET count=10, update_time='2024-01-01 10:00:00', ...
     - 根据 after image 生成 WHERE id=100 AND count=9 AND update_time='2024-01-01 10:05:00', ...
 
-只要这行在期间没被别的事务改过，回滚时会把 包括触发器自动改的字段一起恢复为旧值。
+若自动填充字段被纳入前后镜像、且该行在此期间未被其他事务改动，回滚通常可以恢复该行的旧值；这只是受支持场景下的结果，不是对任意触发器行为的承诺。
 
-所以：只要所有修改都发生在同一条 DML 语句 / 同一个本地事务内，Seata 拍的 before/after image是总效果的快照，是可以恢复的。
-包括：默认值、ON UPDATE 自动时间戳、某些简单触发器在同一行上加/改字段
-这些在“单行 + 单事务维度”上，是可以被 undo_log 正确回滚的。
+`DEFAULT`、`ON UPDATE` 自动时间戳、触发器写同一行等行为都应视为**需要验证的兼容性边界**。不要据此推导出“同一事务内的任意数据库副作用都可被 undo_log 回滚”。
 
 #### 5.4.2.2 真正有坑的地方：跨表副作用 & 事务外修改
 1. 场景 A：触发器更新了其他表
 比如你在 stock 表上定义了一个触发器：
 ```sql
-CREATE TRIGGER trg_stock_log 
+CREATE TRIGGER trg_stock_log
 AFTER UPDATE ON stock
 FOR EACH ROW
 BEGIN
@@ -1045,7 +1037,7 @@ END;
     - 这就说明了一个现实：undo_log 能保证的是“在数据没被乱改的前提下，我能把这条事务自己的影响恢复回去”，但 不能抵抗“提交之后的外部写入”。
     - 所以从工程角度，才会建议：被 Seata 管控的表，所有写入路径都要走 Seata 的 DataSourceProxy，禁止 DBA 对这些表直接“手活改数据”，至少要非常慎重
 
-# 6. AT性能稳定性极限
+# 6. AT 性能、稳定性与降级
 ## 6.1 一个 AT 全局事务里包含 20 个微服务更新节点，其中 2 个服务 RT 炸到了 3 秒，此时系统的性能瓶颈到底在：TC、RM 还是数据库？
 
 1. 在你描述这个场景里，瓶颈几乎肯定不在 TC，而是在那两个慢服务的“RM + 数据库”侧，本质是数据库 / 业务 RT 撑到了 3 秒，拖长了整条全局事务的生命周期。
@@ -1065,12 +1057,12 @@ END;
         - TC 标记全局事务状态为 Committing
         - 异步通知各个 RM 做二阶段清理（删 undo_log、释放锁）
 
-3. 全局事务的整体 RT ≈ max(各个分支一阶段 RT) + 一点点 TC / 网络开销
+3. 全局事务的整体 RT 取决于编排方式：串行调用更接近各分支耗时之和，存在并行分支时更接近关键路径耗时，再叠加 TC、网络与重试开销。
 
 4. 所以你说“其中 2 个服务 RT 炸到 3 秒”，其实就是：
     - 这两个服务的“一阶段本地事务”各自耗时 ~3s
-    - 整个全局事务的生命周期一定 ≥3s
-    - 所有被它占用的全局锁、行锁都跟着撑到 3s 才释放
+    - 整个全局事务的生命周期会被慢分支显著拉长
+    - 已完成一阶段且仍未全局终态的分支，其全局锁会延后释放；数据库行锁则以各自本地事务提交/回滚为准，不能笼统认为都持有 3 秒
 
 ### 6.1.1 TC、RM、DB 分别在干嘛？谁最可能顶不住？
 1. TC：事务协调器
@@ -1081,7 +1073,7 @@ END;
             - BranchRegister / BranchReport
             - 管一堆锁的状态
     - 所以在你说的这个“2 个服务 RT=3s”的场景里：
-    - 除非你整个系统 TPS 已经高到几万级以上，不然 TC 几乎不可能是导致这两个服务 RT 变 3s 的源头。
+    - 不能仅凭“两个服务 RT=3 秒”排除 TC：应先看 `GlobalBegin`/`BranchRegister` 的耗时、TC CPU/GC、会话存储延迟与锁冲突率；若这些指标正常，再优先排查慢服务自身及其数据库。
 
 2. TC 的问题表现通常是：
     - 某些分支 branchRegister 很慢或超时
@@ -1097,7 +1089,7 @@ END;
     - 写 undo_log
     - 向 TC 注册分支、上报状态
 
-2. 这些东西对一条 SQL 来说，一般是 毫秒级，远远不到 3 秒。如果你只看到“按调用链统计，某个服务的 Seata 拦截链耗时 3 秒”，真实情况十有八九是：这个服务的本地事务在 3 秒内都没 commit，Seata 只是“站在旁边看着”，3 秒都花在：
+2. 这些开销的具体量级取决于 SQL、镜像行宽、TC 往返、锁冲突和存储状态，不能预设为毫秒级。如果调用链显示 Seata 拦截链耗时 3 秒，应拆分 JDBC、镜像构建、`branchRegister`、锁等待和下游调用的耗时，常见原因包括：
     - 慢 SQL（全表扫描 / 坏索引）
     - 锁等待（行锁 / 间隙锁 / 死锁重试）
     - 调用别的下游（另一个 RPC 慢）
@@ -1128,17 +1120,16 @@ END;
     - lock_table 里的锁长期不释放，其他分支注册失败频率上升
 
 4. 所以从“谁是最终瓶颈”这个角度：
-    - 最终扛不住的一定是 DB：
-    - CPU / IO / 锁子系统 / Buffer Pool 都顶着干。
-    - TC 和 RM 更多是“放大和传递这个瓶颈”的角色。
+    - DB 是高概率热点，但不能预设为唯一根因；TC、注册中心/网络、RM 线程池或下游依赖都可能成为瓶颈。
+    - 应以分段指标确认瓶颈，而不是仅按组件职责归因。
 
 ### 6.1.4 总结
 1. 在 AT 全局事务里，总体 RT 基本由最慢的分支服务决定。
-2. 你说 20 个微服务里有两个 RT 扛到了 3 秒，99% 场景下瓶颈都不在 TC：
-    - TC 只是做全局事务元数据和逻辑锁的管理，单次 RPC 很轻，除非整体 TPS 爆表，否则不会把单个服务撑到 3 秒。
-    - RM 增加的开销主要是 SQL 解析、镜像查询和 undo_log 写入，通常是毫秒级，难以单独打出 3 秒这么夸张的 RT。
-    - 真正导致 3 秒的往往是这两个服务背后的数据库：慢 SQL、锁等待、IO 抖动、下游依赖等。
-3. AT 的副作用在于：这 3 秒不仅是业务慢，还让全局锁和本地行锁被持有 3 秒，导致其他全局事务在锁上排队，所以系统表现为“整体吞吐被这两个慢分支拖垮”。
+2. 对两个 RT 达到 3 秒的分支，应并行排查：
+    - TC：`GlobalBegin`/`BranchRegister` 时延、全局锁冲突、会话存储与线程池；
+    - RM：SQL 解析、镜像构建、JDBC 连接池、回滚/提交线程池；
+    - DB 与下游：慢 SQL、锁等待、IO、RPC 依赖。
+3. AT 会延长全局事务未决窗口；已提交一阶段分支的全局锁持续到二阶段终态，热点行的冲突可能随之放大。数据库行锁的持有时间仍由各分支本地事务边界决定。
 4. 工程上排查时，我会优先看这两个服务的：
     - 数据库慢查询日志 / InnoDB 锁等待
     - 线程栈是否阻塞在 JDBC 调用上
@@ -1294,7 +1285,7 @@ END;
     - 在配置中心预埋事务模式开关（AT / LOCAL_WITH_MSG / READ_ONLY），出现大面积锁风暴时可以快速切到只读或本地事务；
     - 为 global_table / lock_table 设计运维脚本和流程，能批量处理超时事务、清理残留锁，在停新流量的前提下让系统平稳“出血止损”。
 
-# 7. TCC问题汇总
+# 7. TCC 核心机制与可靠性
 ## 7.1 TCC 的 Try 阶段究竟是“业务校验”还是“资源预留”？如果 Try 只是简单校验，不冻结资源，会发生什么级别的事故？
 ### 7.1.1 Try 到底应该干什么？
 1. TCC 三个阶段：
@@ -1625,20 +1616,21 @@ TCC 幂等最好是“状态机 + 业务唯一键”双保险。只靠一个能�
         - 同一个 orderNo / requestId 只能发起一次 TCC 流程，重复请求直接返回之前的处理结果或当前状态；
         - 防止调用方因为超时重试、用户重复点击，导致“从业务角度看是一笔操作，在系统内变成多笔 TCC 事务”。
 
-# 8. 最终一致方案vs强一致事务
-## 8.1 为什么支付宝、微信支付几乎不用 AT？它们更偏向：本地事务 + 消息表、对账系统、延迟补偿而不是 Seata？
-这个问题背后其实是在问一句大实话：“钱这种东西，能不能用‘回滚’来解决问题？”答案是：不能。这就是为什么像支付宝、微信支付这种体量的支付系统，核心链路几乎不会用 Seata AT，而是选：本地事务 + 消息表、账本 + 对账系统、延迟补偿 / 逆向冲正
+# 8. 事务模式选择：最终一致与强协调
+## 8.1 为什么核心资金链路通常不优先选择 AT，而更偏向本地事务、消息、对账与冲正？
+
+公开资料不足以断言某个具体支付机构“几乎不用”某项技术；这里讨论的是**资金域常见的架构约束**。AT 可以用于受控范围内的内部业务数据，但不宜把它当作跨支付渠道、清算、医保或票据平台的统一事务方案。
 
 ### 8.1.1 资金系统的世界观：不是“撤销历史”，而是“追加事实”
-1. AT 的本质是：我先改一把数据，出事了再用 undo_log “改回去”。也就是“撤销这次操作”。
+1. AT 的本质是：一阶段提交业务数据与 `undo_log`，全局回滚时依据行镜像做补偿。它适合受控的关系型数据库资源，但不等于能撤销已经暴露给外部世界的业务事实。
 2. 而支付系统（尤其是受金融监管的那种）普遍采用的是 账本模型 / 会计模型：
     - 一次扣款 = 记一条借贷流水（甚至多条分录）
     - 发现错了 = 再记一条反向流水（冲正），但原来的那条记录永远存在，不能“抹去历史”。
     - 原因很现实：
         - 审计 / 风控 / 法务都要求：资金流每一笔有迹可循，不能“凭空消失”。
-        - 回滚式的“把余额、流水改回去”，对金融监管来说是灾难：你到底扣过没扣过？别人系统已经看到扣款记录了，你本地却“回滚”了？
+        - 对已入账、已对外发送或需要审计的资金事实，通常以冲正/补记保留完整轨迹；数据库回滚不能替代领域账务的冲正语义。
     - 所以对于“钱”来说：
-        - 正确姿势不是“撤回”，而是“再记一笔把错误抵消掉”。AT 的那种“物理回滚”更像是数据库层的撤销，跟资金领域的记账逻辑是冲突的。这也是他们偏向 “本地事务 + 记账表 + 消息 + 对账 + 冲正” 的深层原因。
+        - 因此跨系统资金处理通常采用“本地账务事务 + 可靠事件 + 对账 + 冲正”；AT 与账本模型并非天然冲突，但其边界必须严格限制在尚未产生外部副作用的受控资源内。
 
 ### 8.1.2 支付链路跨了多少系统？AT 根本管不过来
 1. AT 的前提是：你能在一个 Seata 生态 内管控这些“资源”：某几张 MySQL 表、少数几个支持 DataSourceProxy 的服务
@@ -1775,7 +1767,7 @@ TCC 幂等最好是“状态机 + 业务唯一键”双保险。只靠一个能�
 
 2. 所以它们选择“本地事务 + 消息表 + 对账系统 + 延迟补偿”这套组合拳：在单系统内部保持强一致，在系统间通过幂等、重试和对账来保证最终一致，这更符合支付领域的约束和复杂度。
 
-# 9. 生产事故级
+# 9. 综合场景：医疗挂号、支付与医保
 ## 9.1 如果让你为一个“医疗挂号 + 支付 + 医保结算 + 电子票据”系统设计分布式事务方案，你会如何混合使用：AT、TCC、本地事务消息表、最终对账，并说明：哪一段必须强一致，哪一段必须允许不一致？
 
 ### 9.1.1 先划清几条“红线”
@@ -1808,7 +1800,7 @@ TCC 幂等最好是“状态机 + 业务唯一键”双保险。只靠一个能�
     - 检查号源是否有余量
     - t_schedule_slot.available_count - 1，frozen_count + 1
     - 创建一条 registration 记录，状态 PENDING（待支付）
-    - 整个 Try 是本地事务（号源表 + 挂号表在同库可用本地事务，不用 AT）
+    - 若号源表与挂号表在同一数据库，可在一个本地事务中完成；若属于两个独立服务/数据库，则应分别实现各自的 TCC Try 分支，各自冻结本地资源，不能把跨库写误称为“一个本地事务”。
     - Confirm(确认挂号)
     - frozen_count - 1，used_count + 1
     - registration.status = CONFIRMED
@@ -1879,122 +1871,29 @@ TCC 幂等最好是“状态机 + 业务唯一键”双保险。只靠一个能�
     - 各自服务内部用本地事务 + outbox 消息模式，并通过定时对账、冲正交易、异常池的方式来兜底；
     - 这部分允许短暂不一致，但必须可追溯、可对账、可补偿。
 5. AT 的使用边界：
-    - 只在院内某个服务内部、需要跨多张表但又在同一个库的场景下使用 AT，降低开发成本；
-    - 不用 AT 去覆盖大粒度的支付/医保/开票全链路，以免长事务 + 全局锁拖垮性能。
+    - 同一数据库内多表原子写入应优先使用普通本地事务，通常不需要 AT；AT 仅在多个受控数据库资源确有原子回滚诉求、SQL 与数据源受支持且事务边界足够短时审慎使用。
+    - 不用 AT 去覆盖大粒度的支付/医保/开票全链路，以免长事务、全局锁与外部副作用放大故障。
 
 
-#  10. 记录下真实的调用链路
-按这个项目里一次“创建订单”的实际源码执行顺序，可以这样看 Seata。
+# 10. 调用链路：从业务请求到二阶段
 
-**入口**
-请求先到 `[OrderController.java](/Users/lejinbo/LLM/code-snippets/governance-suite/order-service/src/main/java/com/lx/governance/order/controller/OrderController.java)`，再进入 `[OrderAppService.java](/Users/lejinbo/LLM/code-snippets/governance-suite/order-service/src/main/java/com/lx/governance/order/service/OrderAppService.java#L79)` 的 `create(...)`。这里最关键的是：
-
-```java
-@GlobalTransactional(name = "create-order", rollbackFor = Exception.class)
-public OrderDto create(...)
+```mermaid
+sequenceDiagram
+    participant TM as 业务入口（TM）
+    participant TC as Seata TC
+    participant RM as 分支服务（RM）
+    participant DB as 业务数据库
+    TM->>TC: GlobalBegin
+    TC-->>TM: xid
+    TM->>RM: 调用并传播 xid
+    RM->>DB: 本地事务：镜像 + 业务 DML + undo_log
+    RM->>TC: BranchRegister / 申请全局锁
+    TM->>TC: GlobalCommit 或 GlobalRollback
+    TC->>RM: 二阶段指令
+    RM->>DB: 提交清理或镜像补偿
 ```
 
-这一步不是马上“开始数据库事务”，而是先被 Seata 的 AOP 拦截器拦住。源码阅读顺序你可以理解为：
-
-1. `@GlobalTransactional`
-2. `GlobalTransactionalInterceptor`
-3. `TransactionalTemplate`
-4. TM 向 Seata Server 申请全局事务，拿到一个 `xid`
-5. 把 `xid` 绑定到当前线程上下文
-6. 再真正执行 `create()` 方法体
-
-这就是为什么后面的方法明明只是普通 Feign 调用和普通数据库操作，却能被串成一个全局事务。
-
-**order-service 本地执行**
-进入 `create()` 后，先做幂等锁，然后生成订单号，接着调用：
-
-```java
-orderRepository.insert(...)
-```
-
-这时因为 `order-service` 开了 Seata AT，并且配置了自动数据源代理，真正执行 SQL 的不是裸数据源，而是 Seata 的 `DataSourceProxy`。它会做几件事：
-
-1. 拦截本地事务 SQL
-2. 记录前镜像 / 后镜像
-3. 向 Seata Server 注册当前分支事务
-4. 把回滚所需信息写到本库 `undo_log`
-
-所以这里订单插入虽然看起来是普通 SQL，但已经成为全局事务里的一个 branch。
-
-配置位置在 `[order-service application.yml](/Users/lejinbo/LLM/code-snippets/governance-suite/order-service/src/main/resources/application.yml#L67)`：
-- `enable-auto-data-source-proxy: true`
-- `data-source-proxy-mode: AT`
-
-**调用 inventory-service**
-然后 `create()` 调 `[InventoryClient.java](/Users/lejinbo/LLM/code-snippets/governance-suite/order-service/src/main/java/com/lx/governance/order/client/InventoryClient.java)` 的 Feign 接口：
-
-```java
-ApiResponse<String> inv = inventoryClient.deduct(deductReq);
-```
-
-关键点在于：Seata 会把刚才那个 `xid` 随着 RPC 调用往下传。你代码里没手写这个传递，是 Seata/Spring Cloud 集成层做的。于是下游 `inventory-service` 收到请求时，能知道“我现在是在某个全局事务里”。
-
-请求进入 `[InventoryController.java](/Users/lejinbo/LLM/code-snippets/governance-suite/inventory-service/src/main/java/com/lx/governance/inventory/controller/InventoryController.java)`，再到 `[InventoryAppService.java](/Users/lejinbo/LLM/code-snippets/governance-suite/inventory-service/src/main/java/com/lx/governance/inventory/service/InventoryAppService.java#L29)`：
-
-```java
-@Transactional
-public void deduct(DeductRequest req)
-```
-
-这里的执行顺序是：
-1. Spring 开本地事务
-2. 执行查库存、乐观锁扣库存
-3. Seata 代理数据源拦截 SQL
-4. 把这次库存修改注册成另一个 branch
-5. 记录 `undo_log`
-
-如果这里抛异常，比如你打开 `lab.fail.deduct`，异常会一路返回到 `order-service.create()`。
-
-**调用 payment-service**
-库存成功后，`create()` 继续调 `[PaymentClient.java](/Users/lejinbo/LLM/code-snippets/governance-suite/order-service/src/main/java/com/lx/governance/order/client/PaymentClient.java)`：
-
-```java
-ApiResponse<String> pay = paymentClient.prepare(payReq);
-```
-
-同样，`xid` 会透传到 `payment-service`。请求进入 `[PaymentController.java](/Users/lejinbo/LLM/code-snippets/governance-suite/payment-service/src/main/java/com/lx/governance/payment/controller/PaymentController.java)`，再进 `[PaymentAppService.java](/Users/lejinbo/LLM/code-snippets/governance-suite/payment-service/src/main/java/com/lx/governance/payment/service/PaymentAppService.java#L52)` 的 `prepare(...)`。
-
-这里虽然没显式写 `@Transactional`，但它的插入操作仍然走了 Seata 代理数据源，所以仍然能参与全局事务。执行插入支付预订单时，也会：
-1. 注册 branch
-2. 记录前后镜像
-3. 写 `undo_log`
-
-如果这里失败，比如打开 `lab.fail.prepare`，异常也会回抛给 `order-service.create()`。
-
-**全局提交**
-如果 `create()` 里的订单插入、库存扣减、支付预创建都成功，方法正常返回。此时 Seata 拦截器会在方法退出后做提交流程：
-
-1. TM 告诉 Seata Server：全局事务可以提交
-2. TC 通知各 branch 提交
-3. AT 模式下，本地事务其实已经提交过了
-4. 全局提交更多是清理 branch 状态和后续清理 `undo_log`
-
-所以你看到的“全局提交”不是最后才一次性提交三库 SQL，而是各库本地事务先提交，Seata 通过日志和协调机制保证失败时还能反向补偿回滚。
-
-**全局回滚**
-如果中间任一步异常，比如库存扣减失败，执行顺序就变成：
-
-1. 异常从 `inventory-service` 返回到 `order-service.create()`
-2. `create()` 抛出异常退出
-3. `GlobalTransactionalInterceptor` 捕获到异常
-4. TM 向 Seata Server 发起全局回滚
-5. TC 逐个通知各 branch 回滚
-6. 每个服务依据自己的 `undo_log` 反向恢复数据
-
-例如：
-- `order-service` 删掉刚插入的订单或恢复变更前状态
-- `inventory-service` 把扣掉的库存加回去
-- `payment-service` 回滚刚插入的支付记录
-
-这就是 Seata AT 的核心：不是靠你手写补偿逻辑，而是靠 SQL 镜像和 `undo_log` 自动回滚。
-
-**这条链路的边界**
-注意这个顺序只覆盖 `create()` 这条同步链路。后面的支付确认 `[PaymentAppService.java](/Users/lejinbo/LLM/code-snippets/governance-suite/payment-service/src/main/java/com/lx/governance/payment/service/PaymentAppService.java#L80)` 已经不是 Seata 事务了，而是发 MQ 事件给订单服务，再由订单服务本地事务更新状态。这部分属于最终一致性，不属于 Seata 的执行顺序。
+排查时始终使用“业务单号 → xid → branchId → TC 状态 → RM 日志 → 业务库”的关联链。角色定义见 [Seata基础](#1-seata基础)，通信细节见 [Seata架构与通信机制](#12-seata架构与通信机制)，生产排障见 [[Seata-监控与故障排查]]。
 
 # 11. Seata的3个核心表
 
@@ -2101,7 +2000,7 @@ UPDATE order SET status = 'PAID' WHERE id = 100;
     "rows": [{"id": 100, "status": "PENDING"}]
   },
   "afterImage": {
-    "tableName": "order", 
+    "tableName": "order",
     "rows": [{"id": 100, "status": "PAID"}]
   }
 }
@@ -2447,10 +2346,11 @@ MySQL InnoDB 的四种隔离级别：
 - **REPEATABLE READ**：可重复读（幻读，MySQL 通过 MVCC 解决）
 - **SERIALIZABLE**：串行化
 
-### Seata 的隔离级别
-Seata 默认提供 **读未提交（Read Uncommitted）** 级别的隔离：
+### Seata 的全局可见性语义
 
-**为什么是读未提交？**
+Seata AT 默认可理解为**全局读未提交语义**：其他业务可能读到“本地一阶段已提交、但全局事务尚未决议”的中间状态。这里的“读未提交”是 Seata 对**全局事务状态**的描述，**不是**数据库隔离级别降为 `READ UNCOMMITTED`，也不是读取到数据库未提交的行。
+
+**为什么会出现全局未决状态可见？**
 ```
 事务A（全局事务）：
   1. 开启全局事务（xid=1）
@@ -2464,7 +2364,7 @@ Seata 默认提供 **读未提交（Read Uncommitted）** 级别的隔离：
   3. 但事务A可能还会回滚！
 ```
 
-**问题：** 事务 B 读到了事务 A 一阶段提交的数据，但事务 A 的全局事务可能还会回滚，导致**脏读**。
+**问题：** 事务 B 读到了事务 A 一阶段提交的数据，但事务 A 的全局事务可能还会回滚，导致读取到**全局未决的中间状态**。下文沿用 Seata 文档常用的“全局脏读”称呼，但要与数据库层面的脏读区分。
 
 ## 13.2 脏读问题
 
@@ -2476,19 +2376,19 @@ Seata 默认提供 **读未提交（Read Uncommitted）** 级别的隔离：
 public void createOrder() {
     // 1. 创建订单（状态=PENDING）
     orderDao.insert(order);
-    
+
     // 2. 调用库存服务扣减库存
     stockService.deduct(productId, count);
-    
+
     // 3. 调用支付服务
     paymentService.pay(orderId, amount);
-    
+
     // 4. 更新订单状态为 PAID
     orderDao.updateStatus(orderId, "PAID");
-    
+
     // 此时一阶段已提交，订单状态在数据库中是 PAID
     // 但全局事务还未决议
-    
+
     // 5. 如果支付服务抛异常，全局事务回滚
     // 订单状态会被回滚为 PENDING
 }
@@ -2530,10 +2430,9 @@ public Order queryOrder(Long orderId) {
 ```
 1. 开启本地事务
 2. 执行 SELECT FOR UPDATE（加本地锁）
-3. 向 TC 查询该行是否有全局锁
+3. RM 在本地事务提交前向 TC 申请/校验对应的全局锁
 4. 如果有全局锁：
-   - 等待全局锁释放（重试）
-   - 或抛出 LockConflictException
+   - 本地锁等待由数据库处理；全局锁冲突通常以失败返回或抛出异常，由调用方按策略重试
 5. 如果无全局锁：
    - 返回查询结果
 6. 提交本地事务（释放本地锁）
@@ -2567,13 +2466,13 @@ public Order queryOrderSafe(Long orderId) {
 
 ### 模式对比
 
-| 模式 | 实现方式 | 隔离级别 | 性能 | 适用场景 |
+| 模式 | 实现方式 | 全局可见性语义 | 性能 | 适用场景 |
 |------|----------|----------|------|----------|
-| **默认模式** | 普通查询 | 读未提交 | 高 | 对一致性要求不高的查询 |
-| **@GlobalLock** | @GlobalLock + FOR UPDATE | 读已提交 | 中 | 需要读取最新已提交数据 |
-| **@GlobalTransactional** | 加入全局事务 | 读已提交 | 低 | 查询结果影响后续写操作 |
+| **默认模式** | 普通查询 | 可能读到全局未决的中间状态 | 高 | 对最终结果短暂波动可接受的查询 |
+| **@GlobalLock** | `@GlobalLock` + `FOR UPDATE` | 检查全局锁，避免读取/写入被全局锁保护的记录 | 中 | 查询结果会影响关键后续操作 |
+| **@GlobalTransactional** | 加入全局事务 | 参与全局事务的写隔离；读语义仍依赖本地数据库与锁策略 | 低 | 读后写的全局事务链路 |
 
-### 模式一：默认模式（读未提交）
+### 模式一：默认模式（允许读取全局未决状态）
 ```java
 public Order queryOrder(Long orderId) {
     return orderDao.selectById(orderId);
@@ -2583,7 +2482,7 @@ public Order queryOrder(Long orderId) {
 - **缺点**：可能脏读
 - **适用**：统计报表、日志查询等对实时性要求不高的场景
 
-### 模式二：@GlobalLock（读已提交）
+### 模式二：@GlobalLock（检查全局锁）
 ```java
 @GlobalLock
 @Transactional
@@ -2595,13 +2494,13 @@ public Order queryOrder(Long orderId) {
 - **缺点**：需要与 TC 通信，性能下降
 - **适用**：需要读取最新已提交数据，但不参与全局事务
 
-### 模式三：@GlobalTransactional（读已提交 + 写隔离）
+### 模式三：@GlobalTransactional（全局事务中的读后写）
 ```java
 @GlobalTransactional
 public void processOrder(Long orderId) {
     // 查询订单
     Order order = orderDao.selectByIdForUpdate(orderId);
-    
+
     // 基于查询结果做业务逻辑
     if (order.getStatus().equals("PENDING")) {
         // 更新订单
@@ -2624,8 +2523,8 @@ T2: 事务A更新订单 id=100，申请全局锁
     → lock_table 插入：row_key="order^^^100", xid=1
 T3: 事务A本地事务提交（一阶段完成）
 T4: 事务B查询订单 id=100（@GlobalLock + FOR UPDATE）
-    → 向 TC 查询 row_key="order^^^100" 是否有全局锁
-    → 发现被 xid=1 占用，等待或重试
+    → 在本地事务提交前由 RM 向 TC 校验 row_key="order^^^100" 的全局锁
+    → 发现被 xid=1 占用，当前操作失败或由调用方按策略重试
 T5: 事务A全局事务提交
     → TC 释放全局锁，删除 lock_table 记录
 T6: 事务B重试成功，读取数据
@@ -2756,14 +2655,14 @@ public void updateOrderInTransaction(Long orderId) {
 │  │ 隔离级别:RC  │  │ 隔离级别:RC  │  │ 隔离级别:RC  │    │
 │  └─────────────┘  └─────────────┘  └─────────────┘    │
 │                                                         │
-│  全局隔离级别：读未提交（默认）/ 读已提交（@GlobalLock）│
+│  全局可见性：默认可见中间状态；关键路径通过全局锁加强 │
 └─────────────────────────────────────────────────────────┘
 ```
 
 **关键点：**
 1. **本地事务隔离级别**：由数据库控制（通常是 READ COMMITTED 或 REPEATABLE READ）
-2. **全局事务隔离级别**：由 Seata 控制（默认读未提交，可通过 @GlobalLock 提升到读已提交）
-3. **两者独立**：Seata 不改变数据库的隔离级别，只是在全局事务层面提供额外的隔离保证
+2. **全局可见性与写隔离**：由 Seata 的全局锁、分支注册和使用方式共同决定；`@GlobalLock` 是检查锁的轻量手段，不等同于切换数据库隔离级别。
+3. **两者独立**：Seata 不改变数据库的隔离级别，只在全局事务层面提供额外协调。
 
 ### 最佳实践
 
@@ -2813,7 +2712,7 @@ public boolean try(BusinessActionContext context, Long productId, Integer count)
 
 public boolean cancel(BusinessActionContext context) {
     Long productId = context.getActionContext("productId");
-    
+
     // 问题：Try 未执行，没有冻结库存
     // 如果直接回滚，可能导致库存增加（错误）
     stockDao.unfreeze(productId);  // 空回滚！
@@ -2825,18 +2724,7 @@ public boolean cancel(BusinessActionContext context) {
 
 **核心思路：** 记录 Try 方法的执行状态，Cancel 方法根据状态判断是否需要回滚。
 
-**表结构：**
-```sql
-CREATE TABLE `tcc_transaction_control` (
-  `xid` VARCHAR(128) NOT NULL COMMENT '全局事务ID',
-  `branch_id` BIGINT NOT NULL COMMENT '分支事务ID',
-  `action_name` VARCHAR(64) NOT NULL COMMENT '操作名称',
-  `status` TINYINT NOT NULL COMMENT '状态：1-Try成功，2-Confirm成功，3-Cancel成功',
-  `gmt_create` DATETIME NOT NULL,
-  `gmt_modified` DATETIME NOT NULL,
-  PRIMARY KEY (`xid`, `branch_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-```
+**表结构：** 统一使用 [14.4 完整的 TCC 实现模板](#144-完整的-tcc-实现模板) 中的事务控制表；关键约束是 `(xid, branch_id)` 唯一以及可按状态/创建时间检索，字段可按业务审计要求扩展。
 
 **实现代码：**
 ```java
@@ -2844,35 +2732,35 @@ CREATE TABLE `tcc_transaction_control` (
 public boolean try(BusinessActionContext context, Long productId, Integer count) {
     String xid = context.getXid();
     Long branchId = context.getBranchId();
-    
+
     // 1. 检查是否已经执行过（防止重复执行）
     if (controlDao.exists(xid, branchId)) {
         return true;
     }
-    
+
     // 2. 冻结库存
     int rows = stockDao.freeze(productId, count);
     if (rows == 0) {
         throw new BizException("库存不足");
     }
-    
+
     // 3. 记录 Try 成功
     controlDao.insert(xid, branchId, "deductStock", TRY_SUCCESS);
-    
+
     // 4. 保存业务参数到上下文（供 Confirm/Cancel 使用）
     context.setActionContext("productId", productId);
     context.setActionContext("count", count);
-    
+
     return true;
 }
 
 public boolean cancel(BusinessActionContext context) {
     String xid = context.getXid();
     Long branchId = context.getBranchId();
-    
+
     // 1. 检查 Try 是否执行成功
     TccControl control = controlDao.selectByXidAndBranchId(xid, branchId);
-    
+
     if (control == null) {
         // Try 未执行，空回滚
         log.warn("空回滚，xid={}, branchId={}", xid, branchId);
@@ -2880,21 +2768,21 @@ public boolean cancel(BusinessActionContext context) {
         controlDao.insert(xid, branchId, "deductStock", CANCEL_SUCCESS);
         return true;
     }
-    
+
     if (control.getStatus() == CANCEL_SUCCESS) {
         // 已经回滚过，幂等返回
         log.info("重复回滚，xid={}, branchId={}", xid, branchId);
         return true;
     }
-    
+
     // 2. 执行回滚逻辑
     Long productId = context.getActionContext("productId");
     Integer count = context.getActionContext("count");
     stockDao.unfreeze(productId, count);
-    
+
     // 3. 更新状态为 Cancel 成功
     controlDao.updateStatus(xid, branchId, CANCEL_SUCCESS);
-    
+
     return true;
 }
 ```
@@ -2919,10 +2807,10 @@ TCC 的 Confirm 和 Cancel 方法可能被重复调用：
 public boolean confirm(BusinessActionContext context) {
     Long productId = context.getActionContext("productId");
     Integer count = context.getActionContext("count");
-    
+
     // 问题：每次调用都扣减库存
     stockDao.deduct(productId, count);
-    
+
     // 如果被调用 3 次，库存会被扣减 3 次！
     return true;
 }
@@ -2936,30 +2824,30 @@ public boolean confirm(BusinessActionContext context) {
 public boolean confirm(BusinessActionContext context) {
     String xid = context.getXid();
     Long branchId = context.getBranchId();
-    
+
     // 1. 检查是否已经 Confirm
     TccControl control = controlDao.selectByXidAndBranchId(xid, branchId);
-    
+
     if (control == null) {
         // Try 未执行，异常情况
         log.error("Confirm 时找不到 Try 记录，xid={}, branchId={}", xid, branchId);
         return false;
     }
-    
+
     if (control.getStatus() == CONFIRM_SUCCESS) {
         // 已经 Confirm 过，幂等返回
         log.info("重复 Confirm，xid={}, branchId={}", xid, branchId);
         return true;
     }
-    
+
     // 2. 执行 Confirm 逻辑
     Long productId = context.getActionContext("productId");
     Integer count = context.getActionContext("count");
     stockDao.deduct(productId, count);  // 扣减冻结库存
-    
+
     // 3. 更新状态为 Confirm 成功
     controlDao.updateStatus(xid, branchId, CONFIRM_SUCCESS);
-    
+
     return true;
 }
 ```
@@ -2980,18 +2868,18 @@ CREATE TABLE `stock_freeze` (
 public boolean confirm(BusinessActionContext context) {
     String xid = context.getXid();
     Long productId = context.getActionContext("productId");
-    
+
     // 1. 查询冻结记录
     StockFreeze freeze = freezeDao.selectByXidAndProduct(xid, productId);
-    
+
     if (freeze.getStatus() == CONFIRMED) {
         // 已经 Confirm 过
         return true;
     }
-    
+
     // 2. 扣减库存 + 更新状态（原子操作）
     int rows = freezeDao.confirmAndDeduct(xid, productId);
-    
+
     return rows > 0;
 }
 ```
@@ -2999,13 +2887,13 @@ public boolean confirm(BusinessActionContext context) {
 **SQL 实现：**
 ```sql
 -- 原子操作：只有状态为 FROZEN 时才更新
-UPDATE stock_freeze 
+UPDATE stock_freeze
 SET status = 1  -- CONFIRMED
 WHERE xid = ? AND product_id = ? AND status = 0;  -- FROZEN
 
 -- 同时扣减库存
-UPDATE stock 
-SET available = available - ?, 
+UPDATE stock
+SET available = available - ?,
     frozen = frozen - ?
 WHERE product_id = ?;
 ```
@@ -3040,63 +2928,63 @@ T5: Try 方法的请求终于到达
 public boolean try(BusinessActionContext context, Long productId, Integer count) {
     String xid = context.getXid();
     Long branchId = context.getBranchId();
-    
+
     // 1. 检查是否已经 Cancel（防悬挂）
     TccControl control = controlDao.selectByXidAndBranchId(xid, branchId);
-    
+
     if (control != null && control.getStatus() == CANCEL_SUCCESS) {
         // Cancel 已经执行，拒绝 Try
         log.warn("悬挂检测，拒绝 Try 执行，xid={}, branchId={}", xid, branchId);
         return false;
     }
-    
+
     if (control != null && control.getStatus() == TRY_SUCCESS) {
         // 已经执行过 Try，幂等返回
         return true;
     }
-    
+
     // 2. 冻结库存
     int rows = stockDao.freeze(productId, count);
     if (rows == 0) {
         throw new BizException("库存不足");
     }
-    
+
     // 3. 记录 Try 成功
     controlDao.insert(xid, branchId, "deductStock", TRY_SUCCESS);
-    
+
     context.setActionContext("productId", productId);
     context.setActionContext("count", count);
-    
+
     return true;
 }
 
 public boolean cancel(BusinessActionContext context) {
     String xid = context.getXid();
     Long branchId = context.getBranchId();
-    
+
     // 1. 检查 Try 是否执行
     TccControl control = controlDao.selectByXidAndBranchId(xid, branchId);
-    
+
     if (control == null) {
         // 空回滚，插入 Cancel 记录（防止后续 Try 执行）
         log.warn("空回滚，xid={}, branchId={}", xid, branchId);
         controlDao.insert(xid, branchId, "deductStock", CANCEL_SUCCESS);
         return true;
     }
-    
+
     if (control.getStatus() == CANCEL_SUCCESS) {
         // 幂等返回
         return true;
     }
-    
+
     // 2. 执行回滚
     Long productId = context.getActionContext("productId");
     Integer count = context.getActionContext("count");
     stockDao.unfreeze(productId, count);
-    
+
     // 3. 更新状态
     controlDao.updateStatus(xid, branchId, CANCEL_SUCCESS);
-    
+
     return true;
 }
 ```
@@ -3125,57 +3013,57 @@ CREATE TABLE `tcc_transaction_control` (
 ```java
 @Service
 public class StockTccService {
-    
+
     @Autowired
     private StockDao stockDao;
-    
+
     @Autowired
     private TccControlDao controlDao;
-    
+
     /**
      * Try 阶段：冻结库存
      */
     @TwoPhaseBusinessAction(
-        name = "deductStock", 
-        commitMethod = "confirm", 
+        name = "deductStock",
+        commitMethod = "confirm",
         rollbackMethod = "cancel"
     )
-    public boolean try(BusinessActionContext context, 
+    public boolean try(BusinessActionContext context,
                        @BusinessActionContextParameter(paramName = "productId") Long productId,
                        @BusinessActionContextParameter(paramName = "count") Integer count) {
-        
+
         String xid = context.getXid();
         Long branchId = context.getBranchId();
-        
-        log.info("Try 开始，xid={}, branchId={}, productId={}, count={}", 
+
+        log.info("Try 开始，xid={}, branchId={}, productId={}, count={}",
                  xid, branchId, productId, count);
-        
+
         // 1. 防悬挂：检查是否已经 Cancel
         TccControl control = controlDao.selectByXidAndBranchId(xid, branchId);
         if (control != null && control.getStatus() == TccStatus.CANCEL_SUCCESS) {
             log.warn("悬挂检测，拒绝 Try，xid={}, branchId={}", xid, branchId);
             throw new TccException("事务已回滚，拒绝执行");
         }
-        
+
         // 2. 幂等：检查是否已经 Try 成功
         if (control != null && control.getStatus() == TccStatus.TRY_SUCCESS) {
             log.info("Try 幂等返回，xid={}, branchId={}", xid, branchId);
             return true;
         }
-        
+
         // 3. 冻结库存
         int rows = stockDao.freeze(productId, count);
         if (rows == 0) {
             throw new BizException("库存不足");
         }
-        
+
         // 4. 记录 Try 成功
         controlDao.insert(xid, branchId, "deductStock", TccStatus.TRY_SUCCESS);
-        
+
         log.info("Try 成功，xid={}, branchId={}", xid, branchId);
         return true;
     }
-    
+
     /**
      * Confirm 阶段：扣减库存
      */
@@ -3184,33 +3072,33 @@ public class StockTccService {
         Long branchId = context.getBranchId();
         Long productId = context.getActionContext("productId", Long.class);
         Integer count = context.getActionContext("count", Integer.class);
-        
-        log.info("Confirm 开始，xid={}, branchId={}, productId={}, count={}", 
+
+        log.info("Confirm 开始，xid={}, branchId={}, productId={}, count={}",
                  xid, branchId, productId, count);
-        
+
         // 1. 检查 Try 是否执行
         TccControl control = controlDao.selectByXidAndBranchId(xid, branchId);
         if (control == null) {
             log.error("Confirm 时找不到 Try 记录，xid={}, branchId={}", xid, branchId);
             return false;
         }
-        
+
         // 2. 幂等：检查是否已经 Confirm
         if (control.getStatus() == TccStatus.CONFIRM_SUCCESS) {
             log.info("Confirm 幂等返回，xid={}, branchId={}", xid, branchId);
             return true;
         }
-        
+
         // 3. 扣减库存
         stockDao.deduct(productId, count);
-        
+
         // 4. 更新状态
         controlDao.updateStatus(xid, branchId, TccStatus.CONFIRM_SUCCESS);
-        
+
         log.info("Confirm 成功，xid={}, branchId={}", xid, branchId);
         return true;
     }
-    
+
     /**
      * Cancel 阶段：释放库存
      */
@@ -3219,32 +3107,32 @@ public class StockTccService {
         Long branchId = context.getBranchId();
         Long productId = context.getActionContext("productId", Long.class);
         Integer count = context.getActionContext("count", Integer.class);
-        
-        log.info("Cancel 开始，xid={}, branchId={}, productId={}, count={}", 
+
+        log.info("Cancel 开始，xid={}, branchId={}, productId={}, count={}",
                  xid, branchId, productId, count);
-        
+
         // 1. 检查 Try 是否执行
         TccControl control = controlDao.selectByXidAndBranchId(xid, branchId);
-        
+
         if (control == null) {
             // 空回滚：Try 未执行，插入 Cancel 记录防止后续 Try 执行
             log.warn("空回滚，xid={}, branchId={}", xid, branchId);
             controlDao.insert(xid, branchId, "deductStock", TccStatus.CANCEL_SUCCESS);
             return true;
         }
-        
+
         // 2. 幂等：检查是否已经 Cancel
         if (control.getStatus() == TccStatus.CANCEL_SUCCESS) {
             log.info("Cancel 幂等返回，xid={}, branchId={}", xid, branchId);
             return true;
         }
-        
+
         // 3. 释放库存
         stockDao.unfreeze(productId, count);
-        
+
         // 4. 更新状态
         controlDao.updateStatus(xid, branchId, TccStatus.CANCEL_SUCCESS);
-        
+
         log.info("Cancel 成功，xid={}, branchId={}", xid, branchId);
         return true;
     }
@@ -3258,15 +3146,15 @@ public enum TccStatus {
     TRY_SUCCESS(1, "Try成功"),
     CONFIRM_SUCCESS(2, "Confirm成功"),
     CANCEL_SUCCESS(3, "Cancel成功");
-    
+
     private final int code;
     private final String desc;
-    
+
     TccStatus(int code, String desc) {
         this.code = code;
         this.desc = desc;
     }
-    
+
     public int getCode() {
         return code;
     }
@@ -3323,14 +3211,16 @@ public enum TccStatus {
 ### 1. 事务控制表的清理策略
 
 ```java
-// 定时任务：清理 7 天前的记录
+// 定时任务：仅清理已终态、已对账且超过保留期的记录
 @Scheduled(cron = "0 0 2 * * ?")  // 每天凌晨 2 点
 public void cleanExpiredRecords() {
     Date expireTime = DateUtils.addDays(new Date(), -7);
-    int rows = controlDao.deleteByCreateTimeBefore(expireTime);
-    log.info("清理过期 TCC 控制记录，删除 {} 条", rows);
+    int rows = controlDao.deleteVerifiedTerminalBefore(expireTime);
+    log.info("清理已核验的终态 TCC 控制记录，删除 {} 条", rows);
 }
 ```
+
+清理条件不能只按创建时间判断：记录必须是 `CONFIRM_SUCCESS` 或 `CANCEL_SUCCESS` 等终态，并已确认不再参与重试、对账或人工处置；生产清理还应采用小批次、限速和可回滚备份。
 
 ### 2. 监控告警
 
@@ -3339,14 +3229,14 @@ public void cleanExpiredRecords() {
 @Aspect
 @Component
 public class TccMonitorAspect {
-    
+
     @Autowired
     private MetricRegistry metricRegistry;
-    
+
     @Around("@annotation(io.seata.rm.tcc.api.TwoPhaseBusinessAction)")
     public Object monitor(ProceedingJoinPoint pjp) throws Throwable {
         String methodName = pjp.getSignature().getName();
-        
+
         try {
             return pjp.proceed();
         } catch (TccException e) {
@@ -3366,4290 +3256,44 @@ public class TccMonitorAspect {
 ```java
 // 记录异常场景的详细日志，便于排查
 if (control == null) {
-    log.warn("空回滚检测，xid={}, branchId={}, actionName={}, context={}", 
-             xid, branchId, context.getActionName(), 
+    log.warn("空回滚检测，xid={}, branchId={}, actionName={}, context={}",
+             xid, branchId, context.getActionName(),
              JSON.toJSONString(context.getActionContext()));
     // 可选：发送告警
     alertService.send("TCC 空回滚", "xid=" + xid);
 }
 ```
 
-# 15. SAGA 模式详解
+# 15. SAGA 模式
 
-## 15.1 什么是 SAGA 模式？
+Saga 适合可补偿的长流程；它通过正向步骤和逆序补偿收敛状态，但不提供资源隔离。需要显式定义中间状态、补偿、重试、对账和人工处置。
 
-### 定义
-SAGA 模式是一种长事务解决方案，将一个分布式事务拆分为多个本地事务，每个本地事务都有对应的**补偿事务**。如果某个步骤失败，则执行前面所有已完成步骤的补偿事务，实现最终一致性。
+详见 [[Seata-SAGA]]。
 
-### 核心概念
+# 16. 性能优化
 
-**正向服务（Ti）：** 执行业务逻辑的服务
-**补偿服务（Ci）：** 回滚正向服务的操作
+性能优化从“测量—定位—验证”开始：先确认全局事务范围、TC/RM/数据库的分段时延和锁冲突，再通过压测验证调整结果。
 
-**SAGA 事务：** T1, T2, T3, ..., Tn
-**补偿链：** C1, C2, C3, ..., Cn
+详见 [[Seata-性能优化]]。
 
-### 执行模式
+# 17. 高可用部署
 
-#### 成功场景
-```
-T1 → T2 → T3 → T4 → ... → Tn
-✓    ✓    ✓    ✓         ✓
-```
+高可用的关键不是固定节点数，而是先定义业务 SLA、RTO、RPO 与降级策略，并用 TC、存储和注册中心的故障演练验证恢复能力。
 
-#### 失败场景（T3 失败）
-```
-T1 → T2 → T3 → ✗
-✓    ✓    ✗
-     ↓
-C2 ← C1
-✓    ✓
-```
+详见 [[Seata-高可用部署]]。
 
-## 15.2 SAGA 的两种实现方式
+# 18. Spring Cloud 集成
 
-### 方式一：事件驱动（Choreography）
+集成的核心是 xid 正确传播、受控数据源被代理，以及在线程/异步边界正确绑定和解绑上下文。示例必须与项目依赖版本一起验证。
 
-**特点：** 去中心化，各服务通过事件总线通信。
-
-**流程：**
-```
-订单服务 → 发布"订单创建"事件
-           ↓
-库存服务 → 监听事件 → 扣减库存 → 发布"库存扣减成功"事件
-                                    ↓
-支付服务 → 监听事件 → 执行支付 → 发布"支付成功"事件
-                                    ↓
-订单服务 → 监听事件 → 更新订单状态
-```
-
-**优点：**
-- 服务解耦，无中心节点
-- 扩展性好
-
-**缺点：**
-- 流程分散，难以理解和维护
-- 调试困难
-- 循环依赖风险
-
-### 方式二：编排（Orchestration）- Seata 采用
-
-**特点：** 中心化，由状态机引擎统一编排。
-
-**流程：**
-```
-                  ┌──────────────┐
-                  │  状态机引擎   │
-                  └───────┬──────┘
-                          │
-        ┌─────────────────┼─────────────────┐
-        │                 │                 │
-        ▼                 ▼                 ▼
-   ┌────────┐        ┌────────┐        ┌────────┐
-   │订单服务│        │库存服务│        │支付服务│
-   └────────┘        └────────┘        └────────┘
-```
-
-**优点：**
-- 流程清晰，易于理解
-- 集中管理，便于监控
-- 支持复杂流程（并行、条件分支）
-
-**缺点：**
-- 状态机引擎是单点（可集群部署）
-- 中心节点压力大
-
-## 15.3 Seata SAGA 状态机
-
-### 状态机定义（JSON）
-
-```json
-{
-  "Name": "orderSaga",
-  "Comment": "订单处理流程",
-  "StartState": "CreateOrder",
-  "Version": "1.0.0",
-  "States": {
-    "CreateOrder": {
-      "Type": "ServiceTask",
-      "ServiceName": "orderService",
-      "ServiceMethod": "createOrder",
-      "CompensateState": "CancelOrder",
-      "Next": "DeductStock",
-      "Input": [
-        "$.[userId]",
-        "$.[productId]",
-        "$.[count]"
-      ],
-      "Output": {
-        "orderId": "$.orderId"
-      },
-      "Status": {
-        "#root.status == 0": "SU",
-        "#root.status == 1": "FA",
-        "$Exception{java.lang.Throwable}": "UN"
-      }
-    },
-    "DeductStock": {
-      "Type": "ServiceTask",
-      "ServiceName": "stockService",
-      "ServiceMethod": "deduct",
-      "CompensateState": "RestoreStock",
-      "Next": "ProcessPayment",
-      "Input": [
-        "$.[productId]",
-        "$.[count]"
-      ],
-      "Status": {
-        "#root.status == 0": "SU",
-        "#root.status == 1": "FA",
-        "$Exception{java.lang.Throwable}": "UN"
-      }
-    },
-    "ProcessPayment": {
-      "Type": "ServiceTask",
-      "ServiceName": "paymentService",
-      "ServiceMethod": "pay",
-      "CompensateState": "RefundPayment",
-      "Next": "UpdateOrderStatus",
-      "Input": [
-        "$.[orderId]",
-        "$.[amount]"
-      ],
-      "Status": {
-        "#root.status == 0": "SU",
-        "#root.status == 1": "FA",
-        "$Exception{java.lang.Throwable}": "UN"
-      }
-    },
-    "UpdateOrderStatus": {
-      "Type": "ServiceTask",
-      "ServiceName": "orderService",
-      "ServiceMethod": "updateStatus",
-      "Next": "Succeed",
-      "Input": [
-        "$.[orderId]",
-        "PAID"
-      ]
-    },
-    "CancelOrder": {
-      "Type": "ServiceTask",
-      "ServiceName": "orderService",
-      "ServiceMethod": "cancel",
-      "Input": [
-        "$.[orderId]"
-      ]
-    },
-    "RestoreStock": {
-      "Type": "ServiceTask",
-      "ServiceName": "stockService",
-      "ServiceMethod": "restore",
-      "Input": [
-        "$.[productId]",
-        "$.[count]"
-      ]
-    },
-    "RefundPayment": {
-      "Type": "ServiceTask",
-      "ServiceName": "paymentService",
-      "ServiceMethod": "refund",
-      "Input": [
-        "$.[orderId]"
-      ]
-    },
-    "Succeed": {
-      "Type": "Succeed"
-    },
-    "Fail": {
-      "Type": "Fail",
-      "ErrorCode": "ORDER_PROCESS_FAILED",
-      "Message": "订单处理失败"
-    }
-  }
-}
-```
-
-### 状态类型
-
-| 状态类型 | 说明 | 示例 |
-|---------|------|------|
-| **ServiceTask** | 调用服务方法 | 创建订单、扣减库存 |
-| **Choice** | 条件分支 | 根据金额选择支付方式 |
-| **Parallel** | 并行执行 | 同时扣减库存和积分 |
-| **Succeed** | 成功结束 | 流程完成 |
-| **Fail** | 失败结束 | 流程失败 |
-| **CompensationTrigger** | 触发补偿 | 手动触发回滚 |
-
-### 状态机执行流程
-
-```
-1. 状态机引擎加载 JSON 定义
-2. 开启 SAGA 事务（xid=1）
-3. 执行 CreateOrder 状态
-   → 调用 orderService.createOrder()
-   → 返回 orderId
-   → 记录状态：CreateOrder = SUCCESS
-4. 执行 DeductStock 状态
-   → 调用 stockService.deduct()
-   → 返回成功
-   → 记录状态：DeductStock = SUCCESS
-5. 执行 ProcessPayment 状态
-   → 调用 paymentService.pay()
-   → 抛出异常（余额不足）
-   → 记录状态：ProcessPayment = FAILED
-6. 触发补偿流程
-   → 执行 RestoreStock（DeductStock 的补偿）
-   → 执行 CancelOrder（CreateOrder 的补偿）
-7. SAGA 事务结束（状态=COMPENSATED）
-```
-
-## 15.4 服务实现
-
-### 正向服务
-
-```java
-@Service
-public class OrderService {
-    
-    @Autowired
-    private OrderDao orderDao;
-    
-    /**
-     * 创建订单（正向服务）
-     */
-    public Map<String, Object> createOrder(Long userId, Long productId, Integer count) {
-        Order order = new Order();
-        order.setUserId(userId);
-        order.setProductId(productId);
-        order.setCount(count);
-        order.setStatus("PENDING");
-        
-        orderDao.insert(order);
-        
-        log.info("创建订单成功，orderId={}", order.getId());
-        
-        // 返回结果（供后续状态使用）
-        Map<String, Object> result = new HashMap<>();
-        result.put("orderId", order.getId());
-        result.put("status", 0);  // 0-成功，1-失败
-        return result;
-    }
-    
-    /**
-     * 取消订单（补偿服务）
-     */
-    public Map<String, Object> cancel(Long orderId) {
-        Order order = orderDao.selectById(orderId);
-        if (order == null) {
-            log.warn("订单不存在，orderId={}", orderId);
-            return success();
-        }
-        
-        order.setStatus("CANCELLED");
-        orderDao.updateById(order);
-        
-        log.info("取消订单成功，orderId={}", orderId);
-        return success();
-    }
-    
-    private Map<String, Object> success() {
-        Map<String, Object> result = new HashMap<>();
-        result.put("status", 0);
-        return result;
-    }
-}
-```
-
-### 库存服务
-
-```java
-@Service
-public class StockService {
-    
-    @Autowired
-    private StockDao stockDao;
-    
-    /**
-     * 扣减库存（正向服务）
-     */
-    public Map<String, Object> deduct(Long productId, Integer count) {
-        int rows = stockDao.deduct(productId, count);
-        
-        if (rows == 0) {
-            log.error("库存不足，productId={}, count={}", productId, count);
-            return fail("库存不足");
-        }
-        
-        log.info("扣减库存成功，productId={}, count={}", productId, count);
-        return success();
-    }
-    
-    /**
-     * 恢复库存（补偿服务）
-     */
-    public Map<String, Object> restore(Long productId, Integer count) {
-        stockDao.restore(productId, count);
-        
-        log.info("恢复库存成功，productId={}, count={}", productId, count);
-        return success();
-    }
-    
-    private Map<String, Object> success() {
-        Map<String, Object> result = new HashMap<>();
-        result.put("status", 0);
-        return result;
-    }
-    
-    private Map<String, Object> fail(String message) {
-        Map<String, Object> result = new HashMap<>();
-        result.put("status", 1);
-        result.put("message", message);
-        return result;
-    }
-}
-```
-
-### 支付服务
-
-```java
-@Service
-public class PaymentService {
-    
-    @Autowired
-    private PaymentDao paymentDao;
-    
-    /**
-     * 执行支付（正向服务）
-     */
-    public Map<String, Object> pay(Long orderId, BigDecimal amount) {
-        // 调用第三方支付接口
-        boolean success = thirdPartyPay(orderId, amount);
-        
-        if (!success) {
-            log.error("支付失败，orderId={}, amount={}", orderId, amount);
-            return fail("支付失败");
-        }
-        
-        // 记录支付记录
-        Payment payment = new Payment();
-        payment.setOrderId(orderId);
-        payment.setAmount(amount);
-        payment.setStatus("SUCCESS");
-        paymentDao.insert(payment);
-        
-        log.info("支付成功，orderId={}, amount={}", orderId, amount);
-        return success();
-    }
-    
-    /**
-     * 退款（补偿服务）
-     */
-    public Map<String, Object> refund(Long orderId) {
-        Payment payment = paymentDao.selectByOrderId(orderId);
-        if (payment == null) {
-            log.warn("支付记录不存在，orderId={}", orderId);
-            return success();
-        }
-        
-        // 调用第三方退款接口
-        thirdPartyRefund(orderId, payment.getAmount());
-        
-        payment.setStatus("REFUNDED");
-        paymentDao.updateById(payment);
-        
-        log.info("退款成功，orderId={}", orderId);
-        return success();
-    }
-    
-    private Map<String, Object> success() {
-        Map<String, Object> result = new HashMap<>();
-        result.put("status", 0);
-        return result;
-    }
-    
-    private Map<String, Object> fail(String message) {
-        Map<String, Object> result = new HashMap<>();
-        result.put("status", 1);
-        result.put("message", message);
-        return result;
-    }
-}
-```
-
-## 15.5 启动 SAGA 事务
-
-### 方式一：通过 API
-
-```java
-@Service
-public class OrderSagaService {
-    
-    @Autowired
-    private StateMachineEngine stateMachineEngine;
-    
-    public void processOrder(Long userId, Long productId, Integer count) {
-        // 准备输入参数
-        Map<String, Object> startParams = new HashMap<>();
-        startParams.put("userId", userId);
-        startParams.put("productId", productId);
-        startParams.put("count", count);
-        startParams.put("amount", new BigDecimal("99.99"));
-        
-        // 启动状态机
-        StateMachineInstance instance = stateMachineEngine.startWithBusinessKey(
-            "orderSaga",           // 状态机名称
-            null,                  // 租户ID
-            "ORDER_" + userId,     // 业务主键
-            startParams            // 输入参数
-        );
-        
-        // 检查执行结果
-        if (ExecutionStatus.SU.equals(instance.getStatus())) {
-            log.info("订单处理成功，businessKey={}", instance.getBusinessKey());
-        } else {
-            log.error("订单处理失败，status={}, exception={}", 
-                     instance.getStatus(), instance.getException());
-            throw new BizException("订单处理失败");
-        }
-    }
-}
-```
-
-### 方式二：通过注解
-
-```java
-@Service
-public class OrderSagaService {
-    
-    @SagaTransactional(name = "orderSaga")
-    public void processOrder(Long userId, Long productId, Integer count) {
-        // 状态机会自动执行
-        // 方法参数会作为状态机的输入
-    }
-}
-```
-
-## 15.6 高级特性
-
-### 1. 条件分支（Choice）
-
-```json
-{
-  "CheckAmount": {
-    "Type": "Choice",
-    "Choices": [
-      {
-        "Expression": "[amount] < 100",
-        "Next": "SmallAmountPayment"
-      },
-      {
-        "Expression": "[amount] >= 100 && [amount] < 1000",
-        "Next": "MediumAmountPayment"
-      }
-    ],
-    "Default": "LargeAmountPayment"
-  }
-}
-```
-
-### 2. 并行执行（Parallel）
-
-```json
-{
-  "ParallelTask": {
-    "Type": "Parallel",
-    "Branches": [
-      {
-        "StartState": "DeductStock",
-        "States": {
-          "DeductStock": {
-            "Type": "ServiceTask",
-            "ServiceName": "stockService",
-            "ServiceMethod": "deduct",
-            "CompensateState": "RestoreStock",
-            "Next": "Succeed"
-          }
-        }
-      },
-      {
-        "StartState": "DeductPoints",
-        "States": {
-          "DeductPoints": {
-            "Type": "ServiceTask",
-            "ServiceName": "pointsService",
-            "ServiceMethod": "deduct",
-            "CompensateState": "RestorePoints",
-            "Next": "Succeed"
-          }
-        }
-      }
-    ],
-    "Next": "ProcessPayment"
-  }
-}
-```
-
-### 3. 异步执行
-
-```json
-{
-  "SendNotification": {
-    "Type": "ServiceTask",
-    "ServiceName": "notificationService",
-    "ServiceMethod": "send",
-    "IsAsync": true,
-    "Next": "Succeed"
-  }
-}
-```
-
-### 4. 重试策略
-
-```json
-{
-  "ProcessPayment": {
-    "Type": "ServiceTask",
-    "ServiceName": "paymentService",
-    "ServiceMethod": "pay",
-    "Retry": [
-      {
-        "Exceptions": ["java.net.SocketTimeoutException"],
-        "IntervalSeconds": 1,
-        "MaxAttempts": 3,
-        "BackoffRate": 2.0
-      }
-    ],
-    "Next": "Succeed"
-  }
-}
-```
-
-## 15.7 SAGA vs TCC
-
-| 维度 | SAGA | TCC |
-|------|------|-----|
-| **一致性** | 最终一致 | 最终一致 |
-| **隔离性** | 无隔离（可见中间状态） | 有隔离（资源锁定） |
-| **实现复杂度** | 中等（需设计补偿逻辑） | 高（需实现三个接口） |
-| **业务侵入** | 低（只需补偿服务） | 高（需改造业务逻辑） |
-| **性能** | 高（无锁） | 中（资源锁定） |
-| **适用场景** | 长流程、跨系统 | 短流程、核心业务 |
-| **回滚方式** | 正向补偿 | 预留资源 |
-| **并发控制** | 无 | 有（Try 阶段锁定） |
-
-### 选择建议
-
-**使用 SAGA：**
-- 流程长（5+ 步骤）
-- 跨多个系统/团队
-- 对中间状态可见性要求不高
-- 需要灵活的流程编排（条件、并行）
-
-**使用 TCC：**
-- 流程短（2-3 步骤）
-- 核心业务（订单、支付）
-- 需要强隔离性
-- 对性能要求极高
-
-## 15.8 SAGA 的注意事项
-
-### 1. 补偿服务的幂等性
-
-```java
-// 错误：非幂等的补偿
-public void restoreStock(Long productId, Integer count) {
-    stockDao.restore(productId, count);
-    // 重复调用会导致库存多次增加
-}
-
-// 正确：幂等的补偿
-public void restoreStock(String sagaId, Long productId, Integer count) {
-    // 检查是否已经补偿过
-    if (compensationDao.exists(sagaId, "restoreStock")) {
-        return;
-    }
-    
-    stockDao.restore(productId, count);
-    
-    // 记录补偿操作
-    compensationDao.insert(sagaId, "restoreStock");
-}
-```
-
-### 2. 补偿的顺序
-
-补偿必须按照**逆序**执行：
-
-```
-正向：T1 → T2 → T3 → T4（失败）
-补偿：C3 ← C2 ← C1
-```
-
-### 3. 空补偿
-
-正向服务未执行，补偿服务被调用：
-
-```java
-public void cancel(Long orderId) {
-    Order order = orderDao.selectById(orderId);
-    if (order == null) {
-        // 空补偿：订单未创建，直接返回
-        log.warn("空补偿，orderId={}", orderId);
-        return;
-    }
-    
-    order.setStatus("CANCELLED");
-    orderDao.updateById(order);
-}
-```
-
-### 4. 补偿失败的处理
-
-```java
-public void refund(Long orderId) {
-    try {
-        thirdPartyRefund(orderId);
-    } catch (Exception e) {
-        // 补偿失败，记录日志，人工介入
-        log.error("退款失败，需要人工处理，orderId={}", orderId, e);
-        alertService.send("SAGA 补偿失败", "orderId=" + orderId);
-        
-        // 可选：重试队列
-        retryQueue.add(new RefundTask(orderId));
-        
-        throw e;
-    }
-}
-```
-
-# 16. 性能优化实战
-
-## 16.1 性能瓶颈分析
-
-### Seata 的性能开销来源
-
-```
-┌─────────────────────────────────────────────────────┐
-│                  全局事务流程                        │
-├─────────────────────────────────────────────────────┤
-│ 1. TM 向 TC 申请 xid              → 网络 IO         │
-│ 2. RM 注册分支事务                → 网络 IO         │
-│ 3. RM 申请全局锁（AT 模式）       → 网络 IO + 锁竞争│
-│ 4. RM 生成 undo_log               → 磁盘 IO         │
-│ 5. TM 提交/回滚全局事务           → 网络 IO         │
-│ 6. TC 通知 RM 二阶段              → 网络 IO         │
-│ 7. RM 删除 undo_log               → 磁盘 IO         │
-└─────────────────────────────────────────────────────┘
-
-性能瓶颈：
-1. 网络 IO：TM/RM 与 TC 的频繁通信
-2. 全局锁竞争：高并发下的锁等待
-3. undo_log 写入：磁盘 IO 开销
-4. TC 存储：global_table、branch_table、lock_table 的读写
-```
-
-### 性能基准测试
-
-**测试环境：**
-- 4C8G 服务器
-- MySQL 5.7
-- Seata 1.5.2
-
-**测试结果：**
-
-| 模式 | TPS | 平均响应时间 | P99 响应时间 |
-|------|-----|-------------|-------------|
-| 无事务 | 5000 | 20ms | 50ms |
-| AT 模式 | 1200 | 80ms | 200ms |
-| TCC 模式 | 2000 | 50ms | 120ms |
-| SAGA 模式 | 1800 | 60ms | 150ms |
-
-**性能损耗：**
-- AT 模式：约 75% 性能损耗
-- TCC 模式：约 60% 性能损耗
-- SAGA 模式：约 65% 性能损耗
-
-## 16.2 客户端优化
-
-### 1. 异步提交（AT 模式）
-
-**原理：** 二阶段提交异步化，TM 不等待 RM 删除 undo_log。
-
-**配置：**
-```yaml
-seata:
-  client:
-    rm:
-      async-commit-buffer-limit: 10000  # 异步提交队列大小
-      report-success-enable: false      # 不上报成功结果
-```
-
-**效果：**
-- 全局事务提交耗时从 80ms 降低到 20ms
-- TPS 提升 3-4 倍
-
-**代码示例：**
-```java
-@GlobalTransactional
-public void createOrder() {
-    // 业务逻辑
-    orderDao.insert(order);
-    stockService.deduct(productId, count);
-    
-    // commit() 立即返回，不等待 RM 删除 undo_log
-}
-```
-
-### 2. 批量操作
-
-**原理：** 将多个分支事务的提交/回滚合并为一次网络请求。
-
-**配置：**
-```yaml
-seata:
-  client:
-    rm:
-      report-retry-count: 5
-      table-meta-check-enable: false  # 关闭表结构检查
-    tm:
-      commit-retry-count: 5
-      rollback-retry-count: 5
-```
-
-**实现：**
-```java
-// TC 端批量处理
-public void batchCommit(List<BranchCommitRequest> requests) {
-    List<Long> branchIds = requests.stream()
-        .map(BranchCommitRequest::getBranchId)
-        .collect(Collectors.toList());
-    
-    // 批量删除 branch_table
-    branchTableDao.batchDelete(branchIds);
-    
-    // 批量释放全局锁
-    lockTableDao.batchDelete(branchIds);
-}
-```
-
-### 3. 连接池优化
-
-**配置：**
-```yaml
-seata:
-  client:
-    rm:
-      # RM 与 TC 的连接池配置
-      netty:
-        max-pool-active: 100      # 最大连接数
-        max-pool-idle: 30         # 最大空闲连接数
-        min-pool-idle: 10         # 最小空闲连接数
-        max-acquire-conn-mills: 60000  # 获取连接超时
-```
-
-**HikariCP 配置：**
-```yaml
-spring:
-  datasource:
-    hikari:
-      maximum-pool-size: 50       # 连接池大小
-      minimum-idle: 10
-      connection-timeout: 30000
-      idle-timeout: 600000
-      max-lifetime: 1800000
-```
-
-### 4. 减少全局锁竞争
-
-#### 方案一：缩小事务范围
-
-```java
-// 反例：事务范围过大
-@GlobalTransactional
-public void processOrder() {
-    // 1. 查询用户信息（不需要全局事务）
-    User user = userService.getUser(userId);
-    
-    // 2. 查询商品信息（不需要全局事务）
-    Product product = productService.getProduct(productId);
-    
-    // 3. 创建订单（需要全局事务）
-    orderDao.insert(order);
-    
-    // 4. 扣减库存（需要全局事务）
-    stockService.deduct(productId, count);
-}
-
-// 正例：只在必要的地方使用全局事务
-public void processOrder() {
-    // 1. 查询用户信息
-    User user = userService.getUser(userId);
-    
-    // 2. 查询商品信息
-    Product product = productService.getProduct(productId);
-    
-    // 3. 执行全局事务
-    doGlobalTransaction(user, product);
-}
-
-@GlobalTransactional
-private void doGlobalTransaction(User user, Product product) {
-    orderDao.insert(order);
-    stockService.deduct(productId, count);
-}
-```
-
-#### 方案二：拆分热点数据
-
-```java
-// 反例：单行库存，高并发下锁冲突严重
-CREATE TABLE stock (
-  product_id BIGINT PRIMARY KEY,
-  available INT
-);
-
-// 正例：分段库存，减少锁冲突
-CREATE TABLE stock (
-  product_id BIGINT,
-  segment INT,           -- 分段编号 0-9
-  available INT,
-  PRIMARY KEY (product_id, segment)
-);
-
-// 随机选择分段扣减
-int segment = ThreadLocalRandom.current().nextInt(10);
-stockDao.deduct(productId, segment, count);
-```
-
-#### 方案三：使用 TCC 替代 AT
-
-```java
-// AT 模式：全局锁阻塞
-@GlobalTransactional
-public void deductStock(Long productId, Integer count) {
-    // 申请全局锁，高并发下等待
-    stockDao.update(productId, count);
-}
-
-// TCC 模式：无全局锁
-@TwoPhaseBusinessAction(name = "deductStock", commitMethod = "confirm", rollbackMethod = "cancel")
-public boolean try(Long productId, Integer count) {
-    // 冻结库存，无全局锁
-    stockDao.freeze(productId, count);
-    return true;
-}
-```
-
-### 5. undo_log 优化
-
-#### 方案一：异步删除
-
-```yaml
-seata:
-  client:
-    undo:
-      log-serialization: jackson  # 序列化方式
-      log-table: undo_log
-      only-care-update-columns: true  # 只记录更新的列
-```
-
-#### 方案二：定期清理
-
-```java
-// 定时任务：清理 7 天前的 undo_log
-@Scheduled(cron = "0 0 3 * * ?")
-public void cleanUndoLog() {
-    Date expireTime = DateUtils.addDays(new Date(), -7);
-    int rows = undoLogDao.deleteByCreateTimeBefore(expireTime);
-    log.info("清理过期 undo_log，删除 {} 条", rows);
-}
-```
-
-#### 方案三：压缩 undo_log
-
-```yaml
-seata:
-  client:
-    undo:
-      compress:
-        enable: true
-        type: zip
-        threshold: 64k  # 超过 64k 才压缩
-```
-
-## 16.3 服务端优化
-
-### 1. TC 存储模式选择
-
-| 存储模式 | 性能 | 可靠性 | 适用场景 |
-|---------|------|--------|---------|
-| **File** | 低 | 低 | 单机测试 |
-| **DB** | 中 | 高 | 中小规模生产 |
-| **Redis** | 高 | 中 | 高并发场景 |
-
-#### DB 模式优化
-
-```yaml
-# application.yml
-store:
-  mode: db
-  db:
-    datasource: druid
-    db-type: mysql
-    driver-class-name: com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://127.0.0.1:3306/seata?useSSL=false&rewriteBatchedStatements=true
-    user: root
-    password: root
-    min-conn: 10
-    max-conn: 100
-    global-table: global_table
-    branch-table: branch_table
-    lock-table: lock_table
-    query-limit: 1000
-    max-wait: 5000
-```
-
-**数据库优化：**
-```sql
--- 1. 添加索引
-ALTER TABLE global_table ADD INDEX idx_gmt_modified (gmt_modified);
-ALTER TABLE branch_table ADD INDEX idx_xid (xid);
-ALTER TABLE lock_table ADD INDEX idx_xid (xid);
-
--- 2. 分区表（按时间分区）
-ALTER TABLE global_table PARTITION BY RANGE (TO_DAYS(gmt_create)) (
-    PARTITION p202601 VALUES LESS THAN (TO_DAYS('2026-02-01')),
-    PARTITION p202602 VALUES LESS THAN (TO_DAYS('2026-03-01')),
-    PARTITION p202603 VALUES LESS THAN (TO_DAYS('2026-04-01'))
-);
-
--- 3. 定期清理历史数据
-DELETE FROM global_table WHERE gmt_create < DATE_SUB(NOW(), INTERVAL 7 DAY);
-DELETE FROM branch_table WHERE gmt_create < DATE_SUB(NOW(), INTERVAL 7 DAY);
-```
-
-#### Redis 模式配置
-
-```yaml
-store:
-  mode: redis
-  redis:
-    mode: single  # single/cluster/sentinel
-    single:
-      host: 127.0.0.1
-      port: 6379
-    database: 0
-    password: 
-    max-conn: 100
-    min-conn: 10
-    query-limit: 1000
-```
-
-**优势：**
-- 全局锁查询性能提升 10 倍
-- 分支注册性能提升 5 倍
-
-**劣势：**
-- 数据持久化依赖 Redis（需配置 AOF）
-- 内存占用较大
-
-### 2. TC 集群部署
-
-```
-                    ┌──────────────┐
-                    │  Nacos 注册中心│
-                    └───────┬──────┘
-                            │
-        ┌───────────────────┼───────────────────┐
-        │                   │                   │
-   ┌────▼────┐         ┌────▼────┐         ┌────▼────┐
-   │  TC-1   │         │  TC-2   │         │  TC-3   │
-   │ (8091)  │         │ (8091)  │         │ (8091)  │
-   └────┬────┘         └────┬────┘         └────┬────┘
-        │                   │                   │
-        └───────────────────┼───────────────────┘
-                            │
-                    ┌───────▼──────┐
-                    │  MySQL 集群   │
-                    └──────────────┘
-```
-
-**配置：**
-```yaml
-seata:
-  registry:
-    type: nacos
-    nacos:
-      application: seata-server
-      server-addr: 127.0.0.1:8848
-      namespace: public
-      cluster: default  # 集群名称
-```
-
-**负载均衡：**
-- 客户端自动从注册中心获取 TC 列表
-- 默认使用轮询策略
-- 支持自定义负载均衡算法
-
-### 3. 全局锁优化
-
-#### 方案一：锁分段
-
-```java
-// 将全局锁按 xid 哈希分段，减少锁表竞争
-int segment = Math.abs(xid.hashCode()) % 16;
-String lockKey = "lock_segment_" + segment + ":" + rowKey;
-```
-
-#### 方案二：锁超时释放
-
-```yaml
-seata:
-  server:
-    max-commit-retry-timeout: 30000  # 提交超时（毫秒）
-    max-rollback-retry-timeout: 30000  # 回滚超时
-```
-
-**自动释放：**
-```java
-// TC 定时扫描超时的全局锁
-@Scheduled(fixedDelay = 60000)
-public void releaseTimeoutLocks() {
-    Date expireTime = DateUtils.addSeconds(new Date(), -300);  // 5 分钟前
-    List<GlobalSession> timeoutSessions = sessionManager.findTimeoutSessions(expireTime);
-    
-    for (GlobalSession session : timeoutSessions) {
-        // 释放全局锁
-        lockManager.releaseGlobalLock(session.getXid());
-        // 更新事务状态
-        session.setStatus(GlobalStatus.TimeoutRollbacked);
-    }
-}
-```
-
-## 16.4 业务优化
-
-### 1. 读写分离
-
-```java
-// 全局事务中的读操作走主库
-@GlobalTransactional
-public void processOrder() {
-    // 写操作：主库
-    orderDao.insert(order);
-    
-    // 读操作：也走主库（避免主从延迟）
-    Order savedOrder = orderDao.selectById(order.getId());
-}
-
-// 非全局事务的查询走从库
-public Order queryOrder(Long orderId) {
-    // 走从库
-    return orderDao.selectById(orderId);
-}
-```
-
-**配置：**
-```yaml
-spring:
-  datasource:
-    dynamic:
-      primary: master
-      datasource:
-        master:
-          url: jdbc:mysql://master:3306/db
-        slave:
-          url: jdbc:mysql://slave:3306/db
-```
-
-### 2. 缓存预热
-
-```java
-// 预加载热点数据到缓存，减少数据库查询
-@PostConstruct
-public void preloadCache() {
-    List<Product> hotProducts = productDao.selectHotProducts();
-    for (Product product : hotProducts) {
-        redisTemplate.opsForValue().set(
-            "product:" + product.getId(), 
-            product, 
-            1, TimeUnit.HOURS
-        );
-    }
-}
-
-@GlobalTransactional
-public void createOrder() {
-    // 从缓存读取商品信息
-    Product product = redisTemplate.opsForValue().get("product:" + productId);
-    
-    // 执行事务
-    orderDao.insert(order);
-    stockService.deduct(productId, count);
-}
-```
-
-### 3. 异步化非核心流程
-
-```java
-@GlobalTransactional
-public void createOrder() {
-    // 核心流程：同步执行
-    orderDao.insert(order);
-    stockService.deduct(productId, count);
-    paymentService.pay(orderId, amount);
-    
-    // 非核心流程：异步执行
-    asyncExecutor.execute(() -> {
-        // 发送通知
-        notificationService.sendOrderNotification(orderId);
-        // 记录日志
-        logService.recordOrderLog(orderId);
-        // 更新统计
-        statisticsService.updateOrderStats(orderId);
-    });
-}
-```
-
-### 4. 降级策略
-
-```java
-@GlobalTransactional
-public void createOrder() {
-    try {
-        // 尝试使用全局事务
-        orderDao.insert(order);
-        stockService.deduct(productId, count);
-    } catch (LockConflictException e) {
-        // 全局锁冲突，降级为本地事务 + 补偿
-        log.warn("全局锁冲突，降级处理");
-        createOrderWithCompensation();
-    }
-}
-
-@Transactional
-private void createOrderWithCompensation() {
-    // 本地事务
-    orderDao.insert(order);
-    
-    // 发送 MQ 消息，异步扣减库存
-    mqProducer.send(new DeductStockMessage(productId, count));
-}
-```
-
-## 16.5 监控与调优
-
-### 1. 关键指标
-
-```java
-// 使用 Micrometer 监控
-@Component
-public class SeataMetrics {
-    
-    @Autowired
-    private MeterRegistry meterRegistry;
-    
-    // 全局事务成功率
-    public void recordGlobalTransactionSuccess() {
-        meterRegistry.counter("seata.global.transaction.success").increment();
-    }
-    
-    public void recordGlobalTransactionFailure() {
-        meterRegistry.counter("seata.global.transaction.failure").increment();
-    }
-    
-    // 全局事务耗时
-    public void recordGlobalTransactionDuration(long duration) {
-        meterRegistry.timer("seata.global.transaction.duration")
-            .record(duration, TimeUnit.MILLISECONDS);
-    }
-    
-    // 全局锁冲突次数
-    public void recordLockConflict() {
-        meterRegistry.counter("seata.lock.conflict").increment();
-    }
-    
-    // 分支事务数量
-    public void recordBranchCount(int count) {
-        meterRegistry.gauge("seata.branch.count", count);
-    }
-}
-```
-
-### 2. 慢事务分析
-
-```java
-@Aspect
-@Component
-public class SlowTransactionAspect {
-    
-    private static final long SLOW_THRESHOLD = 1000;  // 1 秒
-    
-    @Around("@annotation(io.seata.spring.annotation.GlobalTransactional)")
-    public Object monitor(ProceedingJoinPoint pjp) throws Throwable {
-        long start = System.currentTimeMillis();
-        String xid = RootContext.getXID();
-        
-        try {
-            return pjp.proceed();
-        } finally {
-            long duration = System.currentTimeMillis() - start;
-            
-            if (duration > SLOW_THRESHOLD) {
-                log.warn("慢事务检测，xid={}, method={}, duration={}ms", 
-                         xid, pjp.getSignature(), duration);
-                
-                // 记录慢事务详情
-                slowTransactionDao.insert(new SlowTransaction(
-                    xid, 
-                    pjp.getSignature().toString(), 
-                    duration
-                ));
-            }
-        }
-    }
-}
-```
-
-### 3. 性能调优建议
-
-**调优清单：**
-
-```
-□ 客户端优化
-  □ 开启异步提交
-  □ 关闭成功结果上报
-  □ 优化连接池配置
-  □ 缩小事务范围
-  □ 拆分热点数据
-
-□ 服务端优化
-  □ 选择合适的存储模式（Redis > DB > File）
-  □ TC 集群部署
-  □ 数据库索引优化
-  □ 定期清理历史数据
-
-□ 业务优化
-  □ 读写分离
-  □ 缓存预热
-  □ 异步化非核心流程
-  □ 降级策略
-
-□ 监控告警
-  □ 全局事务成功率
-  □ 全局事务耗时
-  □ 全局锁冲突率
-  □ 慢事务分析
-```
-
-## 16.6 性能优化效果对比
-
-### 优化前 vs 优化后
-
-| 优化项 | 优化前 TPS | 优化后 TPS | 提升幅度 |
-|--------|-----------|-----------|---------|
-| 异步提交 | 1200 | 4000 | 233% |
-| 批量操作 | 1200 | 1800 | 50% |
-| Redis 存储 | 1200 | 2500 | 108% |
-| 缩小事务范围 | 1200 | 1600 | 33% |
-| 综合优化 | 1200 | 6000 | 400% |
-
-**综合优化后：**
-- TPS：1200 → 6000（5 倍提升）
-- P99 响应时间：200ms → 50ms（75% 降低）
-- 全局锁冲突率：15% → 3%（80% 降低）
-
-# 17. 高可用部署方案
-
-## 17.1 高可用架构设计
-
-### 整体架构
-
-```
-                        ┌─────────────────┐
-                        │   Nginx / LVS   │
-                        │   (负载均衡)     │
-                        └────────┬────────┘
-                                 │
-                ┌────────────────┼────────────────┐
-                │                │                │
-         ┌──────▼──────┐  ┌──────▼──────┐  ┌──────▼──────┐
-         │ 业务服务集群 │  │ 业务服务集群 │  │ 业务服务集群 │
-         │  (TM/RM)    │  │  (TM/RM)    │  │  (TM/RM)    │
-         └──────┬──────┘  └──────┬──────┘  └──────┬──────┘
-                │                │                │
-                └────────────────┼────────────────┘
-                                 │
-                        ┌────────▼────────┐
-                        │  Nacos 集群     │
-                        │  (注册/配置中心) │
-                        └────────┬────────┘
-                                 │
-                ┌────────────────┼────────────────┐
-                │                │                │
-         ┌──────▼──────┐  ┌──────▼──────┐  ┌──────▼──────┐
-         │   TC-1      │  │   TC-2      │  │   TC-3      │
-         │ (Seata)     │  │ (Seata)     │  │ (Seata)     │
-         └──────┬──────┘  └──────┬──────┘  └──────┬──────┘
-                │                │                │
-                └────────────────┼────────────────┘
-                                 │
-                        ┌────────▼────────┐
-                        │  MySQL 主从集群  │
-                        │  (存储事务数据)  │
-                        └─────────────────┘
-```
-
-### 高可用要求
-
-| 组件 | 可用性目标 | 故障恢复时间 | 数据丢失 |
-|------|-----------|-------------|---------|
-| TC 集群 | 99.99% | < 30s | 0 |
-| 注册中心 | 99.99% | < 10s | 0 |
-| 配置中心 | 99.9% | < 1min | 0 |
-| 存储层 | 99.99% | < 1min | 0 |
-
-## 17.2 TC 集群部署
-
-### 部署模式
-
-#### 模式一：DB 存储 + 多节点
-
-**特点：**
-- 数据持久化到 MySQL
-- 多个 TC 节点共享同一个数据库
-- 无状态，易于扩展
-
-**配置（TC-1）：**
-```yaml
-server:
-  port: 8091
-
-spring:
-  application:
-    name: seata-server
-
-seata:
-  config:
-    type: nacos
-    nacos:
-      server-addr: 127.0.0.1:8848
-      namespace: seata
-      group: SEATA_GROUP
-      data-id: seataServer.properties
-  
-  registry:
-    type: nacos
-    nacos:
-      application: seata-server
-      server-addr: 127.0.0.1:8848
-      namespace: seata
-      group: SEATA_GROUP
-      cluster: default
-  
-  store:
-    mode: db
-    db:
-      datasource: druid
-      db-type: mysql
-      driver-class-name: com.mysql.cj.jdbc.Driver
-      url: jdbc:mysql://mysql-master:3306/seata?useSSL=false
-      user: seata
-      password: seata123
-      min-conn: 10
-      max-conn: 100
-```
-
-**配置（TC-2、TC-3）：**
-- 只需修改 `server.port`（如 8092、8093）
-- 其他配置完全相同
-
-**优点：**
-- 部署简单
-- 数据一致性强
-- 支持水平扩展
-
-**缺点：**
-- 数据库是单点（需要主从）
-- 性能受限于数据库
-
-#### 模式二：Redis 存储 + 多节点
-
-**配置：**
-```yaml
-seata:
-  store:
-    mode: redis
-    redis:
-      mode: cluster  # cluster/sentinel/single
-      cluster:
-        nodes: 
-          - 127.0.0.1:7000
-          - 127.0.0.1:7001
-          - 127.0.0.1:7002
-      database: 0
-      password: redis123
-      max-conn: 100
-      min-conn: 10
-```
-
-**优点：**
-- 性能高（全局锁查询快 10 倍）
-- 支持 Redis 集群/哨兵
-
-**缺点：**
-- 依赖 Redis 持久化（AOF）
-- 内存占用大
-
-#### 模式三：Raft 存储（推荐生产）
-
-**特点：**
-- TC 节点之间通过 Raft 协议同步数据
-- 无需外部存储
-- 强一致性
-
-**配置：**
-```yaml
-seata:
-  store:
-    mode: raft
-    raft:
-      server-addr: 127.0.0.1:9091,127.0.0.1:9092,127.0.0.1:9093
-      snapshot-interval: 600  # 快照间隔（秒）
-      apply-batch: 32         # 批量应用日志
-      max-append-bufferSize: 262144
-      max-replicator-inflight-msgs: 256
-      election-timeout-ms: 1000
-```
-
-**优点：**
-- 无外部依赖
-- 强一致性
-- 自动故障转移
-
-**缺点：**
-- 至少需要 3 个节点
-- 配置相对复杂
-
-### 节点健康检查
-
-```yaml
-# application.yml
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health,info,metrics
-  endpoint:
-    health:
-      show-details: always
-
-# 健康检查接口
-# http://localhost:8091/actuator/health
-```
-
-**响应示例：**
-```json
-{
-  "status": "UP",
-  "components": {
-    "db": {
-      "status": "UP",
-      "details": {
-        "database": "MySQL",
-        "validationQuery": "isValid()"
-      }
-    },
-    "diskSpace": {
-      "status": "UP",
-      "details": {
-        "total": 500000000000,
-        "free": 300000000000,
-        "threshold": 10485760
-      }
-    }
-  }
-}
-```
-
-## 17.3 注册中心高可用
-
-### Nacos 集群部署
-
-**架构：**
-```
-┌─────────┐  ┌─────────┐  ┌─────────┐
-│ Nacos-1 │  │ Nacos-2 │  │ Nacos-3 │
-│ (8848)  │  │ (8848)  │  │ (8848)  │
-└────┬────┘  └────┬────┘  └────┬────┘
-     │            │            │
-     └────────────┼────────────┘
-                  │
-          ┌───────▼───────┐
-          │  MySQL 集群    │
-          └───────────────┘
-```
-
-**配置（cluster.conf）：**
-```
-192.168.1.101:8848
-192.168.1.102:8848
-192.168.1.103:8848
-```
-
-**配置（application.properties）：**
-```properties
-# Nacos 数据源
-spring.datasource.platform=mysql
-db.num=1
-db.url.0=jdbc:mysql://mysql-master:3306/nacos?characterEncoding=utf8&connectTimeout=1000&socketTimeout=3000&autoReconnect=true&useSSL=false
-db.user.0=nacos
-db.password.0=nacos123
-
-# 集群配置
-nacos.core.auth.enabled=true
-nacos.core.auth.plugin.nacos.token.secret.key=SecretKey012345678901234567890123456789012345678901234567890123456789
-```
-
-**客户端配置：**
-```yaml
-seata:
-  registry:
-    type: nacos
-    nacos:
-      server-addr: 192.168.1.101:8848,192.168.1.102:8848,192.168.1.103:8848
-      namespace: seata
-      group: SEATA_GROUP
-```
-
-### 注册中心故障切换
-
-**客户端自动切换：**
-```java
-// Seata 客户端会自动重试其他 Nacos 节点
-// 无需手动配置
-```
-
-**监控告警：**
-```java
-@Component
-public class RegistryHealthCheck {
-    
-    @Autowired
-    private NamingService namingService;
-    
-    @Scheduled(fixedDelay = 30000)
-    public void checkHealth() {
-        try {
-            List<Instance> instances = namingService.getAllInstances("seata-server");
-            
-            if (instances.isEmpty()) {
-                log.error("注册中心无可用 TC 实例");
-                alertService.send("Seata TC 不可用", "注册中心查询不到 TC 实例");
-            }
-            
-            long healthyCount = instances.stream()
-                .filter(Instance::isHealthy)
-                .count();
-            
-            if (healthyCount < 2) {
-                log.warn("TC 健康实例不足，当前健康实例数：{}", healthyCount);
-                alertService.send("Seata TC 健康实例不足", "健康实例数：" + healthyCount);
-            }
-        } catch (Exception e) {
-            log.error("注册中心健康检查失败", e);
-            alertService.send("Seata 注册中心异常", e.getMessage());
-        }
-    }
-}
-```
-
-## 17.4 存储层高可用
-
-### MySQL 主从复制
-
-**架构：**
-```
-┌──────────────┐
-│  MySQL Master│
-│  (读写)      │
-└──────┬───────┘
-       │ binlog 同步
-       ├─────────────┐
-       │             │
-┌──────▼───────┐ ┌──▼──────────┐
-│ MySQL Slave1 │ │ MySQL Slave2│
-│  (只读)      │ │  (只读)     │
-└──────────────┘ └─────────────┘
-```
-
-**主库配置（my.cnf）：**
-```ini
-[mysqld]
-server-id=1
-log-bin=mysql-bin
-binlog-format=ROW
-sync-binlog=1
-innodb_flush_log_at_trx_commit=1
-
-# Seata 表不复制到从库（可选）
-binlog-ignore-db=seata
-```
-
-**从库配置（my.cnf）：**
-```ini
-[mysqld]
-server-id=2
-relay-log=mysql-relay-bin
-read-only=1
-```
-
-**配置主从复制：**
-```sql
--- 主库创建复制用户
-CREATE USER 'repl'@'%' IDENTIFIED BY 'repl123';
-GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
-FLUSH PRIVILEGES;
-
--- 从库配置主库信息
-CHANGE MASTER TO
-  MASTER_HOST='192.168.1.101',
-  MASTER_USER='repl',
-  MASTER_PASSWORD='repl123',
-  MASTER_LOG_FILE='mysql-bin.000001',
-  MASTER_LOG_POS=154;
-
--- 启动从库复制
-START SLAVE;
-
--- 检查复制状态
-SHOW SLAVE STATUS\G
-```
-
-### 主从切换
-
-#### 方案一：手动切换
-
-```bash
-# 1. 停止从库复制
-mysql> STOP SLAVE;
-
-# 2. 提升从库为主库
-mysql> RESET MASTER;
-mysql> SET GLOBAL read_only = 0;
-
-# 3. 修改应用配置，指向新主库
-# 4. 重启应用
-```
-
-#### 方案二：MHA 自动切换
-
-**安装 MHA：**
-```bash
-# Manager 节点
-yum install mha4mysql-manager
-
-# 所有 MySQL 节点
-yum install mha4mysql-node
-```
-
-**配置（/etc/mha/app1.cnf）：**
-```ini
-[server default]
-manager_workdir=/var/log/mha/app1
-manager_log=/var/log/mha/app1/manager.log
-remote_workdir=/var/log/mha/app1
-ssh_user=root
-repl_user=repl
-repl_password=repl123
-ping_interval=3
-master_ip_failover_script=/usr/local/bin/master_ip_failover
-
-[server1]
-hostname=192.168.1.101
-port=3306
-candidate_master=1
-
-[server2]
-hostname=192.168.1.102
-port=3306
-candidate_master=1
-
-[server3]
-hostname=192.168.1.103
-port=3306
-no_master=1
-```
-
-**启动 MHA：**
-```bash
-# 检查配置
-masterha_check_ssh --conf=/etc/mha/app1.cnf
-masterha_check_repl --conf=/etc/mha/app1.cnf
-
-# 启动 MHA Manager
-nohup masterha_manager --conf=/etc/mha/app1.cnf &
-```
-
-#### 方案三：使用数据库中间件
-
-**使用 ProxySQL：**
-```sql
--- 配置主库
-INSERT INTO mysql_servers(hostgroup_id, hostname, port) 
-VALUES (0, '192.168.1.101', 3306);
-
--- 配置从库
-INSERT INTO mysql_servers(hostgroup_id, hostname, port) 
-VALUES (1, '192.168.1.102', 3306);
-INSERT INTO mysql_servers(hostgroup_id, hostname, port) 
-VALUES (1, '192.168.1.103', 3306);
-
--- 配置读写分离规则
-INSERT INTO mysql_query_rules(rule_id, active, match_pattern, destination_hostgroup, apply)
-VALUES (1, 1, '^SELECT.*FOR UPDATE$', 0, 1);
-INSERT INTO mysql_query_rules(rule_id, active, match_pattern, destination_hostgroup, apply)
-VALUES (2, 1, '^SELECT', 1, 1);
-
--- 加载配置
-LOAD MYSQL SERVERS TO RUNTIME;
-LOAD MYSQL QUERY RULES TO RUNTIME;
-```
-
-**应用配置：**
-```yaml
-spring:
-  datasource:
-    url: jdbc:mysql://proxysql:6033/seata
-    username: seata
-    password: seata123
-```
-
-### Redis 高可用
-
-#### Redis Sentinel
-
-**架构：**
-```
-┌──────────────┐
-│ Redis Master │
-└──────┬───────┘
-       │
-   ┌───┴───┐
-   │       │
-┌──▼──┐ ┌──▼──┐
-│Slave1│ │Slave2│
-└──────┘ └──────┘
-   │       │
-┌──▼───────▼──┐
-│  Sentinel   │
-│  (监控/切换) │
-└─────────────┘
-```
-
-**配置（sentinel.conf）：**
-```
-sentinel monitor mymaster 192.168.1.101 6379 2
-sentinel down-after-milliseconds mymaster 5000
-sentinel parallel-syncs mymaster 1
-sentinel failover-timeout mymaster 10000
-```
-
-**Seata 配置：**
-```yaml
-seata:
-  store:
-    mode: redis
-    redis:
-      mode: sentinel
-      sentinel:
-        master-name: mymaster
-        sentinel-hosts: 192.168.1.101:26379,192.168.1.102:26379,192.168.1.103:26379
-```
-
-## 17.5 容灾方案
-
-### 同城双活
-
-**架构：**
-```
-机房A                          机房B
-┌─────────────┐              ┌─────────────┐
-│  TC 集群A   │              │  TC 集群B   │
-│  (3节点)    │              │  (3节点)    │
-└──────┬──────┘              └──────┬──────┘
-       │                            │
-┌──────▼──────┐              ┌──────▼──────┐
-│  MySQL A    │◄────同步────►│  MySQL B    │
-│  (主)       │              │  (从)       │
-└─────────────┘              └─────────────┘
-```
-
-**配置：**
-```yaml
-# 机房A的应用
-seata:
-  registry:
-    nacos:
-      server-addr: nacos-a:8848
-      cluster: cluster-a
-
-# 机房B的应用
-seata:
-  registry:
-    nacos:
-      server-addr: nacos-b:8848
-      cluster: cluster-b
-```
-
-### 异地多活
-
-**架构：**
-```
-北京机房                 上海机房                 深圳机房
-┌─────────┐            ┌─────────┐            ┌─────────┐
-│ TC 集群 │            │ TC 集群 │            │ TC 集群 │
-└────┬────┘            └────┬────┘            └────┬────┘
-     │                      │                      │
-┌────▼────┐            ┌────▼────┐            ┌────▼────┐
-│ MySQL   │◄──────────►│ MySQL   │◄──────────►│ MySQL   │
-│ (主)    │   双向同步  │ (主)    │   双向同步  │ (主)    │
-└─────────┘            └─────────┘            └─────────┘
-```
-
-**注意事项：**
-- 跨机房事务延迟高，不建议
-- 按地域路由，同机房内完成事务
-- 跨机房使用异步消息
-
-### 灾难恢复
-
-**备份策略：**
-```bash
-# 每天全量备份
-0 2 * * * mysqldump -u root -p seata > /backup/seata_$(date +\%Y\%m\%d).sql
-
-# 每小时增量备份 binlog
-0 * * * * cp /var/lib/mysql/mysql-bin.* /backup/binlog/
-```
-
-**恢复流程：**
-```bash
-# 1. 恢复全量备份
-mysql -u root -p seata < /backup/seata_20260511.sql
-
-# 2. 恢复增量 binlog
-mysqlbinlog /backup/binlog/mysql-bin.000001 | mysql -u root -p seata
-
-# 3. 重启 TC 集群
-# 4. 验证数据一致性
-```
-
-## 17.6 监控告警
-
-### Prometheus + Grafana
-
-**Seata 暴露指标：**
-```yaml
-management:
-  metrics:
-    export:
-      prometheus:
-        enabled: true
-  endpoints:
-    web:
-      exposure:
-        include: prometheus,health,info
-```
-
-**Prometheus 配置（prometheus.yml）：**
-```yaml
-scrape_configs:
-  - job_name: 'seata-server'
-    static_configs:
-      - targets: ['tc-1:8091', 'tc-2:8092', 'tc-3:8093']
-    metrics_path: '/actuator/prometheus'
-```
-
-**关键指标：**
-- `seata_transaction_total`：全局事务总数
-- `seata_transaction_active`：活跃事务数
-- `seata_transaction_duration_seconds`：事务耗时
-- `seata_branch_transaction_total`：分支事务总数
-- `seata_global_lock_total`：全局锁申请次数
-
-**告警规则（alert.rules）：**
-```yaml
-groups:
-  - name: seata
-    rules:
-      - alert: SeataHighFailureRate
-        expr: rate(seata_transaction_total{status="failure"}[5m]) > 0.1
-        for: 5m
-        annotations:
-          summary: "Seata 事务失败率过高"
-          description: "失败率：{{ $value }}"
-      
-      - alert: SeataHighLockConflict
-        expr: rate(seata_global_lock_conflict_total[5m]) > 10
-        for: 5m
-        annotations:
-          summary: "Seata 全局锁冲突频繁"
-          description: "冲突次数：{{ $value }}/s"
-```
-
-## 17.7 生产部署检查清单
-
-```
-□ TC 集群
-  □ 至少 3 个节点
-  □ 跨机架/可用区部署
-  □ 配置健康检查
-  □ 配置自动重启
-
-□ 注册中心
-  □ Nacos 集群（3 节点）
-  □ 配置持久化（MySQL）
-  □ 配置认证
-
-□ 配置中心
-  □ 配置备份
-  □ 配置版本管理
-  □ 配置灰度发布
-
-□ 存储层
-  □ MySQL 主从复制
-  □ 配置自动切换（MHA/ProxySQL）
-  □ 配置定期备份
-  □ 配置监控告警
-
-□ 网络
-  □ 配置防火墙规则
-  □ 配置负载均衡
-  □ 配置域名解析
-
-□ 监控告警
-  □ Prometheus + Grafana
-  □ 配置告警规则
-  □ 配置告警通知（钉钉/邮件）
-
-□ 容灾
-  □ 配置备份策略
-  □ 编写恢复流程文档
-  □ 定期演练
-```
-
-# 18. Spring Cloud 集成原理
-
-## 18.1 集成架构
-
-### 整体架构
-
-```
-┌─────────────────────────────────────────────────────┐
-│              Spring Cloud 微服务架构                 │
-├─────────────────────────────────────────────────────┤
-│                                                     │
-│  ┌──────────────┐         ┌──────────────┐        │
-│  │ 订单服务 (TM) │────────►│ 库存服务 (RM) │        │
-│  │ @GlobalTx    │  Feign  │              │        │
-│  └──────┬───────┘         └──────┬───────┘        │
-│         │                        │                 │
-│         │  xid 传递              │                 │
-│         │  (HTTP Header)         │                 │
-│         │                        │                 │
-│  ┌──────▼────────────────────────▼───────┐        │
-│  │      Seata Spring Cloud Starter       │        │
-│  │  - GlobalTransactionScanner           │        │
-│  │  - SeataFeignClient                   │        │
-│  │  - SeataRestTemplateInterceptor       │        │
-│  │  - SeataDataSourceProxy               │        │
-│  └──────┬────────────────────────┬───────┘        │
-│         │                        │                 │
-│         └────────────┬───────────┘                 │
-│                      │                             │
-└──────────────────────┼─────────────────────────────┘
-                       │
-                ┌──────▼──────┐
-                │  Seata TC   │
-                └─────────────┘
-```
-
-## 18.2 核心组件
-
-### 1. GlobalTransactionScanner
-
-**作用：** 扫描 `@GlobalTransactional` 注解，创建全局事务代理。
-
-**源码分析：**
-```java
-public class GlobalTransactionScanner extends AbstractAutoProxyCreator 
-    implements InitializingBean, ApplicationContextAware, DisposableBean {
-    
-    @Override
-    public Object wrapIfNecessary(Object bean, String beanName, Object cacheKey) {
-        // 检查是否有 @GlobalTransactional 注解
-        if (bean instanceof Advised) {
-            Advised advised = (Advised) bean;
-            for (Advisor advisor : advised.getAdvisors()) {
-                if (advisor instanceof GlobalTransactionalInterceptor) {
-                    return bean;
-                }
-            }
-        }
-        
-        // 创建代理
-        if (hasGlobalTransactionalAnnotation(bean)) {
-            return createProxy(bean);
-        }
-        
-        return bean;
-    }
-    
-    private Object createProxy(Object bean) {
-        // 创建 AOP 代理，拦截器为 GlobalTransactionalInterceptor
-        ProxyFactory proxyFactory = new ProxyFactory(bean);
-        proxyFactory.addAdvisor(new GlobalTransactionalInterceptor());
-        return proxyFactory.getProxy();
-    }
-}
-```
-
-**配置：**
-```java
-@Configuration
-public class SeataAutoConfiguration {
-    
-    @Bean
-    public GlobalTransactionScanner globalTransactionScanner() {
-        return new GlobalTransactionScanner(
-            applicationId,      // 应用 ID
-            txServiceGroup      // 事务分组
-        );
-    }
-}
-```
-
-### 2. GlobalTransactionalInterceptor
-
-**作用：** 拦截 `@GlobalTransactional` 方法，开启/提交/回滚全局事务。
-
-**源码分析：**
-```java
-public class GlobalTransactionalInterceptor implements MethodInterceptor {
-    
-    @Override
-    public Object invoke(MethodInvocation invocation) throws Throwable {
-        Method method = invocation.getMethod();
-        GlobalTransactional annotation = method.getAnnotation(GlobalTransactional.class);
-        
-        // 获取事务模板
-        TransactionalTemplate template = new TransactionalTemplate();
-        
-        // 执行全局事务
-        return template.execute(new TransactionalExecutor() {
-            @Override
-            public Object execute() throws Throwable {
-                return invocation.proceed();
-            }
-            
-            @Override
-            public TransactionInfo getTransactionInfo() {
-                return new TransactionInfo(
-                    annotation.timeoutMills(),
-                    annotation.name(),
-                    annotation.rollbackFor(),
-                    annotation.noRollbackFor()
-                );
-            }
-        });
-    }
-}
-```
-
-**TransactionalTemplate 核心逻辑：**
-```java
-public class TransactionalTemplate {
-    
-    public Object execute(TransactionalExecutor executor) throws Throwable {
-        // 1. 获取或创建全局事务
-        GlobalTransaction tx = GlobalTransactionContext.getCurrentOrCreate();
-        
-        try {
-            // 2. 开启全局事务
-            tx.begin(executor.getTransactionInfo().getTimeOut(), 
-                     executor.getTransactionInfo().getName());
-            
-            Object result;
-            try {
-                // 3. 执行业务逻辑
-                result = executor.execute();
-            } catch (Throwable ex) {
-                // 4. 业务异常，回滚
-                completeTransactionAfterThrowing(executor.getTransactionInfo(), tx, ex);
-                throw ex;
-            }
-            
-            // 5. 提交全局事务
-            tx.commit();
-            return result;
-            
-        } finally {
-            // 6. 清理上下文
-            RootContext.unbind();
-        }
-    }
-    
-    private void completeTransactionAfterThrowing(TransactionInfo txInfo, 
-                                                   GlobalTransaction tx, 
-                                                   Throwable ex) throws Throwable {
-        // 判断是否需要回滚
-        if (shouldRollback(txInfo, ex)) {
-            tx.rollback();
-        } else {
-            tx.commit();
-        }
-    }
-}
-```
-
-### 3. SeataDataSourceProxy
-
-**作用：** 代理数据源，拦截 SQL 执行，实现 AT 模式的自动回滚。
-
-**源码分析：**
-```java
-public class DataSourceProxy extends AbstractDataSourceProxy {
-    
-    @Override
-    public Connection getConnection() throws SQLException {
-        // 获取原始连接
-        Connection targetConnection = targetDataSource.getConnection();
-        
-        // 包装为 ConnectionProxy
-        return new ConnectionProxy(this, targetConnection);
-    }
-}
-
-public class ConnectionProxy extends AbstractConnectionProxy {
-    
-    @Override
-    public PreparedStatement prepareStatement(String sql) throws SQLException {
-        // 包装为 PreparedStatementProxy
-        PreparedStatement targetStatement = targetConnection.prepareStatement(sql);
-        return new PreparedStatementProxy(this, targetStatement, sql);
-    }
-}
-
-public class PreparedStatementProxy extends AbstractPreparedStatementProxy {
-    
-    @Override
-    public boolean execute() throws SQLException {
-        // 1. 解析 SQL
-        SQLRecognizer recognizer = SQLVisitorFactory.get(sql, dbType);
-        
-        // 2. 查询前镜像（before image）
-        TableRecords beforeImage = queryBeforeImage(recognizer);
-        
-        // 3. 执行 SQL
-        boolean result = targetStatement.execute();
-        
-        // 4. 查询后镜像（after image）
-        TableRecords afterImage = queryAfterImage(recognizer);
-        
-        // 5. 生成 undo_log
-        prepareUndoLog(beforeImage, afterImage);
-        
-        return result;
-    }
-}
-```
-
-**配置：**
-```java
-@Configuration
-public class DataSourceConfiguration {
-    
-    @Bean
-    @ConfigurationProperties(prefix = "spring.datasource")
-    public DataSource dataSource() {
-        return new HikariDataSource();
-    }
-    
-    @Bean
-    @Primary
-    public DataSourceProxy dataSourceProxy(DataSource dataSource) {
-        // 包装为 Seata 数据源代理
-        return new DataSourceProxy(dataSource);
-    }
-}
-```
-
-## 18.3 xid 传递机制
-
-### HTTP 传递（Feign/RestTemplate）
-
-#### Feign 拦截器
-
-```java
-@Component
-public class SeataFeignRequestInterceptor implements RequestInterceptor {
-    
-    @Override
-    public void apply(RequestTemplate template) {
-        // 从上下文获取 xid
-        String xid = RootContext.getXID();
-        
-        if (StringUtils.isNotBlank(xid)) {
-            // 将 xid 放入 HTTP Header
-            template.header(RootContext.KEY_XID, xid);
-        }
-    }
-}
-```
-
-**自动配置：**
-```java
-@Configuration
-@ConditionalOnClass(Feign.class)
-public class SeataFeignAutoConfiguration {
-    
-    @Bean
-    public SeataFeignRequestInterceptor seataFeignRequestInterceptor() {
-        return new SeataFeignRequestInterceptor();
-    }
-}
-```
-
-#### RestTemplate 拦截器
-
-```java
-public class SeataRestTemplateInterceptor implements ClientHttpRequestInterceptor {
-    
-    @Override
-    public ClientHttpResponse intercept(HttpRequest request, 
-                                        byte[] body, 
-                                        ClientHttpRequestExecution execution) throws IOException {
-        // 获取 xid
-        String xid = RootContext.getXID();
-        
-        if (StringUtils.isNotBlank(xid)) {
-            // 添加到 HTTP Header
-            request.getHeaders().add(RootContext.KEY_XID, xid);
-        }
-        
-        return execution.execute(request, body);
-    }
-}
-```
-
-**配置：**
-```java
-@Configuration
-public class RestTemplateConfiguration {
-    
-    @Bean
-    public RestTemplate restTemplate() {
-        RestTemplate restTemplate = new RestTemplate();
-        
-        // 添加 Seata 拦截器
-        List<ClientHttpRequestInterceptor> interceptors = restTemplate.getInterceptors();
-        interceptors.add(new SeataRestTemplateInterceptor());
-        restTemplate.setInterceptors(interceptors);
-        
-        return restTemplate;
-    }
-}
-```
-
-#### 服务端接收 xid
-
-```java
-@Component
-public class SeataHandlerInterceptor implements HandlerInterceptor {
-    
-    @Override
-    public boolean preHandle(HttpServletRequest request, 
-                            HttpServletResponse response, 
-                            Object handler) {
-        // 从 HTTP Header 获取 xid
-        String xid = request.getHeader(RootContext.KEY_XID);
-        
-        if (StringUtils.isNotBlank(xid)) {
-            // 绑定到当前线程上下文
-            RootContext.bind(xid);
-        }
-        
-        return true;
-    }
-    
-    @Override
-    public void afterCompletion(HttpServletRequest request, 
-                               HttpServletResponse response, 
-                               Object handler, 
-                               Exception ex) {
-        // 清理上下文
-        RootContext.unbind();
-    }
-}
-```
-
-**注册拦截器：**
-```java
-@Configuration
-public class WebMvcConfiguration implements WebMvcConfigurer {
-    
-    @Override
-    public void addInterceptors(InterceptorRegistry registry) {
-        registry.addInterceptor(new SeataHandlerInterceptor())
-                .addPathPatterns("/**");
-    }
-}
-```
-
-### Dubbo 传递
-
-#### Dubbo Filter
-
-```java
-@Activate(group = {Constants.PROVIDER, Constants.CONSUMER}, order = 100)
-public class SeataTransactionPropagationFilter implements Filter {
-    
-    @Override
-    public Result invoke(Invoker<?> invoker, Invocation invocation) throws RpcException {
-        String xid = RootContext.getXID();
-        String rpcXid = getRpcXid();
-        
-        boolean bind = false;
-        if (xid != null) {
-            // Consumer 端：传递 xid
-            RpcContext.getContext().setAttachment(RootContext.KEY_XID, xid);
-        } else {
-            // Provider 端：接收 xid
-            xid = rpcXid;
-            if (xid != null) {
-                RootContext.bind(xid);
-                bind = true;
-            }
-        }
-        
-        try {
-            return invoker.invoke(invocation);
-        } finally {
-            if (bind) {
-                RootContext.unbind();
-            }
-        }
-    }
-    
-    private String getRpcXid() {
-        return RpcContext.getContext().getAttachment(RootContext.KEY_XID);
-    }
-}
-```
-
-**配置（META-INF/dubbo/org.apache.dubbo.rpc.Filter）：**
-```
-seataTransactionPropagation=io.seata.integration.dubbo.SeataTransactionPropagationFilter
-```
-
-## 18.4 事务传播机制
-
-### 传播行为
-
-Seata 支持类似 Spring 的事务传播行为：
-
-| 传播行为 | 说明 | 实现方式 |
-|---------|------|---------|
-| **REQUIRED** | 如果当前有事务，加入；否则新建 | 默认行为 |
-| **REQUIRES_NEW** | 总是新建事务，挂起当前事务 | `@GlobalTransactional(propagation = Propagation.REQUIRES_NEW)` |
-| **SUPPORTS** | 如果当前有事务，加入；否则非事务执行 | `@GlobalTransactional(propagation = Propagation.SUPPORTS)` |
-| **NOT_SUPPORTED** | 总是非事务执行，挂起当前事务 | `@GlobalTransactional(propagation = Propagation.NOT_SUPPORTED)` |
-| **NEVER** | 总是非事务执行，如果当前有事务则抛异常 | `@GlobalTransactional(propagation = Propagation.NEVER)` |
-| **MANDATORY** | 必须在事务中执行，否则抛异常 | `@GlobalTransactional(propagation = Propagation.MANDATORY)` |
-
-### 实现原理
-
-```java
-public class TransactionalTemplate {
-    
-    public Object execute(TransactionalExecutor executor) throws Throwable {
-        Propagation propagation = executor.getTransactionInfo().getPropagation();
-        
-        switch (propagation) {
-            case REQUIRED:
-                return executeWithRequired(executor);
-            case REQUIRES_NEW:
-                return executeWithRequiresNew(executor);
-            case SUPPORTS:
-                return executeWithSupports(executor);
-            // ... 其他传播行为
-        }
-    }
-    
-    private Object executeWithRequired(TransactionalExecutor executor) throws Throwable {
-        // 获取当前事务
-        GlobalTransaction tx = GlobalTransactionContext.getCurrent();
-        
-        if (tx == null) {
-            // 没有事务，新建
-            tx = GlobalTransactionContext.createNew();
-            return executeInTransaction(tx, executor);
-        } else {
-            // 有事务，加入
-            return executor.execute();
-        }
-    }
-    
-    private Object executeWithRequiresNew(TransactionalExecutor executor) throws Throwable {
-        // 挂起当前事务
-        String suspendedXid = RootContext.unbind();
-        
-        try {
-            // 新建事务
-            GlobalTransaction tx = GlobalTransactionContext.createNew();
-            return executeInTransaction(tx, executor);
-        } finally {
-            // 恢复挂起的事务
-            if (suspendedXid != null) {
-                RootContext.bind(suspendedXid);
-            }
-        }
-    }
-}
-```
-
-### 使用示例
-
-```java
-@Service
-public class OrderService {
-    
-    @Autowired
-    private StockService stockService;
-    
-    @Autowired
-    private LogService logService;
-    
-    // 主事务
-    @GlobalTransactional
-    public void createOrder() {
-        // 1. 创建订单
-        orderDao.insert(order);
-        
-        // 2. 扣减库存（加入当前事务）
-        stockService.deduct(productId, count);
-        
-        // 3. 记录日志（独立事务）
-        logService.recordLog(orderId);
-    }
-}
-
-@Service
-public class StockService {
-    
-    // 加入当前事务（默认 REQUIRED）
-    @GlobalTransactional
-    public void deduct(Long productId, Integer count) {
-        stockDao.deduct(productId, count);
-    }
-}
-
-@Service
-public class LogService {
-    
-    // 独立事务（REQUIRES_NEW）
-    @GlobalTransactional(propagation = Propagation.REQUIRES_NEW)
-    public void recordLog(Long orderId) {
-        // 即使主事务回滚，日志也会保留
-        logDao.insert(new Log(orderId, "ORDER_CREATED"));
-    }
-}
-```
-
-## 18.5 与 Spring 事务的协同
-
-### 嵌套使用
-
-```java
-@Service
-public class OrderService {
-    
-    // Seata 全局事务
-    @GlobalTransactional
-    public void createOrder() {
-        // 1. 创建订单（本地事务）
-        createOrderInLocalTransaction();
-        
-        // 2. 调用远程服务（全局事务）
-        stockService.deduct(productId, count);
-    }
-    
-    // Spring 本地事务
-    @Transactional
-    public void createOrderInLocalTransaction() {
-        orderDao.insert(order);
-        orderItemDao.batchInsert(orderItems);
-    }
-}
-```
-
-**执行流程：**
-```
-1. @GlobalTransactional 开启全局事务（xid=1）
-2. 进入 createOrderInLocalTransaction()
-3. @Transactional 开启本地事务
-4. 执行 orderDao.insert()
-   → DataSourceProxy 拦截
-   → 生成 undo_log
-   → 注册分支事务（branch_id=1001）
-5. 执行 orderItemDao.batchInsert()
-   → 同一个本地事务
-6. @Transactional 提交本地事务
-7. 调用 stockService.deduct()
-   → xid 通过 Feign 传递
-   → 远程服务注册分支事务（branch_id=1002）
-8. @GlobalTransactional 提交全局事务
-   → TC 通知所有分支提交
-```
-
-### 注意事项
-
-1. **@GlobalTransactional 必须在最外层**
-
-```java
-// 错误：@Transactional 在外层
-@Transactional
-@GlobalTransactional
-public void createOrder() {
-    // @GlobalTransactional 不会生效
-}
-
-// 正确：@GlobalTransactional 在外层
-@GlobalTransactional
-@Transactional
-public void createOrder() {
-    // 正常工作
-}
-```
-
-2. **避免在 @GlobalTransactional 中捕获异常**
-
-```java
-// 错误：捕获异常导致全局事务不回滚
-@GlobalTransactional
-public void createOrder() {
-    try {
-        orderDao.insert(order);
-        stockService.deduct(productId, count);  // 抛异常
-    } catch (Exception e) {
-        log.error("创建订单失败", e);
-        // 全局事务不会回滚！
-    }
-}
-
-// 正确：重新抛出异常
-@GlobalTransactional
-public void createOrder() {
-    try {
-        orderDao.insert(order);
-        stockService.deduct(productId, count);
-    } catch (Exception e) {
-        log.error("创建订单失败", e);
-        throw e;  // 重新抛出，触发回滚
-    }
-}
-```
-
-3. **指定回滚异常**
-
-```java
-@GlobalTransactional(
-    rollbackFor = Exception.class,           // 所有异常都回滚
-    noRollbackFor = BusinessException.class  // 业务异常不回滚
-)
-public void createOrder() {
-    // ...
-}
-```
-
-## 18.6 完整集成示例
-
-### Maven 依赖
-
-```xml
-<dependencies>
-    <!-- Spring Cloud Alibaba Seata -->
-    <dependency>
-        <groupId>com.alibaba.cloud</groupId>
-        <artifactId>spring-cloud-starter-alibaba-seata</artifactId>
-        <version>2021.0.5.0</version>
-    </dependency>
-    
-    <!-- Seata -->
-    <dependency>
-        <groupId>io.seata</groupId>
-        <artifactId>seata-spring-boot-starter</artifactId>
-        <version>1.6.1</version>
-    </dependency>
-</dependencies>
-```
-
-### 配置文件
-
-```yaml
-spring:
-  application:
-    name: order-service
-  cloud:
-    nacos:
-      discovery:
-        server-addr: 127.0.0.1:8848
-  datasource:
-    driver-class-name: com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://localhost:3306/order?useSSL=false
-    username: root
-    password: root
-
-seata:
-  enabled: true
-  application-id: ${spring.application.name}
-  tx-service-group: my_test_tx_group
-  
-  registry:
-    type: nacos
-    nacos:
-      application: seata-server
-      server-addr: 127.0.0.1:8848
-      namespace: seata
-      group: SEATA_GROUP
-  
-  config:
-    type: nacos
-    nacos:
-      server-addr: 127.0.0.1:8848
-      namespace: seata
-      group: SEATA_GROUP
-      data-id: seataServer.properties
-  
-  service:
-    vgroup-mapping:
-      my_test_tx_group: default
-```
-
-### 业务代码
-
-```java
-@RestController
-@RequestMapping("/order")
-public class OrderController {
-    
-    @Autowired
-    private OrderService orderService;
-    
-    @PostMapping("/create")
-    public Result createOrder(@RequestBody OrderDTO orderDTO) {
-        orderService.createOrder(orderDTO);
-        return Result.success();
-    }
-}
-
-@Service
-public class OrderService {
-    
-    @Autowired
-    private OrderDao orderDao;
-    
-    @Autowired
-    private StockServiceClient stockServiceClient;
-    
-    @Autowired
-    private PaymentServiceClient paymentServiceClient;
-    
-    @GlobalTransactional(
-        name = "create-order",
-        rollbackFor = Exception.class,
-        timeoutMills = 30000
-    )
-    public void createOrder(OrderDTO orderDTO) {
-        // 1. 创建订单
-        Order order = new Order();
-        order.setUserId(orderDTO.getUserId());
-        order.setProductId(orderDTO.getProductId());
-        order.setCount(orderDTO.getCount());
-        order.setAmount(orderDTO.getAmount());
-        order.setStatus("PENDING");
-        orderDao.insert(order);
-        
-        // 2. 扣减库存（远程调用）
-        stockServiceClient.deduct(orderDTO.getProductId(), orderDTO.getCount());
-        
-        // 3. 执行支付（远程调用）
-        paymentServiceClient.pay(order.getId(), orderDTO.getAmount());
-        
-        // 4. 更新订单状态
-        order.setStatus("PAID");
-        orderDao.updateById(order);
-    }
-}
-
-@FeignClient(name = "stock-service")
-public interface StockServiceClient {
-    
-    @PostMapping("/stock/deduct")
-    void deduct(@RequestParam("productId") Long productId, 
-                @RequestParam("count") Integer count);
-}
-```
-
-### 数据源配置
-
-```java
-@Configuration
-public class DataSourceConfiguration {
-    
-    @Bean
-    @ConfigurationProperties(prefix = "spring.datasource")
-    public DataSource dataSource() {
-        return new HikariDataSource();
-    }
-    
-    @Bean
-    @Primary
-    public DataSourceProxy dataSourceProxy(DataSource dataSource) {
-        return new DataSourceProxy(dataSource);
-    }
-    
-    @Bean
-    public SqlSessionFactory sqlSessionFactory(DataSourceProxy dataSourceProxy) throws Exception {
-        SqlSessionFactoryBean factoryBean = new SqlSessionFactoryBean();
-        factoryBean.setDataSource(dataSourceProxy);
-        return factoryBean.getObject();
-    }
-}
-```
+详见 [[Seata-Spring Cloud 集成]]。
 
 # 19. 监控与故障排查
 
-## 19.1 监控体系
+排障以“业务单号 → xid → branchId → TC 状态 → RM 日志 → 业务库”关联链为主线；先止血，再恢复与对账。
 
-### 监控架构
+详见 [[Seata-监控与故障排查]]。
 
-```
-┌─────────────────────────────────────────────────────┐
-│                  监控数据采集层                      │
-├─────────────────────────────────────────────────────┤
-│                                                     │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐        │
-│  │ TC 指标  │  │ TM 指标  │  │ RM 指标  │        │
-│  │ (Metrics)│  │ (Metrics)│  │ (Metrics)│        │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘        │
-│       │             │             │               │
-│       └─────────────┼─────────────┘               │
-│                     │                             │
-├─────────────────────┼─────────────────────────────┤
-│                     ▼                             │
-│            ┌─────────────────┐                    │
-│            │   Prometheus    │                    │
-│            │  (指标存储)      │                    │
-│            └────────┬────────┘                    │
-│                     │                             │
-├─────────────────────┼─────────────────────────────┤
-│                     ▼                             │
-│     ┌───────────────────────────────┐            │
-│     │         Grafana               │            │
-│     │  (可视化 + 告警)               │            │
-│     └───────────────────────────────┘            │
-│                                                   │
-├───────────────────────────────────────────────────┤
-│                  日志采集层                        │
-├───────────────────────────────────────────────────┤
-│                                                   │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐      │
-│  │ TC 日志  │  │ TM 日志  │  │ RM 日志  │      │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘      │
-│       │             │             │             │
-│       └─────────────┼─────────────┘             │
-│                     │                           │
-│            ┌────────▼────────┐                  │
-│            │   Filebeat      │                  │
-│            └────────┬────────┘                  │
-│                     │                           │
-│            ┌────────▼────────┐                  │
-│            │   Logstash      │                  │
-│            └────────┬────────┘                  │
-│                     │                           │
-│            ┌────────▼────────┐                  │
-│            │  Elasticsearch  │                  │
-│            └────────┬────────┘                  │
-│                     │                           │
-│            ┌────────▼────────┐                  │
-│            │     Kibana      │                  │
-│            └─────────────────┘                  │
-└───────────────────────────────────────────────────┘
-```
+# 20. 自测与复习
 
-## 19.2 关键指标监控
-
-### 1. 全局事务指标
-
-```java
-@Component
-public class SeataMetricsCollector {
-    
-    @Autowired
-    private MeterRegistry meterRegistry;
-    
-    // 全局事务总数
-    public void recordGlobalTransaction(String status) {
-        meterRegistry.counter("seata.global.transaction", 
-            "status", status).increment();
-    }
-    
-    // 全局事务耗时
-    public void recordGlobalTransactionDuration(long duration, String status) {
-        meterRegistry.timer("seata.global.transaction.duration",
-            "status", status).record(duration, TimeUnit.MILLISECONDS);
-    }
-    
-    // 活跃全局事务数
-    public void recordActiveGlobalTransactions(int count) {
-        meterRegistry.gauge("seata.global.transaction.active", count);
-    }
-    
-    // 全局事务超时次数
-    public void recordGlobalTransactionTimeout() {
-        meterRegistry.counter("seata.global.transaction.timeout").increment();
-    }
-}
-```
-
-**Prometheus 查询：**
-```promql
-# 全局事务成功率
-sum(rate(seata_global_transaction{status="success"}[5m])) 
-/ 
-sum(rate(seata_global_transaction[5m])) * 100
-
-# 全局事务 P99 耗时
-histogram_quantile(0.99, 
-  sum(rate(seata_global_transaction_duration_bucket[5m])) by (le)
-)
-
-# 活跃全局事务数
-seata_global_transaction_active
-```
-
-### 2. 分支事务指标
-
-```java
-// 分支事务总数
-public void recordBranchTransaction(String type, String status) {
-    meterRegistry.counter("seata.branch.transaction",
-        "type", type,      // AT/TCC/SAGA
-        "status", status   // success/failure
-    ).increment();
-}
-
-// 分支注册耗时
-public void recordBranchRegisterDuration(long duration) {
-    meterRegistry.timer("seata.branch.register.duration")
-        .record(duration, TimeUnit.MILLISECONDS);
-}
-
-// 分支提交/回滚耗时
-public void recordBranchCommitDuration(long duration, String result) {
-    meterRegistry.timer("seata.branch.commit.duration",
-        "result", result).record(duration, TimeUnit.MILLISECONDS);
-}
-```
-
-### 3. 全局锁指标
-
-```java
-// 全局锁申请次数
-public void recordLockAcquire(String result) {
-    meterRegistry.counter("seata.lock.acquire",
-        "result", result  // success/conflict/timeout
-    ).increment();
-}
-
-// 全局锁等待时间
-public void recordLockWaitDuration(long duration) {
-    meterRegistry.timer("seata.lock.wait.duration")
-        .record(duration, TimeUnit.MILLISECONDS);
-}
-
-// 全局锁持有数量
-public void recordLockHoldCount(int count) {
-    meterRegistry.gauge("seata.lock.hold.count", count);
-}
-
-// 全局锁冲突率
-public void recordLockConflictRate() {
-    // 冲突次数 / 总申请次数
-}
-```
-
-### 4. TC 服务端指标
-
-```java
-// TC 连接数
-public void recordTcConnections(int count) {
-    meterRegistry.gauge("seata.tc.connections", count);
-}
-
-// TC 处理队列长度
-public void recordTcQueueSize(int size) {
-    meterRegistry.gauge("seata.tc.queue.size", size);
-}
-
-// TC 存储操作耗时
-public void recordTcStorageDuration(String operation, long duration) {
-    meterRegistry.timer("seata.tc.storage.duration",
-        "operation", operation  // insert/update/delete/query
-    ).record(duration, TimeUnit.MILLISECONDS);
-}
-```
-
-## 19.3 Grafana 仪表盘
-
-### 仪表盘配置
-
-```json
-{
-  "dashboard": {
-    "title": "Seata 监控",
-    "panels": [
-      {
-        "title": "全局事务 TPS",
-        "targets": [
-          {
-            "expr": "sum(rate(seata_global_transaction[1m]))"
-          }
-        ]
-      },
-      {
-        "title": "全局事务成功率",
-        "targets": [
-          {
-            "expr": "sum(rate(seata_global_transaction{status=\"success\"}[5m])) / sum(rate(seata_global_transaction[5m])) * 100"
-          }
-        ]
-      },
-      {
-        "title": "全局事务耗时分布",
-        "targets": [
-          {
-            "expr": "histogram_quantile(0.50, sum(rate(seata_global_transaction_duration_bucket[5m])) by (le))",
-            "legendFormat": "P50"
-          },
-          {
-            "expr": "histogram_quantile(0.95, sum(rate(seata_global_transaction_duration_bucket[5m])) by (le))",
-            "legendFormat": "P95"
-          },
-          {
-            "expr": "histogram_quantile(0.99, sum(rate(seata_global_transaction_duration_bucket[5m])) by (le))",
-            "legendFormat": "P99"
-          }
-        ]
-      },
-      {
-        "title": "全局锁冲突率",
-        "targets": [
-          {
-            "expr": "sum(rate(seata_lock_acquire{result=\"conflict\"}[5m])) / sum(rate(seata_lock_acquire[5m])) * 100"
-          }
-        ]
-      },
-      {
-        "title": "活跃全局事务数",
-        "targets": [
-          {
-            "expr": "seata_global_transaction_active"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-## 19.4 日志规范
-
-### 日志级别
-
-```yaml
-logging:
-  level:
-    io.seata: INFO
-    # 开启 DEBUG 查看详细日志
-    # io.seata: DEBUG
-```
-
-### 关键日志
-
-#### 1. 全局事务日志
-
-```java
-@Aspect
-@Component
-public class GlobalTransactionLogAspect {
-    
-    @Around("@annotation(io.seata.spring.annotation.GlobalTransactional)")
-    public Object log(ProceedingJoinPoint pjp) throws Throwable {
-        String xid = RootContext.getXID();
-        String method = pjp.getSignature().toShortString();
-        
-        log.info("全局事务开始，xid={}, method={}", xid, method);
-        
-        long start = System.currentTimeMillis();
-        try {
-            Object result = pjp.proceed();
-            long duration = System.currentTimeMillis() - start;
-            log.info("全局事务提交，xid={}, method={}, duration={}ms", 
-                     xid, method, duration);
-            return result;
-        } catch (Throwable e) {
-            long duration = System.currentTimeMillis() - start;
-            log.error("全局事务回滚，xid={}, method={}, duration={}ms, error={}", 
-                      xid, method, duration, e.getMessage(), e);
-            throw e;
-        }
-    }
-}
-```
-
-#### 2. 分支事务日志
-
-```java
-// RM 端日志
-log.info("分支事务注册，xid={}, branchId={}, resourceId={}", 
-         xid, branchId, resourceId);
-
-log.info("分支事务提交，xid={}, branchId={}, result={}", 
-         xid, branchId, result);
-
-log.error("分支事务回滚失败，xid={}, branchId={}, error={}", 
-          xid, branchId, e.getMessage(), e);
-```
-
-#### 3. 全局锁日志
-
-```java
-log.debug("申请全局锁，xid={}, rowKey={}", xid, rowKey);
-
-log.warn("全局锁冲突，xid={}, rowKey={}, holdByXid={}", 
-         xid, rowKey, holdByXid);
-
-log.info("释放全局锁，xid={}, rowKey={}", xid, rowKey);
-```
-
-### 日志格式
-
-```xml
-<!-- logback-spring.xml -->
-<configuration>
-    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
-        <file>logs/seata.log</file>
-        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
-            <fileNamePattern>logs/seata.%d{yyyy-MM-dd}.log</fileNamePattern>
-            <maxHistory>30</maxHistory>
-        </rollingPolicy>
-        <encoder>
-            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{50} - [xid=%X{XID}] %msg%n</pattern>
-        </encoder>
-    </appender>
-    
-    <logger name="io.seata" level="INFO" additivity="false">
-        <appender-ref ref="FILE"/>
-    </logger>
-</configuration>
-```
-
-**MDC 注入 xid：**
-```java
-@Component
-public class SeataLogInterceptor implements HandlerInterceptor {
-    
-    @Override
-    public boolean preHandle(HttpServletRequest request, 
-                            HttpServletResponse response, 
-                            Object handler) {
-        String xid = RootContext.getXID();
-        if (xid != null) {
-            MDC.put("XID", xid);
-        }
-        return true;
-    }
-    
-    @Override
-    public void afterCompletion(HttpServletRequest request, 
-                               HttpServletResponse response, 
-                               Object handler, 
-                               Exception ex) {
-        MDC.remove("XID");
-    }
-}
-```
-
-## 19.5 常见问题排查
-
-### 问题 1：全局事务不生效
-
-**现象：**
-- 方法标注了 `@GlobalTransactional`，但事务不回滚
-- 日志中没有 xid
-
-**排查步骤：**
-
-1. **检查是否引入依赖**
-```xml
-<dependency>
-    <groupId>io.seata</groupId>
-    <artifactId>seata-spring-boot-starter</artifactId>
-</dependency>
-```
-
-2. **检查配置是否正确**
-```yaml
-seata:
-  enabled: true  # 必须为 true
-  application-id: ${spring.application.name}
-  tx-service-group: my_test_tx_group
-```
-
-3. **检查是否连接到 TC**
-```bash
-# 查看日志
-grep "register success" logs/seata.log
-
-# 应该看到类似输出
-# register success, cost xxx ms, version:1.6.1, role:TMROLE, channel:[id: xxx]
-```
-
-4. **检查方法调用方式**
-```java
-// 错误：内部调用，AOP 不生效
-@Service
-public class OrderService {
-    
-    public void createOrder() {
-        this.doCreate();  // 内部调用，@GlobalTransactional 不生效
-    }
-    
-    @GlobalTransactional
-    private void doCreate() {
-        // ...
-    }
-}
-
-// 正确：外部调用
-@Service
-public class OrderService {
-    
-    @GlobalTransactional
-    public void createOrder() {
-        // ...
-    }
-}
-```
-
-5. **检查异常是否被捕获**
-```java
-// 错误：捕获异常导致不回滚
-@GlobalTransactional
-public void createOrder() {
-    try {
-        // ...
-    } catch (Exception e) {
-        log.error("error", e);
-        // 异常被吞掉，不会回滚
-    }
-}
-
-// 正确：重新抛出异常
-@GlobalTransactional
-public void createOrder() {
-    try {
-        // ...
-    } catch (Exception e) {
-        log.error("error", e);
-        throw e;  // 重新抛出
-    }
-}
-```
-
-### 问题 2：xid 未传递
-
-**现象：**
-- 主服务有 xid，远程服务没有 xid
-- 远程服务未加入全局事务
-
-**排查步骤：**
-
-1. **检查 Feign 拦截器**
-```java
-@Bean
-public SeataFeignRequestInterceptor seataFeignRequestInterceptor() {
-    return new SeataFeignRequestInterceptor();
-}
-```
-
-2. **检查 HTTP Header**
-```java
-// 在远程服务打印 Header
-@GetMapping("/test")
-public String test(HttpServletRequest request) {
-    String xid = request.getHeader(RootContext.KEY_XID);
-    log.info("收到 xid: {}", xid);
-    return "ok";
-}
-```
-
-3. **检查服务端拦截器**
-```java
-@Configuration
-public class WebMvcConfiguration implements WebMvcConfigurer {
-    
-    @Override
-    public void addInterceptors(InterceptorRegistry registry) {
-        registry.addInterceptor(new SeataHandlerInterceptor());
-    }
-}
-```
-
-### 问题 3：全局锁冲突
-
-**现象：**
-- 大量 `LockConflictException`
-- 事务耗时长，TPS 低
-
-**排查步骤：**
-
-1. **查看锁冲突日志**
-```bash
-grep "lock conflict" logs/seata.log
-```
-
-2. **分析热点数据**
-```sql
--- 查询 lock_table，找出冲突最多的行
-SELECT resource_id, table_name, pk, COUNT(*) as conflict_count
-FROM lock_table
-GROUP BY resource_id, table_name, pk
-ORDER BY conflict_count DESC
-LIMIT 10;
-```
-
-3. **优化方案**
-```java
-// 方案1：缩小事务范围
-@GlobalTransactional
-public void createOrder() {
-    // 只在必要的地方使用全局事务
-    Order order = prepareOrder();  // 不需要全局事务
-    
-    // 全局事务
-    saveOrderAndDeductStock(order);
-}
-
-// 方案2：拆分热点数据
-// 将单行库存拆分为多行
-int segment = ThreadLocalRandom.current().nextInt(10);
-stockDao.deduct(productId, segment, count);
-
-// 方案3：使用 TCC 替代 AT
-@TwoPhaseBusinessAction(name = "deductStock", commitMethod = "confirm", rollbackMethod = "cancel")
-public boolean try(Long productId, Integer count) {
-    // TCC 无全局锁
-    stockDao.freeze(productId, count);
-    return true;
-}
-```
-
-### 问题 4：undo_log 膨胀
-
-**现象：**
-- undo_log 表数据量巨大
-- 磁盘空间不足
-
-**排查步骤：**
-
-1. **查看 undo_log 数量**
-```sql
-SELECT COUNT(*) FROM undo_log;
-
--- 查看最早的记录
-SELECT MIN(gmt_create) FROM undo_log;
-```
-
-2. **检查是否有未清理的记录**
-```sql
--- 查询 7 天前的记录
-SELECT COUNT(*) 
-FROM undo_log 
-WHERE gmt_create < DATE_SUB(NOW(), INTERVAL 7 DAY);
-```
-
-3. **清理策略**
-```java
-// 定时任务清理
-@Scheduled(cron = "0 0 3 * * ?")
-public void cleanUndoLog() {
-    Date expireTime = DateUtils.addDays(new Date(), -7);
-    int rows = undoLogMapper.deleteByCreateTimeBefore(expireTime);
-    log.info("清理过期 undo_log，删除 {} 条", rows);
-}
-```
-
-4. **优化配置**
-```yaml
-seata:
-  client:
-    undo:
-      log-serialization: jackson
-      compress:
-        enable: true
-        type: zip
-        threshold: 64k
-```
-
-### 问题 5：TC 连接失败
-
-**现象：**
-- 应用启动报错：`can not connect to seata server`
-- 日志中没有注册成功的信息
-
-**排查步骤：**
-
-1. **检查 TC 是否启动**
-```bash
-# 检查 TC 进程
-ps -ef | grep seata-server
-
-# 检查 TC 端口
-netstat -anp | grep 8091
-```
-
-2. **检查注册中心**
-```bash
-# 查询 Nacos 中的 seata-server
-curl "http://127.0.0.1:8848/nacos/v1/ns/instance/list?serviceName=seata-server"
-```
-
-3. **检查网络连通性**
-```bash
-# 测试连接
-telnet tc-host 8091
-```
-
-4. **检查配置**
-```yaml
-seata:
-  registry:
-    type: nacos
-    nacos:
-      application: seata-server  # 必须与 TC 注册的名称一致
-      server-addr: 127.0.0.1:8848
-      namespace: seata
-      group: SEATA_GROUP
-```
-
-### 问题 6：事务超时
-
-**现象：**
-- 日志中出现 `GlobalTransactionTimeout`
-- 事务自动回滚
-
-**排查步骤：**
-
-1. **查看超时配置**
-```java
-@GlobalTransactional(timeoutMills = 30000)  // 30 秒
-public void createOrder() {
-    // ...
-}
-```
-
-2. **分析慢操作**
-```java
-@Aspect
-@Component
-public class SlowOperationAspect {
-    
-    @Around("execution(* com.example..*Service.*(..))")
-    public Object monitor(ProceedingJoinPoint pjp) throws Throwable {
-        long start = System.currentTimeMillis();
-        try {
-            return pjp.proceed();
-        } finally {
-            long duration = System.currentTimeMillis() - start;
-            if (duration > 1000) {
-                log.warn("慢操作，method={}, duration={}ms", 
-                         pjp.getSignature(), duration);
-            }
-        }
-    }
-}
-```
-
-3. **优化方案**
-```java
-// 方案1：增加超时时间
-@GlobalTransactional(timeoutMills = 60000)
-
-// 方案2：异步化非核心操作
-@GlobalTransactional
-public void createOrder() {
-    // 核心操作
-    orderDao.insert(order);
-    stockService.deduct(productId, count);
-    
-    // 非核心操作异步化
-    asyncExecutor.execute(() -> {
-        notificationService.send(orderId);
-    });
-}
-
-// 方案3：拆分事务
-public void createOrder() {
-    // 事务1：创建订单
-    Long orderId = createOrderInTransaction();
-    
-    // 事务2：扣减库存
-    deductStockInTransaction(orderId);
-}
-```
-
-## 19.6 故障排查工具
-
-### 1. Seata Console
-
-**访问地址：** http://tc-host:7091
-
-**功能：**
-- 查看全局事务列表
-- 查看分支事务详情
-- 查看全局锁信息
-- 手动回滚事务
-
-### 2. SQL 查询
-
-```sql
--- 查询活跃的全局事务
-SELECT * FROM global_table 
-WHERE status IN (1, 2, 3, 4, 5, 6)  -- Begin/Committing/Rollbacking 等
-ORDER BY gmt_create DESC;
-
--- 查询某个全局事务的所有分支
-SELECT * FROM branch_table 
-WHERE xid = 'your-xid'
-ORDER BY gmt_create;
-
--- 查询全局锁
-SELECT * FROM lock_table 
-WHERE xid = 'your-xid';
-
--- 查询长时间未完成的事务
-SELECT * FROM global_table 
-WHERE status = 1  -- Begin
-  AND gmt_create < DATE_SUB(NOW(), INTERVAL 5 MINUTE);
-```
-
-### 3. 日志分析脚本
-
-```bash
-#!/bin/bash
-# analyze_seata_log.sh
-
-LOG_FILE="logs/seata.log"
-
-echo "=== 全局事务统计 ==="
-echo "总数: $(grep -c '全局事务开始' $LOG_FILE)"
-echo "成功: $(grep -c '全局事务提交' $LOG_FILE)"
-echo "失败: $(grep -c '全局事务回滚' $LOG_FILE)"
-
-echo ""
-echo "=== 全局锁冲突 TOP 10 ==="
-grep '全局锁冲突' $LOG_FILE | awk '{print $NF}' | sort | uniq -c | sort -rn | head -10
-
-echo ""
-echo "=== 慢事务 TOP 10 ==="
-grep '全局事务提交' $LOG_FILE | awk '{print $(NF-1), $0}' | sort -rn | head -10
-```
-
-## 19.7 告警规则
-
-### Prometheus 告警
-
-```yaml
-groups:
-  - name: seata_alerts
-    rules:
-      # 全局事务失败率过高
-      - alert: HighGlobalTransactionFailureRate
-        expr: |
-          sum(rate(seata_global_transaction{status="failure"}[5m])) 
-          / 
-          sum(rate(seata_global_transaction[5m])) > 0.1
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Seata 全局事务失败率过高"
-          description: "失败率: {{ $value | humanizePercentage }}"
-      
-      # 全局锁冲突率过高
-      - alert: HighLockConflictRate
-        expr: |
-          sum(rate(seata_lock_acquire{result="conflict"}[5m])) 
-          / 
-          sum(rate(seata_lock_acquire[5m])) > 0.2
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Seata 全局锁冲突率过高"
-          description: "冲突率: {{ $value | humanizePercentage }}"
-      
-      # TC 不可用
-      - alert: SeataServerDown
-        expr: up{job="seata-server"} == 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Seata Server 不可用"
-          description: "实例: {{ $labels.instance }}"
-      
-      # 活跃事务数过多
-      - alert: TooManyActiveTransactions
-        expr: seata_global_transaction_active > 1000
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "活跃全局事务数过多"
-          description: "当前活跃事务数: {{ $value }}"
-```
-
-# 20. 面试高频题汇总
-
-## 20.1 基础概念题
-
-### Q1: 什么是分布式事务？为什么需要分布式事务？
-
-**答案：**
-
-分布式事务是指事务的参与者、支持事务的服务器、资源服务器以及事务管理器分别位于不同的分布式系统的不同节点之上。
-
-**为什么需要：**
-1. **微服务架构**：单体应用拆分为多个服务，每个服务有独立的数据库
-2. **跨数据库操作**：一个业务流程需要操作多个数据库
-3. **数据一致性**：保证多个服务之间的数据一致性
-
-**示例：**
-```
-订单服务（订单库）+ 库存服务（库存库）+ 支付服务（支付库）
-创建订单需要：
-1. 订单库插入订单
-2. 库存库扣减库存
-3. 支付库记录支付
-→ 三个操作要么全成功，要么全失败
-```
-
-### Q2: Seata 的三大角色是什么？各自的职责是什么？
-
-**答案：**
-
-| 角色 | 全称 | 职责 |
-|------|------|------|
-| **TC** | Transaction Coordinator | 事务协调者，维护全局和分支事务的状态，驱动全局事务提交或回滚 |
-| **TM** | Transaction Manager | 事务管理器，定义全局事务的范围，开始、提交或回滚全局事务 |
-| **RM** | Resource Manager | 资源管理器，管理分支事务处理的资源，与 TC 交互注册分支事务和报告分支事务状态 |
-
-**工作流程：**
-```
-1. TM 向 TC 申请开启全局事务，TC 返回 xid
-2. RM 向 TC 注册分支事务，纳入 xid 对应的全局事务管辖
-3. TM 向 TC 发起全局提交或回滚
-4. TC 调度 xid 下的所有分支事务完成提交或回滚
-```
-
-### Q3: Seata 支持哪些事务模式？各有什么特点？
-
-**答案：**
-
-| 模式 | 一致性 | 性能 | 业务侵入 | 适用场景 |
-|------|--------|------|---------|---------|
-| **AT** | 最终一致 | 中 | 低（无代码侵入） | 关系型数据库的 CRUD |
-| **TCC** | 最终一致 | 高 | 高（需实现三个接口） | 核心业务、跨异构系统 |
-| **SAGA** | 最终一致 | 高 | 中（需补偿服务） | 长流程、跨系统 |
-| **XA** | 强一致 | 低 | 低（无代码侵入） | 对一致性要求极高的场景 |
-
-**选择建议：**
-- 普通 CRUD → AT 模式
-- 高并发核心业务 → TCC 模式
-- 长流程跨系统 → SAGA 模式
-- 强一致性要求 → XA 模式
-
-## 20.2 AT 模式题
-
-### Q4: AT 模式的工作原理是什么？
-
-**答案：**
-
-AT 模式是基于**本地事务 + undo_log** 实现的自动补偿型分布式事务。
-
-**两阶段流程：**
-
-**一阶段（Prepare）：**
-```
-1. 解析 SQL，查询前镜像（before image）
-2. 执行业务 SQL
-3. 查询后镜像（after image）
-4. 生成 undo_log（包含 before/after image）
-5. 向 TC 注册分支事务
-6. 申请全局锁
-7. 提交本地事务（业务数据 + undo_log）
-```
-
-**二阶段（Commit）：**
-```
-1. TC 通知 RM 提交
-2. RM 异步删除 undo_log
-3. 释放全局锁
-```
-
-**二阶段（Rollback）：**
-```
-1. TC 通知 RM 回滚
-2. RM 根据 undo_log 的 before image 生成反向 SQL
-3. 执行反向 SQL，恢复数据
-4. 删除 undo_log
-5. 释放全局锁
-```
-
-### Q5: AT 模式如何防止脏写？
-
-**答案：**
-
-通过**全局锁**机制防止脏写。
-
-**工作原理：**
-```
-事务A（xid=1）更新订单 id=100：
-1. 本地事务提交前，向 TC 申请全局锁
-2. TC 在 lock_table 插入记录：row_key="order^^^100", xid=1
-3. 本地事务提交
-
-事务B（xid=2）也要更新订单 id=100：
-1. 本地事务提交前，向 TC 申请全局锁
-2. 发现 row_key 已被 xid=1 占用
-3. 等待或重试，直到事务A释放锁
-```
-
-**关键点：**
-- 全局锁在一阶段本地事务提交前申请
-- 全局锁在二阶段完成后释放
-- 全局锁粒度：resource_id + table_name + pk
-
-### Q6: AT 模式如何解决脏读问题？
-
-**答案：**
-
-使用 `@GlobalLock` + `SELECT FOR UPDATE` 实现读隔离。
-
-**问题场景：**
-```
-T1: 事务A更新订单状态为 PAID，一阶段提交
-T2: 事务B查询订单，读到 PAID
-T3: 事务A全局回滚，订单状态变回 PENDING
-T4: 事务B读到了脏数据
-```
-
-**解决方案：**
-```java
-@GlobalLock
-@Transactional
-public Order queryOrder(Long orderId) {
-    // SELECT * FROM order WHERE id = ? FOR UPDATE
-    return orderDao.selectByIdForUpdate(orderId);
-}
-```
-
-**工作流程：**
-```
-1. 开启本地事务
-2. 执行 SELECT FOR UPDATE（加本地锁）
-3. 向 TC 查询该行是否有全局锁
-4. 如果有全局锁，等待释放
-5. 如果无全局锁，返回数据
-6. 提交本地事务
-```
-
-### Q7: undo_log 的作用是什么？什么时候删除？
-
-**答案：**
-
-**作用：**
-- 存储数据修改前后的镜像（before/after image）
-- 用于生成反向 SQL，实现自动回滚
-
-**结构：**
-```json
-{
-  "beforeImage": {
-    "tableName": "order",
-    "rows": [{"id": 100, "status": "PENDING"}]
-  },
-  "afterImage": {
-    "tableName": "order",
-    "rows": [{"id": 100, "status": "PAID"}]
-  }
-}
-```
-
-**删除时机：**
-1. **二阶段提交**：异步删除 undo_log
-2. **二阶段回滚**：执行回滚后删除 undo_log
-3. **定时清理**：清理 7 天前的历史记录（防止泄漏）
-
-## 20.3 TCC 模式题
-
-### Q8: TCC 模式的三个阶段分别做什么？
-
-**答案：**
-
-| 阶段 | 方法 | 作用 | 示例（扣减库存） |
-|------|------|------|-----------------|
-| **Try** | try() | 资源检查和预留 | 冻结库存：available - 10, frozen + 10 |
-| **Confirm** | confirm() | 执行业务操作 | 扣减库存：frozen - 10 |
-| **Cancel** | cancel() | 释放预留资源 | 恢复库存：available + 10, frozen - 10 |
-
-**关键点：**
-- Try 阶段不执行实际业务，只预留资源
-- Confirm 阶段执行实际业务
-- Cancel 阶段释放 Try 阶段预留的资源
-
-### Q9: TCC 的三大问题是什么？如何解决？
-
-**答案：**
-
-| 问题 | 定义 | 解决方案 |
-|------|------|---------|
-| **空回滚** | Cancel 时 Try 未执行 | Cancel 时检查 Try 是否执行，未执行则插入标记 |
-| **幂等性** | 重复调用 Confirm/Cancel | 记录执行状态，重复调用直接返回 |
-| **悬挂** | Cancel 先于 Try 执行 | Try 时检查是否已 Cancel，已 Cancel 则拒绝执行 |
-
-**实现方案：**
-```java
-// 事务控制表
-CREATE TABLE tcc_control (
-  xid VARCHAR(128),
-  branch_id BIGINT,
-  status TINYINT,  -- 1:Try成功, 2:Confirm成功, 3:Cancel成功
-  PRIMARY KEY (xid, branch_id)
-);
-
-// Try 阶段
-public boolean try() {
-    // 1. 防悬挂：检查是否已 Cancel
-    if (control.status == CANCEL_SUCCESS) {
-        return false;
-    }
-    
-    // 2. 幂等：检查是否已 Try
-    if (control.status == TRY_SUCCESS) {
-        return true;
-    }
-    
-    // 3. 冻结资源
-    stockDao.freeze(productId, count);
-    
-    // 4. 记录 Try 成功
-    controlDao.insert(xid, branchId, TRY_SUCCESS);
-    return true;
-}
-
-// Cancel 阶段
-public boolean cancel() {
-    // 1. 空回滚：Try 未执行
-    if (control == null) {
-        controlDao.insert(xid, branchId, CANCEL_SUCCESS);
-        return true;
-    }
-    
-    // 2. 幂等：已 Cancel
-    if (control.status == CANCEL_SUCCESS) {
-        return true;
-    }
-    
-    // 3. 释放资源
-    stockDao.unfreeze(productId, count);
-    
-    // 4. 更新状态
-    controlDao.updateStatus(xid, branchId, CANCEL_SUCCESS);
-    return true;
-}
-```
-
-### Q10: TCC 与 AT 的区别是什么？如何选择？
-
-**答案：**
-
-| 维度 | AT 模式 | TCC 模式 |
-|------|---------|---------|
-| **实现方式** | 自动补偿（undo_log） | 手动补偿（三个接口） |
-| **业务侵入** | 低（无代码侵入） | 高（需改造业务） |
-| **性能** | 中（有全局锁） | 高（无全局锁） |
-| **隔离性** | 有（全局锁） | 无（资源预留） |
-| **开发成本** | 低 | 高 |
-| **适用场景** | 普通 CRUD | 核心业务、高并发 |
-
-**选择建议：**
-- **用 AT**：普通业务、快速开发、对性能要求不高
-- **用 TCC**：核心业务（订单、支付）、高并发、跨异构系统
-
-## 20.4 架构设计题
-
-### Q11: Seata 如何保证高可用？
-
-**答案：**
-
-**1. TC 集群部署**
-```
-┌─────────┐  ┌─────────┐  ┌─────────┐
-│  TC-1   │  │  TC-2   │  │  TC-3   │
-└────┬────┘  └────┬────┘  └────┬────┘
-     │            │            │
-     └────────────┼────────────┘
-                  │
-          ┌───────▼───────┐
-          │  MySQL 集群    │
-          └───────────────┘
-```
-
-**2. 注册中心高可用**
-- Nacos 集群（3 节点）
-- 客户端自动切换
-
-**3. 存储层高可用**
-- MySQL 主从复制
-- 自动故障切换（MHA/ProxySQL）
-
-**4. 容灾方案**
-- 同城双活
-- 异地多活
-- 定期备份
-
-### Q12: Seata 的性能瓶颈在哪里？如何优化？
-
-**答案：**
-
-**性能瓶颈：**
-1. **网络 IO**：TM/RM 与 TC 的频繁通信
-2. **全局锁竞争**：高并发下的锁等待
-3. **undo_log 写入**：磁盘 IO 开销
-4. **TC 存储**：数据库读写性能
-
-**优化方案：**
-
-| 优化项 | 方案 | 效果 |
-|--------|------|------|
-| **异步提交** | 二阶段异步化 | TPS 提升 3-4 倍 |
-| **批量操作** | 合并分支提交/回滚 | 减少网络 IO 50% |
-| **Redis 存储** | TC 使用 Redis | 全局锁查询快 10 倍 |
-| **缩小事务范围** | 只在必要时使用全局事务 | 减少锁持有时间 |
-| **拆分热点数据** | 分段库存 | 减少锁冲突 80% |
-| **TCC 替代 AT** | 核心业务用 TCC | 无全局锁，性能提升 60% |
-
-**综合优化效果：**
-- TPS：1200 → 6000（5 倍提升）
-- P99 响应时间：200ms → 50ms
-
-### Q13: xid 是如何在微服务之间传递的？
-
-**答案：**
-
-**HTTP 传递（Feign/RestTemplate）：**
-
-```java
-// 1. 客户端拦截器：将 xid 放入 HTTP Header
-@Component
-public class SeataFeignRequestInterceptor implements RequestInterceptor {
-    @Override
-    public void apply(RequestTemplate template) {
-        String xid = RootContext.getXID();
-        if (xid != null) {
-            template.header(RootContext.KEY_XID, xid);
-        }
-    }
-}
-
-// 2. 服务端拦截器：从 HTTP Header 获取 xid
-@Component
-public class SeataHandlerInterceptor implements HandlerInterceptor {
-    @Override
-    public boolean preHandle(HttpServletRequest request, ...) {
-        String xid = request.getHeader(RootContext.KEY_XID);
-        if (xid != null) {
-            RootContext.bind(xid);
-        }
-        return true;
-    }
-    
-    @Override
-    public void afterCompletion(...) {
-        RootContext.unbind();
-    }
-}
-```
-
-**Dubbo 传递：**
-```java
-@Activate(group = {Constants.PROVIDER, Constants.CONSUMER})
-public class SeataTransactionPropagationFilter implements Filter {
-    @Override
-    public Result invoke(Invoker<?> invoker, Invocation invocation) {
-        String xid = RootContext.getXID();
-        if (xid != null) {
-            // Consumer 端：传递 xid
-            RpcContext.getContext().setAttachment(RootContext.KEY_XID, xid);
-        } else {
-            // Provider 端：接收 xid
-            xid = RpcContext.getContext().getAttachment(RootContext.KEY_XID);
-            if (xid != null) {
-                RootContext.bind(xid);
-            }
-        }
-        return invoker.invoke(invocation);
-    }
-}
-```
-
-## 20.5 实战场景题
-
-### Q14: 订单服务调用库存服务扣库存失败，如何回滚已创建的订单？
-
-**答案：**
-
-**使用 Seata AT 模式：**
-
-```java
-@Service
-public class OrderService {
-    
-    @Autowired
-    private OrderDao orderDao;
-    
-    @Autowired
-    private StockServiceClient stockServiceClient;
-    
-    @GlobalTransactional(rollbackFor = Exception.class)
-    public void createOrder(OrderDTO dto) {
-        // 1. 创建订单
-        Order order = new Order();
-        order.setProductId(dto.getProductId());
-        order.setCount(dto.getCount());
-        orderDao.insert(order);
-        
-        // 2. 扣减库存（远程调用）
-        try {
-            stockServiceClient.deduct(dto.getProductId(), dto.getCount());
-        } catch (Exception e) {
-            // 扣库存失败，抛出异常
-            log.error("扣库存失败", e);
-            throw e;  // 触发全局事务回滚
-        }
-        
-        // 3. 更新订单状态
-        order.setStatus("PAID");
-        orderDao.updateById(order);
-    }
-}
-```
-
-**回滚流程：**
-```
-1. stockServiceClient.deduct() 抛异常
-2. @GlobalTransactional 捕获异常，调用 TC 回滚
-3. TC 通知订单服务 RM 回滚
-4. 订单服务 RM 根据 undo_log 生成反向 SQL
-5. 执行 DELETE FROM order WHERE id = ?
-6. 订单被删除，回滚完成
-```
-
-### Q15: 如果 TC 宕机，正在执行的事务会怎样？
-
-**答案：**
-
-**影响：**
-1. **一阶段已完成的事务**：
-   - 本地事务已提交，数据已写入数据库
-   - 但全局事务状态未知，无法提交或回滚
-   - 全局锁无法释放
-
-2. **一阶段未完成的事务**：
-   - 无法注册分支事务
-   - 无法申请全局锁
-   - 事务失败
-
-**恢复机制：**
-
-**1. TC 集群部署**
-```
-TC-1 宕机 → 客户端自动切换到 TC-2
-```
-
-**2. TC 重启后恢复**
-```
-1. TC 从数据库加载 global_table、branch_table
-2. 恢复未完成的事务状态
-3. 继续执行二阶段提交/回滚
-```
-
-**3. 超时回滚**
-```
-1. TC 定时扫描超时的全局事务
-2. 自动触发回滚
-3. 释放全局锁
-```
-
-**4. 人工介入**
-```
-1. 通过 Seata Console 查看未完成的事务
-2. 手动提交或回滚
-```
-
-### Q16: 如何设计一个秒杀系统的分布式事务？
-
-**答案：**
-
-**方案一：TCC 模式（推荐）**
-
-```java
-@Service
-public class SeckillService {
-    
-    @GlobalTransactional
-    public void seckill(Long userId, Long productId) {
-        // 1. 扣减库存（TCC）
-        stockTccService.deduct(productId, 1);
-        
-        // 2. 创建订单
-        orderDao.insert(order);
-        
-        // 3. 扣减用户余额（TCC）
-        accountTccService.deduct(userId, order.getAmount());
-    }
-}
-
-@Service
-public class StockTccService {
-    
-    // Try：冻结库存
-    @TwoPhaseBusinessAction(name = "deductStock", commitMethod = "confirm", rollbackMethod = "cancel")
-    public boolean try(Long productId, Integer count) {
-        // 使用 Redis Lua 脚本保证原子性
-        String script = 
-            "local available = redis.call('get', KEYS[1]) " +
-            "if tonumber(available) >= tonumber(ARGV[1]) then " +
-            "  redis.call('decrby', KEYS[1], ARGV[1]) " +
-            "  redis.call('incrby', KEYS[2], ARGV[1]) " +
-            "  return 1 " +
-            "else " +
-            "  return 0 " +
-            "end";
-        
-        Long result = redisTemplate.execute(
-            new DefaultRedisScript<>(script, Long.class),
-            Arrays.asList("stock:available:" + productId, "stock:frozen:" + productId),
-            count
-        );
-        
-        return result == 1;
-    }
-    
-    // Confirm：扣减冻结库存
-    public boolean confirm(BusinessActionContext context) {
-        Long productId = context.getActionContext("productId", Long.class);
-        Integer count = context.getActionContext("count", Integer.class);
-        
-        redisTemplate.opsForValue().decrement("stock:frozen:" + productId, count);
-        return true;
-    }
-    
-    // Cancel：恢复库存
-    public boolean cancel(BusinessActionContext context) {
-        Long productId = context.getActionContext("productId", Long.class);
-        Integer count = context.getActionContext("count", Integer.class);
-        
-        String script = 
-            "redis.call('incrby', KEYS[1], ARGV[1]) " +
-            "redis.call('decrby', KEYS[2], ARGV[1])";
-        
-        redisTemplate.execute(
-            new DefaultRedisScript<>(script, Long.class),
-            Arrays.asList("stock:available:" + productId, "stock:frozen:" + productId),
-            count
-        );
-        
-        return true;
-    }
-}
-```
-
-**方案二：异步补偿（高并发场景）**
-
-```java
-@Service
-public class SeckillService {
-    
-    @Autowired
-    private RocketMQTemplate mqTemplate;
-    
-    public void seckill(Long userId, Long productId) {
-        // 1. 扣减库存（Redis）
-        boolean success = stockService.deduct(productId, 1);
-        if (!success) {
-            throw new BizException("库存不足");
-        }
-        
-        // 2. 发送 MQ 消息，异步创建订单
-        SeckillMessage msg = new SeckillMessage(userId, productId);
-        mqTemplate.sendMessageInTransaction("seckill-topic", msg, null);
-    }
-}
-
-@RocketMQTransactionListener
-public class SeckillTransactionListener implements RocketMQLocalTransactionListener {
-    
-    @Override
-    public RocketMQLocalTransactionState executeLocalTransaction(Message msg, Object arg) {
-        try {
-            // 创建订单
-            orderDao.insert(order);
-            return RocketMQLocalTransactionState.COMMIT;
-        } catch (Exception e) {
-            // 创建订单失败，回滚库存
-            stockService.restore(productId, 1);
-            return RocketMQLocalTransactionState.ROLLBACK;
-        }
-    }
-    
-    @Override
-    public RocketMQLocalTransactionState checkLocalTransaction(Message msg) {
-        // 检查订单是否创建成功
-        Order order = orderDao.selectByMsgId(msg.getTransactionId());
-        return order != null ? 
-            RocketMQLocalTransactionState.COMMIT : 
-            RocketMQLocalTransactionState.ROLLBACK;
-    }
-}
-```
-
-**性能对比：**
-- TCC 模式：TPS ~5000，强一致性
-- 异步补偿：TPS ~50000，最终一致性
-
-## 20.6 对比题
-
-### Q17: Seata 与本地消息表的区别？
-
-**答案：**
-
-| 维度 | Seata | 本地消息表 |
-|------|-------|-----------|
-| **一致性** | 强一致/最终一致 | 最终一致 |
-| **实现复杂度** | 低（框架支持） | 中（需自己实现） |
-| **性能** | 中 | 高 |
-| **适用场景** | 同步调用 | 异步调用 |
-| **回滚方式** | 自动回滚 | 补偿 |
-| **外部依赖** | TC 服务 | MQ |
-
-**选择建议：**
-- 同步调用、强一致性 → Seata
-- 异步调用、最终一致性 → 本地消息表
-
-### Q18: Seata 与 RocketMQ 事务消息的区别？
-
-**答案：**
-
-| 维度 | Seata | RocketMQ 事务消息 |
-|------|-------|------------------|
-| **调用方式** | 同步 | 异步 |
-| **一致性** | 强一致/最终一致 | 最终一致 |
-| **性能** | 中 | 高 |
-| **实时性** | 高 | 低（有延迟） |
-| **适用场景** | 强一致性要求 | 最终一致性可接受 |
-
-**选择建议：**
-- 强一致性、实时性要求高 → Seata
-- 最终一致性、高并发 → RocketMQ 事务消息
-
-## 20.7 开放题
-
-### Q19: 如果让你设计一个分布式事务框架，你会怎么设计？
-
-**答案要点：**
-
-**1. 架构设计**
-- 协调者（TC）+ 事务管理器（TM）+ 资源管理器（RM）
-- TC 集群部署，支持水平扩展
-- 使用注册中心实现服务发现
-
-**2. 事务模式**
-- 支持 AT、TCC、SAGA 多种模式
-- 根据业务场景选择合适的模式
-
-**3. 性能优化**
-- 异步提交，减少同步等待
-- 批量操作，减少网络 IO
-- 使用 Redis 存储，提升查询性能
-
-**4. 高可用**
-- TC 集群部署
-- 数据持久化（DB/Redis）
-- 故障自动切换
-
-**5. 监控告警**
-- 暴露 Prometheus 指标
-- Grafana 可视化
-- 告警规则配置
-
-### Q20: 在生产环境中使用 Seata 需要注意什么？
-
-**答案要点：**
-
-**1. 部署架构**
-- TC 至少 3 个节点
-- 使用 Nacos 集群作为注册中心
-- MySQL 主从复制 + 自动切换
-
-**2. 性能优化**
-- 开启异步提交
-- 使用 Redis 存储模式
-- 缩小事务范围
-- 核心业务使用 TCC
-
-**3. 监控告警**
-- 监控全局事务成功率
-- 监控全局锁冲突率
-- 监控 TC 可用性
-- 配置告警规则
-
-**4. 故障处理**
-- 定期清理 undo_log
-- 处理超时事务
-- 人工介入机制
-
-**5. 降级方案**
-- 全局锁冲突时降级为本地事务 + MQ
-- TC 不可用时降级为最终一致性方案
-
-**6. 测试验证**
-- 压力测试
-- 故障演练
-- 回滚测试
+本章不重复正文答案和代码。完成主文阅读后，用 [[Seata-自测题]] 进行自测，并按每道题后的链接回到对应机制章节查漏补缺。

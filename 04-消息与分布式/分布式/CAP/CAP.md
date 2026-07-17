@@ -173,7 +173,7 @@
 
 ## 1）边界与默认假设（不写清楚容易翻车）
 
-* 微服务：订单/支付/库存/开票等独立库（典型“必须 AP”场景）
+* 微服务：订单/支付/库存/开票等独立库（并不“必须 AP”；是否采用最终一致取决于业务可接受的不一致窗口与补偿成本）
 * MQ 语义：**至少一次投递（at-least-once）**，允许重复、乱序、延迟
 * 一致性目标：**最终一致**（分钟级或更短），核心账务仍以权威系统/对账为准
 * 失败模型：网络抖动、消费者宕机、消息堆积、重复投递、生产端“写库成功但消息没发出去”、消费端“处理成功但 ack 丢了”
@@ -191,7 +191,7 @@
 
 事务提交后，由 **Outbox Dispatcher** 异步把事件发到 MQ。
 
-> 这样就彻底规避了经典坑：**“写 DB 成功，但发 MQ 失败”**（或者反过来）。
+> 这保证的是“业务变更”和“待投递事件”在同一数据库事务内原子落库，因而不会出现“业务已提交却没有任何可重试的发送记录”。它**不能**保证一次发送成功，投递端仍须处理重复投递、发送超时和确认结果未知。
 
 ### 2.2 消费端：inbox 去重 + 业务状态机
 
@@ -353,7 +353,8 @@ public void onMessage(Message msg, Channel channel) throws Exception {
         InvoiceCmd cmd = parse(msg);
         invoiceService.createInvoiceIfAbsent(cmd);
 
-        // 3) ack 只在事务提交后
+        // 3) 事务提交后再 ack。这里需要由事务框架的 afterCommit
+        //    回调执行，不能仅因为方法尚未抛异常就提前 ack。
         channel.basicAck(msg.getMessageProperties().getDeliveryTag(), false);
 
     } catch (Exception ex) {
@@ -370,7 +371,7 @@ public void onMessage(Message msg, Channel channel) throws Exception {
 * 业务更新尽量用“状态机幂等”：
 
   * `update ... set status='DONE' where id=? and status='INIT'`
-* inbox 表会增长：按 `processed_at` 做 TTL 清理（保 7~30 天，按回放窗口定）
+* inbox 表会增长：按 `processed_at` 做归档/清理（保留期必须不短于消息最大延迟、重试与人工回放窗口；不能机械固定为 7~30 天）
 
 ---
 

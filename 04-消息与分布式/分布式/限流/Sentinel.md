@@ -41,8 +41,8 @@ Sentinel 提供系统自适应保护机制，主要包括以下指标：
 用于定义资源并指定限流、降级后的处理逻辑。常用参数：
 
 - `value`: 资源名
-- `blockHandler`: 限流后的处理方法（未被放行）
-- `fallback`: 异常降级处理方法（已被放行）
+- `blockHandler`: 因 Sentinel 规则抛出 `BlockException` 时的处理方法
+- `fallback`: 已进入业务方法后发生非 `BlockException` 异常时的兜底方法
 - `defaultFallback`: 全局降级处理方法
 - `exceptionsToIgnore`: 忽略的异常
   
@@ -52,7 +52,7 @@ Sentinel 提供系统自适应保护机制，主要包括以下指标：
   
 ### 1.2.3 如何处理方法签名带参数的降级处理方法？
 
-处理方法需与原方法签名一致，且最后加上 `BlockException` 参数。
+`blockHandler` 的参数需与原方法一致，并在末尾额外加一个 `BlockException`；`fallback` 的参数与原方法一致，或在末尾额外加一个 `Throwable`。两者的返回类型必须与原方法兼容。
 
 ```java
 @SentinelResource(value = "doSomething", blockHandler = "handleBlock")  
