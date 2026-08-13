@@ -2293,7 +2293,7 @@ public class RedissonExpireExample {
     - maxmemory：设置为物理内存的60%-70%
     - maxmemory-policy：缓存场景用allkeys-lru，持久化场景用noeviction
 
-![[Pasted image 20250304140222.png]]
+![[Learning-document/image/Pasted image 20250304140222.png]]
 
 ## 8. Redis的管道功能
 ### 8.1 Redis的Pipeline（管道）
@@ -2702,10 +2702,10 @@ auto-aof-rewrite-min-size 64mb  # 设置AOF重写的最小文件大小
                 jedis.get(key);
             }
             ```
-        ![[Pasted image 20250304104018.png]]
+        ![[Learning-document/image/Pasted image 20250304104018.png]]
     - 异步更新 高可用：
         - 在缓存失效时，后台启动一个异步线程重新加载数据。
-        - ![[Pasted image 20250304104354.png]]
+        - ![[Learning-document/image/Pasted image 20250304104354.png]]
 
 ### 11.2 缓存穿透
 1. 定义：
