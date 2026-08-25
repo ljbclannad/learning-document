@@ -1,454 +1,134 @@
-# LLM(Large Language Model)
+# LLM（Large Language Model，大语言模型）
 
 [TOC]
-[1. 数据准备阶段](#1-数据准备阶段)
 
+## 1. 一张全景图
 
-# 1. 数据准备阶段
+大语言模型通常是以 Transformer 为主体、通过海量文本上的“预测下一个 token”任务训练出的神经网络。它根据输入上下文输出下一个 token 的概率分布，再按某种策略逐个生成 token。
 
-## 1.1 tokenization
+```text
+文本 -> tokenizer -> token IDs -> token/位置表示
+     -> 多层 Transformer -> 下一个 token 的概率分布 -> 解码 -> 文本
+```
 
-1. LLM 的输入最终是一个 id 序列（整数数组）。所以 token 化要提供两样东西：文本 -> tokens -> token_ids，token_ids -> tokens -> 文本（解码）。
+“语言流畅”不等于“事实正确”。模型从训练数据中学习统计模式与表征，不是带版本、来源和权限的事实数据库；对私有或易变知识，参见 [[06-AI应用后端/机器学习/RAG|RAG]]。
 
-2. 核心目标：在“词表大小、序列长度、表达能力、跨语言鲁棒性、可训练性”之间做工程权衡。
+## 2. Tokenization：文本如何变成模型输入
 
-3. Token 化的一般流水线（概念顺序）
-    1. 规范化（Normalization，可选但常见），把“视觉上相似/等价”的文本统一一下，降低歧义与词表膨胀。常见操作：
-        - Unicode 规范化（NFC/NFKC 等）
-        - 全角/半角统一
-        - 大小写处理（LLM多数保留大小写，不会强制 lower）
-        - 去掉/替换不可见字符（零宽空格等）
-        - 注意：规范化越激进，越可能损失信息（比如大小写、特殊符号），所以很多现代 tokenizer 选择“轻规范化”。
-    2. 预分词（Pre-tokenization），把文本先粗切成片段（例如按空格、标点、数字边界），让后面的 BPE/Unigram 在“片段内”做子词学习。
-        - GPT 系常见：用正则把空格、字母、数字、符号分组（你会看到 token 里经常带一个前置空格）
-        - BERT 系（WordPiece）常见：按空格 + 标点拆分
-        - 预分词的差异会直接导致：同样的 BPE 规则，切出来也不一样。
-    3. 子词切分（Subword tokenization）
-        - 在预分词片段内部，把字符串变成 token 序列（子词/字节/字符的组合）。
+模型接收的不是字符或单词，而是一串整数 token ID。一个 tokenizer 包含词表、切分规则、规范化规则和特殊 token 定义；训练与推理必须使用完全一致的版本。
 
-    4. 特殊符号注入（Special tokens）
-        - 为了让模型“知道结构”，会加上特殊 token：
-            - BOS/EOS（句子起止）
-            - PAD（补齐 batch）
-            - UNK（未知，一般 BPE/字节方案很少用）
-            - SEP/CLS（BERT 类）
-            - 以及对话模板相关的 <|system|> <|user|> <|assistant|> 等
-        - 这一步在训练与推理时都极其关键：同样的文本，不同的 special token 方案，模型行为会变。
+典型流程：
 
-4. 三个你必须形成“肌肉记忆”的指标
-	1.	词表大小（vocab size）
-        - 大词表：单 token 信息量更大、序列更短，但 embedding 矩阵更大、稀有 token 学不好。
-        - 小词表：更通用、覆盖好，但序列更长、注意力更贵（Transformer 计算量跟长度强相关）。
-    2. 序列长度（sequence length）
-        - Token 化的“压缩率”直接影响上下文窗口能塞多少内容，也影响推理成本。
-    3. 可逆性 & 稳定性
-        - 训练语料和线上输入必须用同一 tokenizer 版本；Tokenizer 改一点点，embedding 对应的 id 就全变了（灾难级）。
+1. **规范化（可选）**：如 Unicode 规范化或处理不可见字符。规范化越激进，越可能丢失大小写、符号等信息。
+2. **预分词**：按空格、标点、数字或正则规则粗分片段。
+3. **子词切分**：将片段编码为子词或字节级 token。
+4. **特殊 token 注入**：按模型要求加入 BOS、EOS、PAD 或对话模板标记。
 
-5. 常见 token 化流派（建立地图）
-    - Word（按词）：词表爆炸、OOV（未登录词）严重，基本被淘汰
-    - Character（按字符）：无 OOV，但序列太长
-    - Subword（子词：BPE / WordPiece / Unigram）：工业主流
-    - Byte-level（字节级 BPE）：对任意字符集天然覆盖，GPT 系常见，几乎不需要 UNK
+token 数不等于字数或单词数；语言、数字、空格和标点都会影响它。上下文限制、推理延迟和 API 成本通常按 token 计算。
 
-6. 你在工程里会踩的坑（提前打疫苗）
-    - “token 数 ≠ 字符数 ≠ 单词数”：中英文、数字、空格都会影响 token 数；成本评估别用字数估。
-    - 空格很重要：很多 tokenizer 把“前置空格”编码进 token；同一句话前面多一个空格，token 序列可能不同。
-    - 版本锁死：训练用 tokenizer A，线上千万别换 tokenizer B（哪怕词表大小一样也不行）。
-    - 特殊 token 对齐：padding side、是否加 BOS/EOS、chat template 都会影响输出质量与长度。
+### 2.1 常见 token 化方案
 
-## 1.2 BPE
+| 方案 | 特点 | 典型问题 |
+| --- | --- | --- |
+| Word | 一词一 token | 词表膨胀，未登录词（OOV）严重。 |
+| Character | 一字符一 token | 覆盖稳定，但序列较长。 |
+| 子词（BPE、WordPiece、Unigram） | 在词表大小与序列长度间折中 | 行为依赖具体训练规则。 |
+| Byte-level BPE | 以 UTF-8 字节为基础，几乎可编码任意文本 | 对人类不直观，中文可能占多个字节。 |
 
-### 1.2.1 BPE基础
+### 2.2 BPE 的核心直觉
 
-BPE 一句话：用“最常见的相邻片段合并”把字符串压缩成更大的子词。它本质上是个 贪心的压缩算法：反复统计语料里“相邻符号对（bigram）”出现频率，每次把最常见的一对合并成一个新符号；直到词表达到目标大小。
-“符号”一开始可以是：字符（classic BPE / many Word-level BPE）、字节（byte-level BPE，GPT 系最常见）、或者带了空格标记的“预分词片段”。
-BPE 的效果：高频片段变成一个 token（序列更短），低频词就拆成更小的片段（避免 OOV）。
+BPE 从较小的基本符号出发，反复把语料中高频相邻符号对合并为新 token，直到达到目标词表规模。高频词干或片段会变成更长的 token，低频词则保留为较小片段，从而避免纯词级词表的 OOV 问题。
 
-1. BPE 解决的核心矛盾：词表大小 vs 序列长度 vs OOV
-	•	纯按“词”切：词表爆炸、未登录词（OOV）多。
-	•	纯按“字/字符”切：没 OOV，但序列太长，Transformer 计算贵。
-	•	BPE：在两者之间做折中
-	•	常见词/词干/后缀会被合成大 token（短）
-	•	生僻词会被拆成较小 token（覆盖好）
+训练产物是词表（token <-> ID）和按优先级排列的 merge 规则。编码新文本时不再重新统计频率，而是按已学习的 merge 顺序合并。并列频率的处理、预分词和边界标记都会影响最终词表，因此 tokenizer 版本必须锁定。
 
-2. Classic BPE 训练流程（最常见讲法）
-    1. 输入是什么？
-        - 通常不是“整段文本”，而是 word 级别的频次表（从语料统计得到）：
-        - 你先做 basic 预分词（比如按空格/标点切出词）
-        - 统计每个 word 出现次数 freq(word)
-        - 然后把每个 word 表示成“符号序列”
+Byte-level BPE 先将文本转为 UTF-8 bytes，再在字节序列上应用 BPE。某些实现会将不可打印 byte 映射为可显示字符，因此调试时常见的 `Ġ`、`Ċ` 只是空格或换行等字节的显示表示；它们不是模型理解出的特殊语义。
 
-    2. 初始符号怎么表示？
-        - 经典做法：字符序列 + 词尾标记（很重要）
-        - 例如单词 "low" 变成：l o w </w>
-        - </w>（end-of-word）保证 “low” 和 “lower” 的边界信息不会乱串。
-        - 如果没有 </w>，你可能把跨词边界的东西学进去，导致解码/切分怪异。
+### 2.3 特殊 token 与对话模板
 
-    3. 每一轮做什么？
-        - 重复下面步骤直到词表大小到达目标（或 merge 次数达到上限）：
-        - 统计所有“相邻符号对”的出现次数（按 word 频次加权）
-        - 找到出现次数最高的一对 (A, B)
-        - 合并为新符号 AB
-        - 在所有 word 的符号序列中，把 A B 替换成 AB
-        - 记录这次 merge（非常关键：推理时要按这个顺序应用）
+特殊 token 是训练协议的一部分。BOS/EOS 指定序列边界，PAD 用于 batch 对齐，某些模型还定义角色边界、工具调用或图像占位 token。错误的 chat template、padding side、BOS/EOS 设置即使不会报错，也可能明显改变模型行为。
 
-    4. 手推一个经典例子（面试讲得最稳）
-        - 语料（假设每个出现 1 次）：
-            - low
-            - lower
-            - newest
-            - widest
+## 3. 从数据到训练样本
 
-        - 初始表示
-            - low    -> l o w </w>
-            - lower  -> l o w e r </w>
-            - newest -> n e w e s t </w>
-            - widest -> w i d e s t </w>
+原始数据可为连续文本、指令—回答对或多轮 messages。经过 tokenizer 和数据整理后，常见字段包括：
 
-        - 统计相邻对（只列一些直观高频的）：
-            - e s：在 newest、widest 里都有 → 2 次
-            - s t：在 newest、widest 里都有 → 2 次
-            - l o：在 low、lower 里都有 → 2 次
-            - o w：在 low、lower 里都有 → 2 次
-            - w </w>：在 low 里 1 次（lower 里不是）→ 1 次
+```text
+input_ids:       token ID 序列
+attention_mask:  哪些位置是有效 token
+labels:          计算损失的目标；忽略位置通常标为 -100
+```
 
-        - 这时最高频可能有并列（2 次的好几个）。真实实现里需要 tie-break 规则（例如字典序/先出现/哈希顺序），不同规则会导致不同词表（但大体相似）。
-        - 假设我们先合并 e s：
-            - Merge #1: e s -> es
-            - newest -> n e w es t </w>
-            - widest -> w i d es t </w>
+对 decoder-only 的因果语言模型，训练目标是预测下一个 token；实现通常由模型内部完成一位偏移。指令微调（SFT）中，常将 system/user 提示部分的 labels 置为 `-100`，只对 assistant 的目标回答计算损失。具体边界必须和所用对话模板一致。
 
-        - 再合并 l o -> lo：
-            - Merge #3: l o -> lo
-            - low   -> lo w </w>
-            - lower -> lo w e r </w>
+### 3.1 Padding、packing 与长文本
 
-        - 再合并 lo w -> low：
-            - Merge #4: lo w -> low
-            - low   -> low </w>
-            - lower -> low e r </w>
+- **动态 padding**：每个 batch 对齐到本批最长样本，通常比固定长度省显存。
+- **packing**：把多个短样本拼入长序列，提升 token 利用率；要正确处理样本边界和 loss mask。
+- **截断**：简单可靠，但可能丢掉任务关键部分；应记录被截断比例。
+- **滑动窗口与 stride**：长文本切窗时保留相邻窗口重叠。它适用于长文训练或 perplexity 评估，但会带来重复 token；使用 packing 时往往不需要。
 
-        - 你会看到规律：BPE 很自然地学到高频后缀 est、高频词干 low。这就是它“自动发现子词结构”的来源（虽然它并不懂语言学，只是在做压缩）。
+训练成本更接近“每次更新处理了多少 token”，而不是样本条数：
 
-3. 推理/编码阶段：怎么把新文本切成 token？
-    - BPE 训练产物通常是两样：
-        - vocab：token -> id（以及反向 id -> token）
-        - merges（ranked）：每条 merge 规则及其优先级（顺序）
-    - 编码步骤（以一个 word 为例）：
-        - 初始把 word 切成最小符号（字符或字节）+ </w>（或用其他边界符）
-        - 在当前符号序列里，找到所有相邻对
-        - 按 merge rank（越早学到 rank 越小，优先级越高）不断合并，直到不能再合并
-    - 关键点：不是“每轮找频率最高的对”，那是训练时做的。推理时你只按训练时学到的 merge 顺序做替换（按 rank）。
-    - 实现上常见两种：
-        - 简单版：循环扫描、按 rank 找能合并的最优对（慢但好写）
-        - 工业版：用优先队列（heap）维护可合并对的最小 rank，局部更新（快）
+```text
+tokens_per_micro_step ≈ micro_batch_size × sequence_length
+effective_batch ≈ micro_batch_size × gradient_accumulation × data_parallel_world_size
+```
 
-4. 为什么 GPT 系喜欢 Byte-level BPE？
-    - Classic BPE 仍可能遇到 UNK（比如遇到奇怪字符、emoji、罕见符号等），除非你的初始符号集覆盖所有 Unicode。
-    - Byte-level BPE 的骚操作：先把文本变成 UTF-8 bytes（0–255），把每个 byte 当成初始符号，然后跑 BPE merge。
-    - 好处：理论上对任意文本都可编码（几乎不需要 UNK），多语言/符号更鲁棒，词表大小可控（初始 256 个符号 + merges）
-    - GPT-2 还做了一步“byte→unicode 映射”（把 0–255 映射到可打印字符集合），方便把 byte token 存成字符串形式（便于 merges.txt / vocab.json）。
+先确定任务所需序列长度，再在硬件上找到不溢出的 micro batch，最后通过梯度累积调整有效 batch。有效 batch、学习率和序列长度应作为一组实验变量记录，而非孤立调参。
 
-5. BPE 和 WordPiece / Unigram 的差别（你学 BPE 后必须能区分）
-    - BPE：合并规则由“最频繁相邻对”贪心产生（压缩视角）
-    - WordPiece（BERT 常见）：目标更像“让训练数据的似然更大”（但工程上也很像 BPE 的合并过程），并且常用 ## 表示“非词首子词”
-    - Unigram（SentencePiece 常见）：先给一个很大的候选子词集合，然后“删掉最不重要的”，用概率模型选最优切分（更像统计建模）
-    - BPE 是“拼积木：越常一起出现就粘起来”；Unigram 是“砍树枝：保留最有用的子词”。
+## 4. Embedding：ID 如何成为向量
 
-6. 工程细节：你真做 tokenizer 会遇到的坑
-    1. tie-break（并列频次怎么选）
-        - 同频次的 pair 很多，选择策略会影响词表细节。
-        - 工业实现会固定规则保证可复现，否则训练一次词表一次样。
+Token embedding 是一个可训练矩阵 E，形状为 `vocab_size × hidden_size`。输入 token ID `t` 时，模型取出第 `t` 行向量 `E[t]`。这只是 Transformer 的输入表示，不等同于 RAG 使用的句向量。
 
-    2. 边界标记/空格策略
-        - classic BPE 用 </w> 防止跨词串联
-        - GPT 系更常把“空格”编码进 token（比如 token 里带前导空格），这样模型更容易学到“词边界”
+常见表示包括：
 
-    3. 预分词决定上限
-        - 预分词切得越碎，BPE 只能在碎片内合并；切得越粗，BPE 搜索空间大但训练更慢，也可能把奇怪片段合成一个 token。
+- **token embedding**：把 token ID 映射为向量；
+- **位置信息**：绝对位置 embedding 或 RoPE 等相对/旋转位置编码，使模型感知顺序；
+- **输出投影（LM head）**：把隐藏状态映射回词表大小以预测下一个 token。许多模型与输入 embedding 共享权重（weight tying）。
 
-    4. 版本一致性是铁律
-        - Tokenizer 的 vocab + merges + normalization + pretokenization + special tokens 任何一项变了，token id 序列就变，模型就像突然“换了字典”。
+检索 embedding 则将整段文本编码为一个固定长度向量，通常由专门优化的 embedding 模型产生。文档与查询必须使用同一模型、同一指令前缀和归一化策略；余弦相似度、点积或欧氏距离的意义也取决于这些约定。详情见 [[06-AI应用后端/机器学习/RAG#4. 召回（Retrieval）|RAG 召回]]。
 
-### 1.2.1 Byte-level BPE 的完整流程（regex 预分词 → bytes 映射 → merges 应用 → decode）以及为什么 GPT 的 token 里会出现奇怪字符（Ġ、Ċ 之类）
+## 5. Transformer：模型怎样利用上下文
 
-1. 总览：Byte-level BPE 的“数据形态变化”。一段文本 "Hello world\n" 进入 tokenizer，大概经历：
-    1. 文本字符串（Unicode）
-    2. regex 预分词得到若干片段（仍是字符串）
-    3. 每个片段转 UTF-8 bytes（0–255 的字节序列）
-    4. bytes→unicode 映射（把每个 byte 映射成一个“安全可打印”的 Unicode 字符）
-    5. 在这些“伪字符”上跑 BPE merges（合并得到子词 token）
-    6. token → id（查 vocab）
-    7. 解码反向：id → token → 伪字符 → bytes → UTF-8 → 原文本
+一个 Transformer block 通常由多头注意力、前馈网络、残差连接和归一化组成，多层堆叠后形成更抽象的表示。
 
-关键：Byte-level BPE 的“最小原子”不是字符、也不是词，而是 byte。所以它几乎不需要 UNK（任何文本都能变成 bytes）。
+### 5.1 Self-attention
 
-2. Regex 预分词：先切片，再在片内做 BPE
-    1. 典型 regex 长什么样（GPT-2 家族）
-        - 经典 GPT-2 的预分词 regex（核心思想）是把文本分成几类片段：
-            - 英文字母序列（可带一个前导空格）
-            - 数字序列（可带一个前导空格）
-            - 标点/符号序列（可带一个前导空格）
-            - 纯空白（空格、换行等）
-        - 你会看到一种很“有意为之”的设计：很多规则前面写了一个可选空格  ?。这导致切出来的片段常常是 " world"（前面带空格），而不是 " " 和 "world" 分开。
-        - 因为英语里空格极高频。把“空格 + 单词”作为整体更容易被合并成一个 token（更短、更省算力）。这也是你经常见到 token 里有“空格痕迹”的根源之一。
+每个 token 的表示会投影为 Query（Q）、Key（K）和 Value（V）。注意力使用 Q 与所有 K 的相似度计算权重，再对 V 加权求和：
 
-3. UTF-8 bytes：把 Unicode 文本变成 0–255 的字节流
-- 对每个预分词片段 piece：
-    - 用 UTF-8 编码：piece.encode("utf-8")
-    - 得到字节序列，比如：
-        - " "（空格） → byte 32
-        - "\n"（换行） → byte 10
-        - "你" → UTF-8 bytes 可能是 3 个 byte（中文通常 3 个）
-    - 这一步就是 Byte-level 的“底座”：再怪的字符也能落到 bytes 上。
+```text
+Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) V
+```
 
-4. bytes → unicode 映射：Ġ、Ċ 等怪字符从哪来？
-    1. 为什么要做这个映射？
-        - BPE 合并规则通常用“字符串”来表达和存储（vocab.json、merges.txt 这种）。
-        - 但 raw bytes 里有大量 不可打印字符 / 控制字符 / 空白字符（比如 0、10、13、32），直接放进文本文件、JSON、正则处理会非常痛苦，甚至会被编辑器/解析器吞掉或改写。
-        - 所以 GPT-2 家族做了个聪明但有点邪门的工程技巧：把每个 byte (0–255) 映射成一个 唯一的、可打印的 Unicode 字符，保证：1 byte ↔ 1 unicode 字符（可逆），这些字符尽量不包含真正的空白/控制符，存文件安全
+因果语言模型使用 causal mask：当前位置只能关注自己及之前的 token，不能看到未来 token。多头注意力让模型并行学习不同类型的关联，例如指代、语法、局部搭配或远距离依赖。
 
-    2. Ġ 和 Ċ 的含义（最常见的两个）
-        - 在这套映射里，经常会出现：
-            - Ġ（U+0120）：常用来表示 空格 byte 32
-            - Ċ（U+010A）：常用来表示 换行 byte 10
+注意力机制不意味着模型能无损“读取”整段上下文。上下文越长，成本、位置泛化、干扰信息和关键证据被忽略的风险都需要通过实际任务验证。
 
-        - 所以你看到的不是“模型学会了爱尔兰语字母”，而是：
-            - “这个 token 里包含一个空格/换行 byte”
-            - 只是 tokenizer 用一个“可打印符号”把它显示出来了
+### 5.2 前馈网络、残差与归一化
 
-    3. 为什么不同模型的“怪字符”不完全一样？
-        - 映射表是实现细节，不同 tokenizer 可能：
-            - 用同一套 GPT-2 映射（很多会这样）
-            - 或者用别的可逆表示
-            - 或者干脆不把 bytes 映射成 unicode，而是内部直接操作 bytes（例如一些更现代的实现）
-        - 但你在调试里看到 Ġ/Ċ，基本都指向“byte-level + 可打印映射”这条路线。
+注意力负责在 token 之间交换信息；前馈网络（MLP/FFN）则在每个位置独立进行非线性特征变换。残差连接为深层网络保留信息和梯度通路，LayerNorm/RMSNorm 有助于稳定训练。架构细节会因模型而异，但这四个组件构成理解 Transformer 的基本地图。
 
-5. BPE merges 应用：在“伪字符序列”上合并
-    1. 把一个片段转成“伪字符”后，例如：
-        - 片段 " world"
-        - 前导空格 byte 32 → Ġ
-        - "world" 的各字母 bytes → 映射成对应字符
-        - 得到类似 "Ġworld"（这是概念表示）
-        - 然后在这个“字符序列”上应用 merges：
-            - ("Ġ", "w") -> "Ġw"
-            - ("Ġw", "o") -> "Ġwo"
-            - ("Ġwo", "r") -> "Ġwor"
-            - ……
-        - 真实 merges 会更复杂，但思路一样：相邻对合并。
+## 6. 训练、微调与推理
 
-    2. 推理时怎么合并（关键点）
-        - 推理/编码阶段不会再统计频率了，只会：
-            - 从当前符号序列里找“可合并的相邻对”
-            - 按 merges 的 rank（越早学到 rank 越小，优先级越高）不断合并
-            - 直到没有任何相邻对出现在 merges 表里
-        - 最后得到若干子词 token（每个 token 是一个字符串，例如 "Ġworld"、"hello"、"Ċ" 或更长组合）。
+### 6.1 预训练与微调
 
-    3. 为什么常见 token 形态是：Ġword
-        - 因为预分词把空格往后粘、映射把空格显示成 Ġ、BPE 又很乐意把高频片段“Ġ + word”整体合并。
-        - 于是你调试 token 时，第二个词开始经常长这样：
-            - Hello → "Hello"
-            - world → "Ġworld"
+预训练通常以海量文本的 next-token prediction 为目标；微调则在较小、任务相关的数据上继续优化。SFT 用于学习指令遵循和任务格式；LoRA 等参数高效微调方法通过训练少量附加参数降低资源需求。
 
-    4. token → id：查 vocab
-        - 把 BPE 合并出来的“token 字符串”，还要用 vocab 映射成整数 id：
-            - id = vocab[token]
-        - 到这里就得到模型输入的 input_ids 了。
+微调并非知识库更新的默认答案：它难以精确删除或引用单条事实，且可能过拟合小数据。开始训练前应先有清晰任务、数据划分、基线、独立测试集和回滚方案。
 
-6. Decode：把 id 还原回原始文本（完全可逆）
-    1. 反向流程：
-        - ids -> tokens（用 id_to_token 查回字符串）
-        - 把每个 token 字符串拆成“伪字符”
-        - 用 unicode→byte 的逆映射把每个伪字符还原成 byte（0–255）
-        - 把 bytes 拼接成一个 byte 数组
-        - 用 UTF-8 解码回字符串（必要时处理错误策略）
-    
-## 1.3 dataset
+### 6.2 解码与采样
 
-1. LLM 里的 dataset 到底长什么样
-- 你从原始数据（文本/指令/对话/QA）走到训练输入，通常要经历 3 层形态：
-    - 原始样本层（raw examples）
-        - 纯文本：{"text": "…"}
-        - 指令微调：{"instruction": "...", "input": "...", "output": "..."}
-        - 对话：{"messages": [{"role":"user","content":"..."}, ...]}
-    - token 化后的样本层（tokenized examples）
-        - 典型字段：
-            - input_ids: [int, int, ...]
-            - attention_mask: [0/1, ...]
-            - (可选) token_type_ids（多数 decoder-only 不用）
-            - labels: 训练目标（语言模型一般是把 input_ids 右移一位；指令微调会把提示部分 mask 掉）
-    - batch 层（collate 后）
-        - 把一批样本对齐成张量：
-            - padding 到同一长度（或用 packing 把多个短样本塞进一个长序列）
-            - 生成 batch 的 input_ids/attention_mask/labels
+模型每一步输出词表概率分布。贪心解码选择最高概率 token，稳定但可能保守；temperature 调整分布尖锐程度；top-p 或 top-k 只在部分候选中采样以控制随机性。对结构化输出、工具参数和高风险结论，通常应降低随机性，并结合 schema 校验和确定性规则。
 
-2. batchsize：不要只盯“样本数”，要盯“tokens/step”
-    1. LLM 训练的成本主要跟 每一步的 token 数量 相关：
-        - tokens_per_step ≈ micro_batch_size × seq_len
-        - 真正影响优化的是 effective batch：
-        - effective_batch = micro_batch_size × gradient_accumulation_steps × data_parallel_world_size
-    2.  micro batch size（你显存能装下的那个）
-        - 显存最主要受这几个影响：
-            - 模型参数量
-            - 序列长度 seq_len（注意 Transformer 注意力是 O(seq_len^2)，长度上去显存/算力都爆）
-            - batch size
-        - 实操做法（最稳的工程习惯）：
-            - 先定 seq_len（比如 1024/2048/4096）
-            - 用你的硬件试到 不 OOM 的最大 micro_batch_size
-            - 再用 梯度累积 把 effective batch 拉到你想要的规模
-    3. 目标 tokens/step 的经验范围（给你个“落地标尺”）
-        - 小模型/小数据微调：每步 8k ~ 128k tokens 都常见
-        - 更大规模训练：会更大（但那是集群玩法了）
-        - 你在单机/单卡做微调，常见组合：
-            - seq_len=2048, micro_batch=2 → 4096 tokens/step
-            - grad_accum=16 → 65536 tokens/update（这就已经很像样了）
+### 6.3 常见工程误区
 
-    4. 学习率和 batchsize 是绑定的
-        - effective batch 变大，通常学习率也能适当放大（但别机械线性放大，微调更敏感）。    
-effective batch 变大，通常学习率也能适当放大（但别机械线性放大，微调更敏感）。
-        - 如果你只是想“先跑通”，优先保证 不 OOM + loss 正常下降，再调 batch/lr。
+1. 将字符数当 token 数估算成本或上下文。
+2. 更换 tokenizer、词表或 chat template，却继续使用旧模型权重或旧训练数据。
+3. 将 padding token 计入 loss，或错误 mask 掉应学习的 assistant 回答。
+4. 只因训练 loss 下降就认为模型变好；必须看独立评测和业务指标。
+5. 把模型输出当作事实或执行授权；应使用 RAG、工具、校验与权限边界。
 
-3. stride：它是“滑动窗口重叠”，主要用于长文本切块
-    - stride 的语义：当你把一段长文本切成固定长度 max_length 的块时，相邻块之间重叠多少 token。
-        - 步长 step = max_length - stride
-        - stride 越大 → 重叠越多 → 上下文连续性更好，但训练数据重复更多、训练更慢
-        - stride 越小 → 重叠少 → 训练更快，但块与块之间上下文断裂更明显
-    - 
-4. stride 最常见的两个场景
-    - 场景 A：评估 perplexity（非常常见）
-        - 为了不浪费尾部 token，且保证上下文连贯，会用 sliding window：
-            - 例如 max_length=2048, stride=512
-            - 让每个窗口都带一部分前文上下文
-    - 场景 B：生成 tokenized chunks（不做 packing 时）
-        - 你把长文章切成训练块，希望模型既看到全局内容，又别断得太狠：
-            - max_length=2048
-            - stride=128~512（大约是 5%~25% overlap，比较常见）
-    - 训练时 stride 一定需要吗？
-        - 不一定。现在很多训练会用 packing（样本拼接）：
-            - 把多个短样本拼成一个长序列，几乎不需要 stride
-            - 长文章如果本身就超长，要切块时 stride 才更有意义
+## 7. 学习与排障顺序
 
-5. 重要参数清单（你调参时最常碰到的）
-    - Tokenizer / 切块相关
-        - max_length / model_max_length：单条样本最大长度（决定显存/算力上限）
-        - truncation=True：超长就截断（训练时常用）
-        - padding：
-            - False：不 pad，交给 collator 动态 pad（推荐）
-            - "max_length"：固定 pad 到 max_length（吞显存但形状稳定）
-        - return_overflowing_tokens=True：让 tokenizer 把长文本切成多个窗口（滑窗）
-        - stride：配合 overflowing 使用的重叠长度
-        - pad_to_multiple_of=8/16：对齐到 Tensor Core 友好形状（吞吐常能涨）
-    - HF Datasets 处理相关
-        - dataset.map(batched=True, batch_size=...)：批处理 tokenization，快很多
-        - remove_columns=[...]：删掉原始列，节省内存/IO
-        - num_proc：多进程 map（CPU 强时很好用）
-        - streaming=True：超大数据不落盘，边读边训（IterableDataset）
-        - shuffle(seed, buffer_size=...)：streaming 时是“缓冲区洗牌”，不是全量洗牌
-    - PyTorch DataLoader 相关
-        - batch_size：你给的“样本数”，但真正消耗看 seq_len
-        - drop_last=True：避免最后一个 batch 太小导致形状波动
-        - num_workers：CPU 并行取数据（一般 2~8 起步，视 CPU/磁盘）
-        - pin_memory=True：GPU 训练常开
-        - prefetch_factor：worker 预取（吞吐不稳时可以调）
-    - collator / labels 相关
-        - causal LM（decoder-only）：
-            - labels 往往就是 input_ids（内部 loss 会 shift）
-            - padding 部分要置 -100（忽略 loss）
-        - 指令微调（SFT）：
-            - prompt 部分通常也置 -100，只让模型在 answer 部分算 loss
-            - 你要非常确定“哪些 token 该学、哪些不该学”
-    - 两段最常用的代码模板（带 stride）
-        - 长文本滑窗切块（stride 生效）
-            - 适合：一篇文章很长，你要切成多个训练窗口。
-            - ```python
-                def tokenize_sliding(examples):
-                    out = tokenizer(
-                        examples["text"],
-                        max_length=2048,
-                        truncation=True,
-                        return_overflowing_tokens=True,
-                        stride=256,                 # 重叠 256
-                        padding=False,
-                    )
-                    # out 会产生多个窗口：input_ids 是“展开后的多条样本”
-                    return out
-            ``` 
-            - tokenized = raw_ds.map(tokenize_sliding, batched=True, remove_columns=raw_ds.column_names)
-        - 经典 CLM chunk（不重叠，更偏 packing 前的准备）
-            - ```python
-                def tokenize(examples):
-                    return tokenizer(examples["text"], truncation=False)
-                def group_texts(examples, block_size=2048):
-                    # 把一批样本拼接再切块
-                    concat = sum(examples["input_ids"], [])
-                    total = (len(concat) // block_size) * block_size
-                    concat = concat[:total]
-                    return {"input_ids": [concat[i:i+block_size] for i in range(0, total, block_size)]}
-            ```
-        - 一套“不会错”的 batchsize + stride 选择顺序
-            - 先定 seq_len（你的模型上下文、任务需要、显存承受范围）
-            - 找到最大 micro_batch_size（跑一两个 step，确保不 OOM）
-            - 用 grad_accum 拉到你想要的 tokens/update
-            - stride：
-                - 训练如果用 packing/拼接：stride 通常不重要或 0
-                - 长文切块/评估 ppl：优先 128~512，别太大避免重复过多
+遇到效果问题，先检查数据格式、对话模板、token 截断和 labels mask，再检查评测集是否泄漏或覆盖不足，最后才调整模型、学习率或 LoRA 配置。训练过程至少记录数据版本、tokenizer、模型版本、超参数、随机种子、指标、成本和代表性失败样本。
 
-## 1.4 embdding(向量)
-
-1. Embedding 的本质：一张可训练的“查表矩阵”,给定词表大小 V、隐藏维度 d_model：
-    - 你有一个矩阵 E ∈ R^(V × d_model)
-	- 输入 token id：t
-	- 输出向量：x = E[t]（就是查第 t 行）
-    - 这一步非常快，和“按 id 取数组”一样。
-
-2. LLM 里常见的几类 embedding（别把它只当“词向量”）
-    1. Token Embedding（词表嵌入）:最基础那张表：input_ids -> vectors。
-    2. Position Embedding（位置嵌入）
-        - Transformer 不像 RNN 天生有顺序感，需要额外告诉它第几个 token：
-            - 绝对位置：pos_id -> p，然后 x = token_emb + pos_emb
-            - 相对位置 / 旋转位置（RoPE）：不加法，而是把位置信息“揉进注意力计算里”（现在更常见）
-        - 你平时看到的 “max_position_embeddings / rope_theta / rotary_dim” 就在这条线里。
-    3. Segment / Role Embedding（可选）
-        - BERT 时代的 token_type_ids（句子 A/B），或对话里不同角色（system/user/assistant）也可以用类似思想编码。
-    4. Output Embedding / LM Head（输出层）
-        - 语言模型最后要预测下一个 token 的概率：
-            - 有一个矩阵 W ∈ R^(d_model × V) 把隐藏态投影回词表大小
-            - 很多模型会做 weight tying：让 W = E^T（输入 embedding 和输出投影共享权重）
-            - 好处：参数更少、常常更稳
-
-3. Embedding 训练时到底学到什么（从“统计共现”到“可推理表征”）
-    - 在自回归 LM（预测下一个 token）里，embedding 会被优化成：
-        - 能让模型更容易预测下一个 token
-        - 所以它会编码：词性、语义、常见搭配、领域偏好、甚至格式/标点习惯
-    - 经典现象：
-        - “king - man + woman ≈ queen” 这种线性关系是 embedding 空间里常出现的结构（不是魔法，是统计结构+线性层偏好带来的几何结果）。
-        - 但在现代 LLM 里，语义并不只在 embedding 层，更大量的“抽象能力”在中间层的表示里。
-
-4. Embedding 在检索（RAG）里的用法：把“整段文本”变成一个向量
-    - 你平时做向量检索用的 embedding，通常不是 “token embedding”，而是 sentence/document embedding（把一句话/一段话压成一个向量）。
-    1. 怎么从 token 级变成句子级？常见池化（pooling）方式：
-	    - [CLS] 向量（BERT 系常见）
-        - Mean pooling：对所有 token 向量取平均（很常用）
-	    - Last token：取最后一个 token（某些 decoder-only embedding 模型用）
-        - 加权 pooling：按 attention 权重或 TF-IDF 权重加权
-        - 然后得到一个固定维度向量 v ∈ R^d，存进向量库。
-
-    2. 相似度怎么比？
-        - 余弦相似度（cosine）：最常见
-	    - 点积（dot product）：如果向量做过归一化，点积=余弦
-	    - 欧式距离：也能用，但检索里余弦/点积更主流
-
-5. 你做 RAG 必须知道的 embedding “坑位”
-	1.	同一个 embedding 模型 + 同一个归一化策略。文档库和查询必须一致，否则相似度会失真。
-	2.	维度越大不一定越好。大维度更吃存储和检索（HNSW/IVF 都更贵），收益递减明显。很多模型 768/1024/1536 就够用。
-	3.	领域适配很重要。医疗规则/医保条文这种文本，用通用 embedding 能用，但召回可能不够“贴领域”，常见做法：
-        - 选更强的 embedding 模型（偏检索优化的）
-        - 或做领域继续训练 / 对比学习微调
-	4.	chunk 切法比你想的更影响 embedding。chunk 太长：语义混杂；太短：信息不足。通常会配合重叠（overlap/stride）和结构化切分（按标题/条款/编号）。
-
-6. Embedding 和你已经学的 tokenization 的关系（上游地基）
-	- tokenization 决定：文本会被拆成什么 token id
-	- embedding 决定：每个 id 在向量空间是什么坐标
-	- 所以 tokenizer 换了、词表换了，embedding 表也必须一起换（否则 id 对不上）
-
-# 2. 编码注意力机制
+对于 AI 应用工程，更完整的学习路线见 [[06-AI应用后端/机器学习/从 Agent 到机器学习：学习路径|从 Agent 到机器学习：学习路径]]。
