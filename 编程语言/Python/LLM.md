@@ -1,6 +1,8 @@
-# LLM
+# LLM 开发中的 Python 基础
 
-## Python 类型标注：TypedDict 和 Literal
+这篇笔记聚焦 LLM / LangGraph 开发中最常见的 Python 语法与运行方式。阅读时可按“状态建模 → 数据处理 → 异步 I/O → 运行调试 → 小型爬虫实战”的顺序学习。
+
+## 1. 状态建模：`TypedDict` 与 `Literal`
 
 ### TypedDict
 
@@ -106,13 +108,13 @@ class EmailAgentState(TypedDict):
     messages: list[str] | None
 ```
 
-### 最短总结
+### 小结
 
 - `TypedDict`：定义字典结构，说明有哪些 key，以及 value 分别是什么类型。
 - `Literal`：限制变量或字段只能取固定值之一。
 - 在 LangGraph 中，`TypedDict` 常用于定义 `StateGraph` 的状态，`Literal` 常用于定义路由、分类、条件分支的可选结果。
 
-## Python 常见遍历方式：列表、字典与 RAG 文档块
+## 2. 数据处理：列表、字典与 RAG 文档块的遍历
 
 遍历前先确认数据的形状。`for` 每次从可迭代对象中取出一个元素；变量应与“单个元素”的形状匹配。
 
@@ -201,6 +203,50 @@ for key, value in documents:
 
 这里 `documents` 的每个元素是一个字典；直接解包字典时会尝试把它的 **key** 解包给 `key` 和 `value`，而不是得到键值对。只有遍历单个字典的 `.items()` 时，`for key, value in ...` 才是正确写法。
 
+### 从文档列表提取字段：列表推导式与批处理
+
+当循环的目的只是“从每个元素取一个值，并组成一个新列表”时，列表推导式比先创建空列表、再不断 `append()` 更紧凑：
+
+```python
+raw_documents = [
+    {"source_url": "https://docs.example.com/a.md", "content": "..."},
+    {"source_url": "https://docs.example.com/b.md", "content": "..."},
+]
+
+source_urls = [document["source_url"] for document in raw_documents]
+```
+
+它等价于：
+
+```python
+source_urls = []
+for document in raw_documents:
+    source_urls.append(document["source_url"])
+```
+
+在 RAG 增量覆盖更新中，先提取本次文档的所有来源，再交给 collection 层做一次批量删除：
+
+```python
+source_urls = [document["source_url"] for document in raw_documents]
+collection.delete_by_sources(source_urls)
+```
+
+这里不应在循环内逐条调用 `delete_by_sources()`。列表推导式只负责准备数据；一次批量调用可以减少与 Milvus 的网络往返，也能让“删除旧 Chunk，再写入新 Chunk”的边界更清晰。
+
+推导式适合**生成集合**，不适合执行写数据库、发请求、打印日志等副作用操作。后者应使用普通 `for`，让每一步处理和异常位置都明确可见。
+
+### 遍历对象列表：字段访问使用 `.`
+
+RAG 代码中不只有 `list[dict[...]]`，也常有 `list[ChunkData]` 这类对象列表。对象字段通过点号访问，而不是下标访问：
+
+```python
+for chunk in chunks:
+    print(chunk.page_content)
+    print(chunk.chunk_metadata.source_url)
+```
+
+`ChunkData` 是 dataclass 对象，所以应写 `chunk.page_content`；字典才写 `document["content"]`。遇到遍历代码时，先看单个元素是 `dict` 还是对象，再决定使用 `[]` 还是 `.`。
+
 ### 同时遍历多组对应数据：`zip()`
 
 当多个列表中相同索引的数据构成一条记录时，用 `zip()` 配对。例如将文本、向量和来源 URL 组合后写入 Milvus：
@@ -223,25 +269,35 @@ for text, vector, source in zip(texts, vectors, sources, strict=True):
 | `list[T]` | `for item in items` | 逐个处理列表元素 |
 | `list[T]` 且需要序号 | `for i, item in enumerate(items)` | 打印进度、记录 chunk 序号 |
 | `dict[K, V]` 的 key 与 value | `for key, value in data.items()` | 读取配置、遍历文档字段 |
-| `list[dict[...]]` | `for item in items: item["key"]` | 处理多篇文档或多个 chunk |
+| `list[dict[...]]` | `for item in items: item["key"]` | 处理多篇原始文档 |
+| `list[对象]` | `for item in items: item.field` | 处理 `ChunkData` 等文档块对象 |
+| 从每项提取一个字段 | `[item["key"] for item in items]` | 收集 source URL、正文或 metadata |
 | 多个等长序列 | `for a, b in zip(a_list, b_list, strict=True)` | 组合 text、embedding、source |
 
-### 最短总结
+### 小结
 
 - 先判断循环对象的“单个元素”是什么，再决定循环变量的写法。
 - 列表直接遍历元素；字典直接遍历 key；字典的 `.items()` 才会产生 `(key, value)`。
 - `list[dict[str, str]]` 要先遍历外层列表，再读取内层字典字段。
+- 字典字段使用 `item["key"]`，对象字段使用 `item.field`；不要混用。
 - `enumerate()` 用于元素加序号；`zip()` 用于多组对应数据配对。
+- 只需从每项提取一个值时使用列表推导式；循环体含数据库、网络或日志副作用时使用普通 `for`。
 
-## Python 异步编程：在 LangGraph 深度研究工作流中的 `async` / `await`
+## 3. 异步 I/O：`async` / `await` 与 LangGraph 工作流
 
 在调用 LLM、搜索 API、MCP 服务等 I/O 密集型操作时，网络等待通常远长于 Python 的本地计算。`asyncio` 允许程序在等待某个请求返回期间，去推进其他已经就绪的任务；它解决的是**等待期间的并发执行**，不是让 CPU 计算自动变快或自动使用多个 CPU 核心。
 
-当前项目的 [`deep_researcher.py`](../../../../../LLM/open_deep_research/src/open_deep_research/deep_researcher.py) 将异步用于 LangGraph 节点、模型调用、子研究单元和工具调用：多个互不依赖的网络请求可以重叠等待，从而缩短一次研究任务的总耗时。
+以 LangGraph 深度研究工作流为例，异步通常用于图节点、模型调用、子研究单元和工具调用：多个互不依赖的网络请求可以重叠等待，从而缩短一次研究任务的总耗时。
+
+```text
+依赖上一步结果：使用串行 await
+相互独立的 I/O：创建多个协程 -> asyncio.gather() 并发等待
+外部调用边界：设置超时、并发上限、异常处理和降级路径
+```
 
 ### `async def`：声明协程函数
 
-`async def` 声明的是**协程函数**。调用它不会立即执行函数体，而是得到一个协程对象；协程需要由事件循环调度，并通过 `await`、`asyncio.run()` 或框架（本项目中是 LangGraph）实际执行。
+`async def` 声明的是**协程函数**。调用它不会立即执行函数体，而是得到一个协程对象；协程需要由事件循环调度，并通过 `await`、`asyncio.run()` 或框架（例如 LangGraph）实际执行。
 
 ```python
 async def researcher(state, config):
@@ -290,9 +346,9 @@ second = await model.ainvoke(second_messages)
 
 如果 `second` 不依赖 `first`，可以改用 `asyncio.gather()` 并发等待；如果它依赖 `first` 的结果，则必须保留串行 `await`。
 
-### 项目中为什么节点普遍使用异步调用
+### 工作流节点为什么普遍使用异步调用
 
-`deep_researcher.py` 中以下节点都声明为 `async def`：
+深度研究类工作流中，以下节点通常声明为 `async def`：
 
 - `clarify_with_user()`：调用模型判断是否需要追问用户；
 - `write_research_brief()`：调用模型生成结构化研究简报；
@@ -312,13 +368,13 @@ response = model.invoke(messages)
 response = await model.ainvoke(messages)
 ```
 
-选择哪一个取决于调用环境：在本项目的异步节点中应优先使用 `ainvoke()`，不要在其中改用可能阻塞事件循环的同步网络调用。
+选择哪一个取决于调用环境：在异步节点中应优先使用 `ainvoke()`，不要在其中改用可能阻塞事件循环的同步网络调用。
 
 ### `asyncio.gather()`：同时等待一组独立任务
 
 `asyncio.gather(*aws)` 接收多个 awaitable，并发调度它们，返回结果列表。结果顺序与传入任务的顺序一致，而不是与任务完成的先后顺序一致。
 
-项目中最关键的一处出现在 `supervisor_tools()`：主管模型一次可以发出多个 `ConductResearch` 调用，每个调用对应一个独立研究主题。
+典型场景是主管节点一次发出多个 `ConductResearch` 调用，每个调用对应一个独立研究主题。
 
 ```python
 research_tasks = [
@@ -337,7 +393,7 @@ tool_results = await asyncio.gather(*research_tasks)
 
 这不是“先完成一个研究员，再启动下一个”，而是创建多个子图调用后一起等待。随后代码通过 `zip(tool_results, allowed_conduct_research_calls)` 将每个结果关联回原始工具调用；依赖的正是 `gather()` 的结果顺序保证。
 
-并发不等于无限制并发。项目会先按 `max_concurrent_research_units` 截取任务：
+并发不等于无限制并发。通常会先按 `max_concurrent_research_units` 限制任务数量：
 
 ```python
 allowed_calls = conduct_research_calls[:configurable.max_concurrent_research_units]
@@ -345,7 +401,7 @@ allowed_calls = conduct_research_calls[:configurable.max_concurrent_research_uni
 
 这个上限用于控制 API 并发、成本和限流风险。超过上限的研究请求不会执行，而会收到对应的工具错误消息。修改并发策略时，应同时考虑供应商的速率限制、单次任务成本、下游 MCP 服务容量以及状态合并行为。
 
-`researcher_tools()` 也以相同方式并发执行同一轮模型提出的多个工具调用：
+工具执行节点也可以用相同方式，并发执行同一轮模型提出的多个独立工具调用：
 
 ```python
 tool_execution_tasks = [
@@ -359,7 +415,7 @@ observations = await asyncio.gather(*tool_execution_tasks)
 
 ### 异步中的错误处理：把单个工具失败转成观察结果
 
-`gather()` 默认会在任一任务抛出异常时把异常传播给等待它的调用方。项目通过 `execute_tool_safely()` 在每个工具调用的边界捕获异常：
+`gather()` 默认会在任一任务抛出异常时把异常传播给等待它的调用方。可通过 `execute_tool_safely()` 在每个工具调用的边界捕获异常：
 
 ```python
 async def execute_tool_safely(tool, args, config):
@@ -371,11 +427,11 @@ async def execute_tool_safely(tool, args, config):
 
 这样，一个搜索工具失败时，会生成可作为 `ToolMessage` 内容的错误文本；同一轮其他工具仍可完成。需要注意，这种做法把异常转换为了正常返回值，因此调用方必须能识别并合理处理错误文本；它不适合需要严格失败语义的事务型操作。
 
-主管并行运行整个研究子图时则在 `await asyncio.gather(...)` 外层捕获异常。这里的边界更高：子图执行异常会结束当前研究阶段并使用已经累积的笔记生成报告，而不是让整个图无控制地崩溃。
+主管并行运行整个研究子图时，则应在 `await asyncio.gather(...)` 外层捕获异常。这里的边界更高：子图执行异常时，可结束当前研究阶段并使用已经累积的笔记生成报告，而不是让整个图无控制地崩溃。
 
 ### `asyncio.wait_for()`：为单次等待设置超时
 
-超时是异步 I/O 的必要保护。项目在 `utils.py` 的网页摘要中使用：
+超时是异步 I/O 的必要保护。网页摘要等外部模型调用可使用：
 
 ```python
 summary = await asyncio.wait_for(
@@ -384,7 +440,7 @@ summary = await asyncio.wait_for(
 )
 ```
 
-如果摘要模型在 60 秒内没有完成，`wait_for()` 会取消该等待并抛出 `asyncio.TimeoutError`。项目捕获它后记录告警，并退回原始网页内容，避免一个慢请求拖住整轮研究。
+如果摘要模型在 60 秒内没有完成，`wait_for()` 会取消该等待并抛出 `asyncio.TimeoutError`。调用方可捕获它、记录告警，并退回原始网页内容，避免一个慢请求拖住整轮研究。
 
 ```python
 except asyncio.TimeoutError:
@@ -412,21 +468,21 @@ gather 并发：
 
 - 新增外部 I/O 时，在异步节点内优先使用库提供的异步接口；不要直接调用长时间阻塞的同步函数。
 - 只有在任务相互独立、且允许并发访问外部资源时，才放入 `asyncio.gather()`。
-- 为并发数量设置上限；本项目对应 `max_concurrent_research_units`，避免触发限流或失控扩大成本。
+- 为并发数量设置上限；例如 `max_concurrent_research_units`，避免触发限流或失控扩大成本。
 - 将结果和发起任务一一对应时，依赖 `gather()` 的输入/输出顺序，并保留原始调用 ID。
 - 在合适边界处理异常与超时：工具级失败可转成观察结果；工作流级失败应保留可用状态并选择明确的降级路径。
 - 不要在 `async def` 内调用 `asyncio.run()`；它会尝试创建嵌套事件循环并通常导致运行时错误。
 - 注意共享可变对象。比如 `compress_research()` 会对当前研究员消息列表追加压缩指令；并发分支之间不要共享并修改同一个列表或字典，除非状态 reducer 与同步策略明确支持这种行为。
 
-### 最短总结
+### 小结
 
 - `async def` 定义协程函数；调用后需要由事件循环执行。
 - `await` 等待单个异步结果，并在等待网络 I/O 时把执行权交给事件循环。
-- `asyncio.gather()` 用于并发等待多个独立任务；本项目用它并行子研究图和同轮工具调用。
-- `asyncio.wait_for()` 为单个等待增加超时保护；本项目网页摘要超时后回退为原文。
+- `asyncio.gather()` 用于并发等待多个独立任务；可用于并行子研究图和同轮工具调用。
+- `asyncio.wait_for()` 为单个等待增加超时保护；超时后应选择明确的降级策略。
 - 异步提高的是 I/O 等待期间的并发能力；并发数量、错误处理、超时和共享状态决定了它是否可靠。
 
-## Python 类方法：`@classmethod`
+## 4. 面向对象：`@classmethod` 与 `@staticmethod`
 
 `@classmethod` 是 Python 的装饰器，用来定义**类方法**。类方法绑定到“类”本身，而不是某一个实例对象。
 
@@ -567,7 +623,7 @@ class Config:
         return cls(...)
 ```
 
-### 最短总结
+### 小结
 
 - `@classmethod` 定义绑定到类的方法。
 - 类方法第一个参数通常写作 `cls`，表示当前类。
@@ -575,7 +631,7 @@ class Config:
 - 类方法常用于 `from_dict()`、`from_env()`、`from_runnable_config()` 这类替代构造函数。
 - 如果方法既不需要实例 `self`，也不需要类 `cls`，才考虑 `@staticmethod`。
 
-## Python 语法糖：f-string 的 `!s` 转换标记
+## 5. 字符串表达：f-string 的 `!s` 转换标记
 
 在 Python 的 f-string 中，`{变量!s}` 表示：先对变量调用 `str()`，再把结果插入字符串。
 
@@ -633,22 +689,24 @@ print(f"{name!a}")
 '张三'
 ```
 
-### 最短总结
+### 小结
 
 - `{e!s}` 是 f-string 的转换标记，可以看作一种语法糖。
 - 它等价于 `str(e)`。
 - `{e!s}` 更适合生成用户可读的错误提示。
 - `{e!r}` 更适合调试，因为它会保留更详细的对象表示。
 
-## Python 常见运行、测试、Debug 命令
+## 6. 运行、测试与调试速查
 
-下面这些命令适合在项目根目录执行，例如当前项目：
+下面的命令适合在项目根目录执行。路径、模块名和测试文件名应替换为自己的项目实际值：
 
 ```bash
-cd /Users/lejinbo/LLM/langgraph-LLM
+cd <项目根目录>
 ```
 
-### 1. 运行 Python 文件
+### 6.1 运行与交互验证
+
+#### 运行 Python 文件
 
 运行一个普通 Python 文件：
 
@@ -674,7 +732,7 @@ source .venv/bin/activate
 python src/langgraph_llm/email/nodes/read_classify.py
 ```
 
-### 2. 运行一小段临时代码
+#### 运行一小段临时代码
 
 不想新建文件时，可以用 `python -c`：
 
@@ -700,7 +758,7 @@ PY
 
 这种方式适合快速验证某个函数、类或导入路径。
 
-### 3. 进入 Python 交互环境
+#### 进入 Python 交互环境
 
 ```bash
 python
@@ -738,7 +796,9 @@ print(command.update)
 exit()
 ```
 
-### 4. 用 pytest 运行全部测试
+### 6.2 使用 pytest
+
+#### 运行全部测试
 
 运行整个测试目录：
 
@@ -752,7 +812,7 @@ pytest
 pytest tests
 ```
 
-### 5. 用 pytest 运行某个测试文件
+#### 运行某个测试文件
 
 ```bash
 pytest tests/test_email_agent.py
@@ -764,7 +824,7 @@ pytest tests/test_email_agent.py
 pytest -v tests/test_email_agent.py
 ```
 
-### 6. 用 pytest 运行单个测试方法
+#### 运行单个测试方法
 
 格式：
 
@@ -784,7 +844,7 @@ pytest tests/test_email_agent.py::test_search_documentation_routes_to_draft_resp
 pytest -v tests/test_email_agent.py::test_search_documentation_routes_to_draft_response
 ```
 
-### 7. 用 `-k` 按关键字筛选测试
+#### 用 `-k` 按关键字筛选测试
 
 运行名字中包含 `human_review` 的测试：
 
@@ -806,7 +866,7 @@ pytest tests/test_email_agent.py -k approved
 
 `-k` 适合不想输入完整测试函数名时使用。
 
-### 8. 让 pytest 遇到第一个失败就停止
+#### 遇到第一个失败就停止
 
 ```bash
 pytest -x
@@ -818,7 +878,7 @@ pytest -x
 pytest -x -v
 ```
 
-### 9. 显示 print 输出
+#### 显示 `print()` 输出
 
 pytest 默认会捕获 `print()` 输出。想直接显示，可以加 `-s`：
 
@@ -832,7 +892,7 @@ pytest -s tests/test_email_agent.py
 pytest -s tests/test_email_agent.py::test_send_reply_returns_empty_update
 ```
 
-### 10. 只运行上次失败的测试
+#### 只运行上次失败的测试
 
 ```bash
 pytest --lf
@@ -840,7 +900,9 @@ pytest --lf
 
 `--lf` 是 `--last-failed` 的缩写。适合修复失败测试时反复运行。
 
-### 11. 用 Python 内置 debugger：pdb
+### 6.3 使用断点调试
+
+#### Python 内置 debugger：pdb
 
 在代码里插入断点：
 
@@ -876,7 +938,7 @@ q        退出调试
 (Pdb) c
 ```
 
-### 12. 不修改源码，直接用 pytest 进入失败处调试
+#### pytest 在失败处进入调试
 
 如果测试失败时想自动进入调试：
 
@@ -890,7 +952,7 @@ pytest --pdb tests/test_email_agent.py
 pytest --pdb tests/test_email_agent.py::test_search_documentation_routes_to_draft_response
 ```
 
-### 13. VS Code 中 Debug 单个测试
+#### VS Code 中调试单个测试
 
 如果 VS Code 已经配置 pytest，测试函数上方通常会出现：
 
@@ -924,7 +986,7 @@ pytest
 tests
 ```
 
-### 14. 常见组合命令
+### 6.4 常见组合命令
 
 运行全部测试，详细输出：
 
@@ -962,7 +1024,7 @@ pytest --pdb tests/test_email_agent.py
 pytest --lf -v
 ```
 
-### 15. 最短总结
+### 小结
 
 - 运行文件：`python path/to/file.py`
 - 运行临时代码：`python -c "..."` 或 `python - <<'PY' ... PY`
@@ -974,7 +1036,7 @@ pytest --lf -v
 - 失败后调试：`pytest --pdb`
 - 代码中手动断点：`breakpoint()`
 
-## Python 语法：`crawl_langgraph.py` 中的写法
+## 7. 实战语法：以 `crawl_langgraph.py` 为例
 
 ### 类型标注
 
@@ -1035,228 +1097,3 @@ filename = f"{hashlib.sha256(url.encode()).hexdigest()[:16]}.md"
 - `.hexdigest()`：将哈希值转为十六进制字符串。
 - `[:16]`：取字符串前 16 个字符。
 - `f"...{表达式}..."`：f-string，将表达式值插入字符串。
-
-<!-- 以下为替换前的应用层说明，保留在源码历史中，不作为学习笔记正文。
-
-```python
-async def main() -> None:
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=30) as client:
-        index_response = await client.get(INDEX_URL)
-        index_response.raise_for_status()
-
-        urls = extract_markdown_urls(index_response.text)
-        semaphore = asyncio.Semaphore(3)
-        await asyncio.gather(
-            *(download_document(client, url, semaphore) for url in urls[:5])
-        )
-```
-
-### 大写模块常量：`INDEX_URL`、`OUTPUT_DIR`、`HEADERS`
-
-```python
-INDEX_URL = "https://docs.langchain.com/llms.txt"
-OUTPUT_DIR = Path("data/raw/langgraph")
-HEADERS = {"User-Agent": "langgraph-docs-rag-agent/0.1 (learning project)"}
-```
-
-Python 没有真正的“常量”关键字；模块顶层使用全大写变量名是约定，表示它们应被视为配置，不应在运行中随意重新赋值。
-
-- `INDEX_URL`：索引文件地址；
-- `OUTPUT_DIR`：本地保存目录；
-- `HEADERS`：每个 HTTP 请求附带的请求头。`User-Agent` 用于说明请求来自哪个程序，便于服务端识别来源。
-
-### 类型标注：`str`、`list[str]` 与 `-> None`
-
-```python
-def extract_markdown_urls(index_text: str) -> list[str]:
-    ...
-
-async def download_document(
-    client: httpx.AsyncClient,
-    url: str,
-    semaphore: asyncio.Semaphore,
-) -> None:
-    ...
-```
-
-- `index_text: str`：参数应传入字符串；
-- `-> list[str]`：函数返回字符串列表；Python 3.9 起可直接写 `list[str]`，不必从 `typing` 导入 `List`；
-- `-> None`：函数只产生副作用（如下载、写文件），不返回业务结果；
-- `client: httpx.AsyncClient` 和 `semaphore: asyncio.Semaphore`：说明参数对象的预期类型，帮助 IDE 补全和静态检查。
-
-类型标注不会默认阻止运行时传错类型。例如传入整数不会在函数入口自动报错；它主要服务于阅读、IDE 和静态分析工具。
-
-### `response.text` 与 `index_text`：响应正文和它的业务名称
-
-```python
-index_response = await client.get(INDEX_URL)
-index_text = index_response.text
-```
-
-`index_response` 是 HTTP 响应对象，包含状态码、响应头和正文。`.text` 会把正文按文本解码为 `str`。
-
-`index_text` 只是给该字符串起的业务名称，表示“文档索引的文本”。索引内容通常类似：
-
-```md
-- [Overview](https://docs.langchain.com/oss/python/langgraph/overview.md)
-- [Persistence](https://docs.langchain.com/oss/python/langgraph/persistence.md)
-```
-
-后续把 `index_text` 交给正则函数，得到待下载的 URL 列表。
-
-### 原始字符串与正则：从 Markdown 链接中提取 URL
-
-```python
-urls = re.findall(
-    r"\((https://docs\.langchain\.com/[^)]+\.md)\)",
-    index_text,
-)
-```
-
-`re.findall(模式, 文本)` 会返回所有匹配结果。这里的模式只取 Markdown 链接中的 URL：
-
-| 片段 | 含义 |
-|---|---|
-| `r"..."` | 原始字符串。反斜杠按字面保留，正则通常更易读。 |
-| `\(`、`\)` | 匹配真正的圆括号 `(` 和 `)`。 |
-| `( ... )` | 捕获组；`findall()` 返回该组中的内容。 |
-| `docs\.langchain\.com` | `.` 在正则中表示“任意字符”，所以用 `\.` 匹配真正的小数点。 |
-| `[^)]+` | 匹配一个或多个非右括号字符，即 URL 的中间部分。 |
-| `\.md` | 只接受 Markdown 文档链接。 |
-
-对于：
-
-```md
-- [Persistence](https://docs.langchain.com/oss/python/langgraph/persistence.md)
-```
-
-结果为：
-
-```python
-["https://docs.langchain.com/oss/python/langgraph/persistence.md"]
-```
-
-### `set()` 去重与 `sorted()` 排序
-
-```python
-return sorted(set(urls))
-```
-
-`set(urls)` 会删除重复 URL，但集合本身不保证顺序；再用 `sorted()` 把 URL 排成稳定顺序。稳定顺序有助于调试：相同输入时，每次下载和打印的顺序一致。
-
-### `async with`：自动关闭异步资源
-
-```python
-async with httpx.AsyncClient(...) as client:
-    response = await client.get(url)
-```
-
-`async with` 是异步上下文管理器语法。进入代码块时创建并准备 `AsyncClient`；离开代码块时，即使内部抛出异常，也会自动关闭连接池，避免网络连接泄漏。
-
-它和普通文件操作的 `with open(...) as file:` 用途相同，只是资源的创建与释放可能需要异步等待，因此写成 `async with`。
-
-### `raise_for_status()`：不要把 HTTP 错误页当成文档保存
-
-```python
-response = await client.get(url)
-response.raise_for_status()
-```
-
-`get()` 成功拿到响应不等于请求成功：404、429、500 等响应仍然可能有正文。`raise_for_status()` 会在 HTTP 状态码表示失败时抛出异常，防止把错误页面误保存进知识库。
-
-### `asyncio.Semaphore`：限制实际下载并发数
-
-```python
-semaphore = asyncio.Semaphore(3)
-
-async def download_document(...):
-    async with semaphore:
-        response = await client.get(url)
-```
-
-信号量可理解为有限数量的“下载名额”。`Semaphore(3)` 表示最多三个任务可以同时进入 `async with semaphore:` 代码块；第四个任务会等待某个已完成下载释放名额。
-
-它既能提高下载速度，也能避免短时间向官方站点发出大量请求。它限制的是**同时进行的请求数**，不限制 URL 总数。
-
-### `asyncio.gather()`、生成器表达式与 `*` 解包
-
-```python
-await asyncio.gather(
-    *(download_document(client, url, semaphore) for url in urls[:5])
-)
-```
-
-`download_document(...)` 是 `async def` 函数，调用后会产生协程对象。括号中的：
-
-```python
-(download_document(client, url, semaphore) for url in urls[:5])
-```
-
-是**生成器表达式**：它为前五个 URL 逐个生成下载协程，而不先构建一个列表。
-
-`*` 是函数调用时的可迭代对象解包。它把生成器中的协程逐个传给 `gather()`，效果近似于：
-
-```python
-await asyncio.gather(
-    download_document(client, urls[0], semaphore),
-    download_document(client, urls[1], semaphore),
-    # ...
-)
-```
-
-`gather()` 会并发调度这些协程，并在**全部完成后**才继续执行下一行。没有 `*` 时，传入的是一个生成器对象本身，而不是多个可等待协程，通常会触发 `TypeError`。
-
-注意：`gather()` 会创建所有任务；真正能同时发出多少请求，由前面的 `Semaphore(3)` 决定。
-
-### 列表切片：`urls[:5]`
-
-```python
-for url in urls[:5]:
-    ...
-```
-
-`列表[开始:结束]` 是切片语法。省略开始位置表示从索引 `0` 开始，`5` 是结束位置且不包含在内，因此 `urls[:5]` 取前五个元素。
-
-练习爬虫时先使用前五篇文档，是为了验证下载、文件保存和解析逻辑；确认正常后改为 `urls`，再下载完整索引。
-
-### 哈希文件名、字节编码与切片
-
-```python
-filename = f"{hashlib.sha256(url.encode()).hexdigest()[:16]}.md"
-```
-
-这行将 URL 转成固定且不易冲突的文件名：
-
-1. `url.encode()`：把字符串编码为 `bytes`。哈希函数接收字节而非 `str`；默认通常是 UTF-8。
-2. `hashlib.sha256(...)`：计算 SHA-256 哈希对象。
-3. `.hexdigest()`：将哈希结果转成十六进制字符串。
-4. `[:16]`：取前 16 个字符，缩短文件名。
-5. f-string：插入哈希片段并追加 `.md` 后缀。
-
-这样不会依赖网页标题，也避免不同 URL 的标题相同导致文件覆盖。需要保留来源时，不能只依赖文件名；应像脚本一样把原 URL 写入文件元数据：
-
-```python
-content = f"<!-- source_url: {url} -->\n\n{response.text}"
-```
-
-### `Path.mkdir()` 与 `write_text()`：创建目录并写入 UTF-8 文本
-
-```python
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-(OUTPUT_DIR / filename).write_text(content, encoding="utf-8")
-```
-
-`pathlib.Path` 用 `/` 拼接路径，比字符串拼接更跨平台、更清晰。
-
-- `parents=True`：父目录不存在时一并创建；
-- `exist_ok=True`：目录已经存在时不报错；
-- `write_text(..., encoding="utf-8")`：以 UTF-8 写文本；明确编码可以避免不同系统默认编码差异导致乱码。
-
-### 最短总结
-
-- `response.text` 是 HTTP 响应正文；`index_text` 是对这段索引正文的业务命名。
-- `re.findall()` 用正则从索引文本取出 Markdown URL；`set()` 去重，`sorted()` 让顺序稳定。
-- `async with AsyncClient(...)` 会自动关闭异步 HTTP 客户端；`raise_for_status()` 防止保存错误页。
-- `Semaphore(3)` 限制同时下载的请求数；`gather(*...)` 并发等待全部下载协程。
-- `urls[:5]` 是先取前五条练习；`url.encode()`、SHA-256 和 `[:16]` 生成简短稳定的文件名。
--->

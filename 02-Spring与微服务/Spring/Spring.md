@@ -3,13 +3,16 @@
 > 本文负责回答“是什么、为什么、基本如何使用”，并给出容器主流程、常见配置和排障入口。建议按「循环依赖 → 生命周期/IOC → `ApplicationContext` 与 `refresh()` → DI/Scope/Profile → AOP/事务常见问题」学习。
 >
 > 遇到源码调用链、代理边界、早期引用一致性、事务传播与并发取舍时，进入 [[Spring深度解析|《Spring深度解析》]]；不要在两篇笔记中维护同一份深度推导。
+>
+> [!note] 版本前提
+> 本文以 Spring Framework 6 / Spring Boot 3 为主要语境。注解包名以 `jakarta.annotation` 为准；不同 Spring 版本的源码细节、默认容器实现和配置加载顺序可能存在差异。
 
 ## 目录
 
 1. [[#1. 循环依赖|循环依赖与三级缓存]]：[[#2. 三级缓存|缓存状态迁移]]、[[#4. @Lazy 的作用|`@Lazy`]]
-2. [[#6. Bean 生命周期|Bean 生命周期]]、[[#7. IoC 与 DI|IoC/DI]]、[[#8. ApplicationContext|容器]]、[[#9. refresh()|`refresh()`]]
-3. [[#10. Bean Scope|Scope]]、[[#11. Spring Profile 的原理|Profile]]、[[#12. 依赖注入原理|依赖解析]]、[[#13. Spring 注册 Bean 的整体详细源码解析|Bean 注册]]
-4. [[#14. Spring 的单例 Bean 是线程安全的吗|单例并发]]、[[#15. Spring事务失效|事务失效]]、[[#17. 为什么不推荐使用字段注入|注入风格]]、[[#18. Spring AOP 的工作原理|AOP]]、[[#19. Spring 事务原理（进阶入口）|事务调用链]]
+2. [[#5. Bean 生命周期|Bean 生命周期]]、[[#6. IoC 与 DI|IoC/DI]]、[[#7. ApplicationContext|容器]]、[[#8. refresh()|`refresh()`]]
+3. [[#9. Bean Scope|Scope]]、[[#10. Spring Profile 的原理|Profile]]、[[#11. 依赖注入原理|依赖解析]]、[[#12. Spring 注册 Bean 的整体详细源码解析|Bean 注册]]
+4. [[#13. Spring 的单例 Bean 是线程安全的吗|单例并发]]、[[#14. Spring事务失效|事务失效]]、[[#16. 为什么不推荐使用字段注入|注入风格]]、[[#17. Spring AOP 的工作原理|AOP]]、[[#18. Spring 事务原理（进阶入口）|事务调用链]]
 
 # 1. 循环依赖
 在Spring中，循环依赖是指两个或多个Bean相互依赖，形成一个闭环。Spring处理循环依赖的方式取决于Bean的作用域（如单例或原型）。
@@ -143,7 +146,7 @@ Spring的三级缓存主要包括：
 3. **创建Bean**：
    - 如果一级和二级缓存都没有，Spring 开始创建 Bean：
      - 在创建过程中，Spring会将当前Bean的`ObjectFactory`放入三级缓存`singletonFactories`中。
-     - 同时将该Bean的引用添加到`earlySingletonObjects`中。
+      - 此时不会立即放入二级缓存；只有其他 Bean 在循环依赖中请求该 Bean 的早期引用时，才调用 `ObjectFactory#getObject()`，并将结果转入 `earlySingletonObjects`。
 
 4. **依赖注入**：
    - 如果Bean的构造函数或属性需要其他Bean（可能是处于循环依赖中），Spring会先从`earlySingletonObjects`中获取早期引用。
@@ -391,7 +394,7 @@ public class B {
 
 `@Lazy` 的主要用途是延迟 Bean 初始化或依赖解析，从而控制启动成本和依赖获取时机。它可以缓解某些创建阶段的依赖冲突，但不应替代循环依赖的设计治理。
 
-# 6. Bean 生命周期
+# 5. Bean 生命周期
 Spring Bean 的生命周期是指从 Bean 实例化到销毁的完整过程，由 Spring 容器管理。了解其生命周期有助于开发者更好地控制对象的行为和资源管理。
 
 ### **Spring Bean 生命周期的完整流程**
@@ -533,7 +536,7 @@ Spring Bean 的生命周期是指从 Bean 实例化到销毁的完整过程，�
     - **答：**
         - `FactoryBean` 是一个特殊的 Bean，其 `getObject()` 方法返回的是创建的对象，而非 `FactoryBean` 本身。
 
-# 7. IoC 与 DI
+# 6. IoC 与 DI
 ### **IOC（Inversion of Control，控制反转）**
 
 #### **什么是 IOC？**
@@ -570,7 +573,7 @@ Spring Bean 的生命周期是指从 Bean 实例化到销毁的完整过程，�
 
 #### **什么是 DI？**
 
-- DI 是 IOC 的具体实现方法，指ta'm的是容器将对象的依赖（通常是其他对象）注入到该对象中，而不是让对象自己主动获取依赖。
+- DI 是 IOC 的具体实现方法，指的是容器将对象的依赖（通常是其他对象）注入到该对象中，而不是让对象自己主动获取依赖。
 - **目标：** 解耦对象之间的依赖关系，使代码更易于扩展、测试和维护。
 
 ---
@@ -628,7 +631,7 @@ Spring 提供以下三种依赖注入方式：
             private Engine engine;
             
             @Autowired
-		    private ObjectProvider<LoggerService> loggerProvider
+            private ObjectProvider<LoggerService> loggerProvider;
         }
         ```
         
@@ -694,7 +697,7 @@ Spring 提供以下三种依赖注入方式：
         - 字段注入：
             - 隐式注入，降低可测试性和可维护性。
 
-# 8. ApplicationContext
+# 7. ApplicationContext
 在 Spring 框架中，**`ApplicationContext`** 是 Spring IOC 容器的核心接口之一。它继承了 `BeanFactory`，并扩展了更多高级功能，如国际化支持、事件机制和 AOP 集成。
 
 以下是对 **`ApplicationContext`** 的详细讲解，包括其功能、实现原理和源码解析。
@@ -937,10 +940,10 @@ public Object doGetBean(String name) {
 ### **总结**
 
 1. **`ApplicationContext` 是 Spring 的核心容器接口，支持 Bean 管理、事件机制、资源加载等高级功能。**
-2. **Spring Boot 默认使用 `AnnotationConfigServletWebServerApplicationContext`，加载注解配置类并启动 Web 容器。**
+2. **Servlet Web 类型的 Spring Boot 应用通常使用 `AnnotationConfigServletWebServerApplicationContext`，加载注解配置类并启动 Web 容器；非 Web 与 Reactive Web 应用会使用不同的 `ApplicationContext` 实现。**
 3. **源码级别理解：重点关注 `refresh()` 和 `getBean()` 方法，掌握容器初始化与 Bean 创建的流程。**
 
-# 9. refresh()
+# 8. refresh()
 
 
 ---
@@ -1219,7 +1222,7 @@ public void refresh() throws BeansException, IllegalStateException {
 
 这段代码展示了 Spring 容器启动的核心流程。如果需要进一步探讨具体步骤（如 `@Autowired` 或 AOP 的实现），可以继续展开！
 
-# 10. Bean Scope
+# 9. Bean Scope
 在 Spring 框架中，**Bean 的范围（Scope）** 定义了 Spring 容器中 Bean 的生命周期和实例化规则。不同的范围控制 Bean 在容器中是否共享实例或根据请求创建新实例。
 
 ---
@@ -1229,7 +1232,7 @@ public void refresh() throws BeansException, IllegalStateException {
 | 范围            | 描述                                                        | 适用场景                     |
 | --------------- | ----------------------------------------------------------- | ---------------------------- |
 | **singleton**   | 默认范围，每个 Spring 容器中仅存在一个共享实例。            | 无状态 Bean，例如服务类。    |
-| **prototype**   | 每次请求都会创建一个新的实例。                              | 有状态 Bean，例如配置对象。  |
+| **prototype**   | 每次由容器解析时都会创建一个新的实例。                      | 短生命周期且携带调用状态的对象。 |
 | **request**     | 每个 HTTP 请求都会创建一个新的 Bean 实例，适用于 Web 应用。 | Web 应用中的请求范围数据。   |
 | **session**     | 每个 HTTP 会话共享一个 Bean 实例，适用于 Web 应用。         | Web 应用中的会话范围数据。   |
 | **application** | 整个 ServletContext 共享一个 Bean 实例，适用于 Web 应用。   | 应用级别的全局数据。         |
@@ -1326,7 +1329,7 @@ public class PrototypeBean {
 | ---------------- | ------------------------------------ | -------------------------------- |
 | **实例数量**     | 容器中始终只有一个共享实例。         | 每次请求都会创建一个新的实例。   |
 | **生命周期管理** | 由 Spring 容器管理，容器关闭时销毁。 | 不受容器管理，由调用者负责销毁。 |
-| **适用场景**     | 无状态 Bean（例如服务类）。          | 有状态 Bean（例如配置对象）。    |
+| **适用场景**     | 无状态 Bean（例如服务类）。          | 短生命周期且携带调用状态的对象。 |
 
 ---
 
@@ -1413,7 +1416,10 @@ public class PrototypeBean {
 
 #### **(2) 为什么 prototype Bean 不会被销毁？**
 
-- **答：** Spring 容器仅负责 `prototype` Bean 的创建，生命周期由调用者管理。
+- **答：** Spring 容器完成 `prototype` Bean 的初始化后不再追踪该实例，因此不会在容器关闭时自动调用其销毁回调；资源释放由调用者负责。
+
+> [!tip] Scope 选择原则
+> `singleton` 适合无状态组件；不要把请求数据、用户信息或可变业务状态保存在单例实例字段中。`prototype` 解决的是“每次解析得到新对象”，不等于“每个线程一个对象”；若将 prototype 直接注入 singleton，依赖只会在 singleton 创建时解析一次。需要按需创建时可注入 `ObjectProvider<T>`；Web 请求或会话状态优先考虑 `request`、`session` scope 并结合 scoped proxy。
 
 #### **(3) 如何解决作用域 Bean 注入单例 Bean 的问题？**
 
@@ -1430,7 +1436,7 @@ public class PrototypeBean {
 
 如果需要进一步探讨某个作用域或结合实际场景分析，可以继续讨论！
 
-# 11. Spring Profile 的原理
+# 10. Spring Profile 的原理
 
 Spring Profile 是 Spring 框架提供的一种功能，用于在不同的环境（如开发、测试、生产）中激活不同的配置。它通过逻辑分组和条件激活机制，让开发者能够灵活地管理环境相关的 Bean 定义和配置。
 
@@ -1665,7 +1671,7 @@ public class DevConfig {
     3. Spring Boot 通过 `application.properties` 文件和 `spring.profiles.active` 实现自动化环境配置。
 
 
-# 12. 依赖注入原理
+# 11. 依赖注入原理
 
 Spring 中的 **依赖注入（DI, Dependency Injection）** 是 IOC（控制反转）思想的具体实现方式，它将对象的依赖管理交给 Spring 容器，在运行时自动注入所需的依赖对象。依赖注入的实现基于反射、`BeanDefinition` 和 `BeanFactory` 的功能。
 
@@ -1932,7 +1938,7 @@ public PropertyValues postProcessProperties(PropertyValues pvs, Object bean, Str
     - 注解支持：`@Autowired`、`@Resource`、`@Inject`。
 
 
-# 13. Spring 注册 Bean 的整体详细源码解析
+# 12. Spring 注册 Bean 的整体详细源码解析
 
 Spring 的 Bean 注册是指将 Bean 定义信息（`BeanDefinition`）加载到 IOC 容器（`BeanFactory`）中，并根据需要创建实例的过程。以下是从启动到 Bean 注册的全流程和核心源码解析。
 
@@ -2218,7 +2224,7 @@ protected void populateBean(String beanName, RootBeanDefinition mbd, BeanWrapper
 如果需要更详细的某个阶段源码分析或实际应用场景的解读，可以继续探讨！
 
 
-# 14. Spring 的单例 Bean 是线程安全的吗
+# 13. Spring 的单例 Bean 是线程安全的吗
 
 ### **Spring 的单例 Bean 是线程安全的吗？**
 
@@ -2415,7 +2421,7 @@ public class ConcurrentService {
 
 
 
-# 15. Spring事务失效
+# 14. Spring事务失效
 在默认的 **Spring AOP 代理模式** 下，声明式事务依赖 AOP 代理；调用未经过代理、事务属性不匹配或事务管理器选择错误时，可能导致事务不符合预期。若使用 AspectJ 事务模式，织入边界不同，本节的“自调用绕过代理”结论不直接适用。
 ``` 
 @Configuration + @EnableTransactionManagement
@@ -2644,7 +2650,7 @@ logging.level.org.springframework.jdbc.datasource.DataSourceTransactionManager=D
 
 如果你在项目中遇到事务失效的问题，可以按照这些步骤进行排查和优化。
 
-# 16. Spring推断构造方法
+# 15. Spring推断构造方法
 ### **Spring 如何推断构造方法？**
 
 Spring 在创建 Bean 时会解析构造器，但“选择参数最多的构造器”不是通用规则。是否能走构造器注入还取决于 BeanDefinition 中是否指定了构造参数、是否存在 `@Autowired` 候选，以及候选参数能否从容器解析。
@@ -2897,7 +2903,7 @@ public final class PaymentService {}  // ❌ 不推荐
 
 以上内容可作为排查入口；复杂边界以实际 Spring 版本与配置为准。
 
-# 17. 为什么不推荐使用字段注入
+# 16. 为什么不推荐使用字段注入
 ### **为什么不要使用字段注入（Field Injection）？**
 
 在 Spring 开发中，尽管 **字段注入（Field Injection）** 是一种简单快捷的方式，但通常 **不推荐** 使用，而是推荐使用 **构造器注入（Constructor Injection）**。下面详细解释 **为什么不推荐字段注入**，并对比 **不同的依赖注入方式**。
@@ -3177,7 +3183,7 @@ public class UserServiceTest {
 
 **最佳实践：使用构造器注入，避免字段注入。**
 
-# 18. Spring AOP 的工作原理
+# 17. Spring AOP 的工作原理
 
 Spring AOP 主要依赖 **动态代理** 实现方法增强，使用 **JDK 动态代理** 或 **CGLIB 代理** 来生成代理对象，并在调用目标方法前后执行切面逻辑。
 
@@ -3289,7 +3295,7 @@ public Object proceed() throws Throwable {
 
 Spring AOP 的核心是**代理模式 + 责任链模式**：通过动态代理实现无侵入的切面增强。
 
-# 19. Spring 事务原理（进阶入口）
+# 18. Spring 事务原理（进阶入口）
 
 > 本节只用于建立事务调用链的全局认知。传播行为的精细语义、多数据源、异步边界、隔离级别和最终一致性，以 [[Spring深度解析|《Spring深度解析》]] 的「事务」章节为准；基础排障则回看本文「15. Spring事务失效」。
 ## 1. Spring 事务到底是什么

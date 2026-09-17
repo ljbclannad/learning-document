@@ -1107,42 +1107,255 @@
   - 条件满足才会注册对应 BeanDefinition/Bean
 - 4) 默认 Bean 提供与用户覆盖
   - 自动配置通常写成：`@Bean` + `@ConditionalOnMissingBean`
-  - 如果用户自己定义了同类型/同名 Bean，则 Missing 条件不成立，默认 Bean 不创建，实现“用户优先”
+  - 如果用户已经提供了满足注解检查要求的 Bean（如指定类型，或通过 `name` 显式指定的名称），则 Missing 条件不成立，默认定义不注册；并非所有 Missing 条件都同时检查类型和名称。
 
-### 4) 追问：Conditional 系列注解的决策发生在哪？
-- 结论
-  - 条件决策发生在“配置类解析/BeanDefinition 注册阶段”，本质是 Spring 的 `@Conditional` 机制在评估条件：条件不满足时，对应的配置类或 @Bean 方法不会被注册为 BeanDefinition（或不会被实例化）。
-- 关键机制（源码级名词对齐）
-  - Spring Core：`Condition` / `ConditionEvaluator`
-    - `ConditionEvaluator#shouldSkip(...)` 决定是否跳过某个配置类/某个 @Bean 方法
-  - Boot 扩展：`SpringBootCondition`（大量 OnClass/OnBean/OnProperty 条件的基类）
-    - 例如 `OnClassCondition`、`OnBeanCondition`、`OnPropertyCondition` 等
-- 发生时机（面试可复述）
-  - 配置类解析阶段（ConfigurationClassPostProcessor 处理 @Configuration）
-  - 以及 @Bean 方法解析/注册阶段（读取 @Bean 元数据时评估条件）
-  - 部分条件也会在更后阶段再次参与（例如与 BeanFactory 状态相关的判断），但主决策点在“是否注册”这一刻
+### 4) 追问：Conditional 系列注解的决策发生在哪？（源码调用链）
+
+> 源码基线：以下关键实现按 Spring Framework **6.2.0**、Spring Boot **3.4.0** 源码核对；代码块标为“简化”时只保留判断主线，不是完整源码。Action Guard 示例用于说明装配机制，其项目当前使用 Boot 3.2.5，调试时应打开项目实际依赖版本的源码。
+
+#### 4.1 先定位启动阶段：注册定义，不是创建对象后再筛选
+
+```text
+SpringApplication.run(...)
+  ├─ 准备 Environment：加载配置文件、环境变量、命令行参数等
+  ├─ 创建并准备 ApplicationContext，加载启动类的 BeanDefinition
+  └─ AbstractApplicationContext.refresh()
+       ├─ invokeBeanFactoryPostProcessors(beanFactory)
+       │    └─ PostProcessorRegistrationDelegate.invokeBeanFactoryPostProcessors(...)
+       │         └─ ConfigurationClassPostProcessor.postProcessBeanDefinitionRegistry(...)
+       │              └─ processConfigBeanDefinitions(...)
+       │                   ├─ ConfigurationClassParser.parse(...)
+       │                   │    └─ 解析配置类、扫描组件、处理 @Import，评估解析阶段条件
+       │                   └─ ConfigurationClassBeanDefinitionReader.loadBeanDefinitions(...)
+       │                        └─ 注册配置类及 @Bean 定义，评估注册阶段条件
+       ├─ registerBeanPostProcessors(...)
+       └─ finishBeanFactoryInitialization(...)
+            └─ 实例化普通的非懒加载单例 Bean，注入依赖并执行初始化
+```
+
+- `ConfigurationClassPostProcessor` 实现 `BeanDefinitionRegistryPostProcessor`，属于可以新增 Bean 定义的基础设施扩展点，不是处理普通 Bean 实例的 `BeanPostProcessor`。
+- **BeanDefinition 是创建对象的说明书，Bean 才是实际对象。** 条件不满足时跳过相应的配置处理或定义注册，不是先执行 `@Bean` 方法、再销毁返回对象。
+- 基础设施 Bean 可能提前实例化，因此不要把这条主线理解为“条件判断前绝对没有任何 Bean 对象”。
+
+#### 4.2 元注解入口：Boot 注解最终落到 Spring 的 `@Conditional`
+
+`@Conditional` 来自 `org.springframework.context.annotation`，核心声明如下（省略其他元注解）：
+
+```java
+public @interface Conditional {
+    Class<? extends Condition>[] value();
+}
+```
+
+Boot 的属性条件通过元注解接入该机制（简化）：
+
+```java
+@Conditional(OnPropertyCondition.class)
+public @interface ConditionalOnProperty {
+    // prefix、name、havingValue、matchIfMissing 等属性
+}
+```
+
+对应关系：
+
+| 注解 | 条件实现 | 判断依据 |
+|---|---|---|
+| `@Conditional` | 注解中指定的 `Condition` | 自定义 `matches(...)` 逻辑 |
+| `@ConditionalOnProperty` | `OnPropertyCondition` | `Environment` 中的属性 |
+| `@ConditionalOnBean` / `@ConditionalOnMissingBean` | `OnBeanCondition` | 当前可见的 Bean 定义、类型及名称等信息 |
+| `@ConditionalOnClass` | `OnClassCondition` | 类路径是否存在指定类型 |
+
+Boot 条件通常继承 `SpringBootCondition`，由其 `matches(...)` 调用具体条件的 `getMatchOutcome(...)`，并记录匹配结果，供条件报告排障使用。
+
+#### 4.3 核心调度器：`ConditionEvaluator#shouldSkip(...)`
+
+核心逻辑如下（简化）：
+
+```java
+// 没有 @Conditional 就无需跳过；未传 phase 时先根据元数据推断阶段。
+List<Condition> conditions = collectConditions(metadata);
+// collectConditions 会实例化条件，并通过 AnnotationAwareOrderComparator 排序。
+for (Condition condition : conditions) {
+    ConfigurationPhase requiredPhase = null;
+    if (condition instanceof ConfigurationCondition configurationCondition) {
+        requiredPhase = configurationCondition.getConfigurationPhase();
+    }
+    if ((requiredPhase == null || requiredPhase == phase)
+            && !condition.matches(this.context, metadata)) {
+        return true; // 当前阶段任意一个适用条件不匹配，就跳过。
+    }
+}
+return false;
+```
+
+关键点：
+- `shouldSkip(...) == true` 表示**不处理**，与 `matches(...) == true` 的含义相反。
+- 同一个位置直接组合的多个条件，在适用阶段按 **AND** 判断；自定义条件内部可以另行实现 OR 等逻辑。
+- 条件实例由框架创建，不是普通业务 Bean；不要在 `Condition` 中依赖业务 Bean 注入，或主动获取业务 Bean 导致提前实例化。应优先使用 `ConditionContext` 提供的环境、类加载器、注册表等信息。
+- 条件的 `@Order` 影响条件求值顺序，不等于自动配置排序，也不等于业务 Bean 的实例化顺序。
+
+#### 4.4 两个阶段：`PARSE_CONFIGURATION` 与 `REGISTER_BEAN`
+
+`ConfigurationCondition` 在 `Condition` 基础上增加 `getConfigurationPhase()`：
+
+| 阶段 | 典型调用位置 | 不匹配的效果 |
+|---|---|---|
+| `PARSE_CONFIGURATION` | `ConfigurationClassParser#processConfigurationClass(...)` | 不继续解析该配置类的内容 |
+| `REGISTER_BEAN` | `ConfigurationClassBeanDefinitionReader` 注册配置类或 `@Bean` 定义时 | 跳过对应定义的注册 |
+
+配置类解析入口的关键代码：
+
+```java
+if (this.conditionEvaluator.shouldSkip(
+        configClass.getMetadata(), ConfigurationPhase.PARSE_CONFIGURATION)) {
+    return;
+}
+```
+
+`@Bean` 方法定义注册入口的关键代码：
+
+```java
+if (this.conditionEvaluator.shouldSkip(metadata, ConfigurationPhase.REGISTER_BEAN)) {
+    configClass.skippedBeanMethods.add(methodName);
+    return;
+}
+```
+
+- `OnBeanCondition#getConfigurationPhase()` 明确返回 `REGISTER_BEAN`，避免在过早的解析阶段判断 Bean 是否存在。
+- `OnPropertyCondition` 未限定阶段：放在配置类上时可在解析阶段阻止整类继续处理，也可能在注册阶段再次判断；放在 `@Bean` 方法上时则在方法定义注册时判断。**不能说所有条件都只执行一次或只在同一阶段执行。**
+- 上面聚焦配置类处理主线；直接注册带注解的类、组件扫描等入口也会使用条件评估。Boot 自动配置导入还可能先做候选过滤，不能把所有过滤都等同于这里的配置类解析。
+
+#### 4.5 `OnPropertyCondition`：从 Environment 读取，而非先绑定属性对象
+
+主要路径为 `getMatchOutcome(...)` → 构建属性条件描述 → `collectProperties(...)` → `isMatch(...)`。逻辑如下（简化）：
+
+```text
+从注解读取 prefix、name、havingValue、matchIfMissing
+  ↓
+规范化 prefix，为每个 name 拼出完整属性键
+  ↓
+Environment.containsProperty(key)
+  ├─ 不存在：根据 matchIfMissing 判断
+  └─ 存在：读取字符串值，通过 isMatch(value, havingValue) 判断
+  ↓
+所有指定属性均匹配，条件才成立
+```
+
+字符串匹配的核心源码：
+
+```java
+private boolean isMatch(String value, String requiredValue) {
+    if (StringUtils.hasLength(requiredValue)) {
+        return requiredValue.equalsIgnoreCase(value);
+    }
+    return !"false".equalsIgnoreCase(value);
+}
+```
+
+- 显式设置 `havingValue = "memory"`：按忽略大小写的字符串比较判断，不是任意类型的复杂绑定。
+- 省略 `havingValue`：属性存在且不等于 `false` 即匹配，空字符串也可能匹配；布尔开关建议显式写 `havingValue = "true"`。
+- `matchIfMissing` 默认 `false`；指定多个 `name` 时需要全部满足。
+- 这里直接读取 `Environment`，不依赖 `@ConfigurationProperties` Bean 已经实例化和绑定；属性对象中的字段默认值也不会自动成为这里的配置值。
+- 不适合用它可靠判断集合索引配置，如只配置了 `items[0]`，不代表检查 `items` 就能匹配；复杂结构应写专门的条件。
+- 这是装配时判断，不是运行期监听开关；之后改变配置值不会自动删除或重新创建这些 Bean。
+
+#### 4.6 结合 Action Guard：整组选择 + 单项退让
+
+```java
+@Configuration(proxyBeanMethods = false)
+@ConditionalOnProperty(
+        prefix = "action.guard.store", name = "type", havingValue = "memory")
+public class InMemoryActionGuardStoreConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean
+    public ActionInstanceRepository actionInstanceRepository() {
+        return new InMemoryActionInstanceRepository();
+    }
+}
+```
+
+```text
+解析 ActionGuardAutoConfiguration 的 @Import
+  ↓
+准备解析 InMemoryActionGuardStoreConfiguration
+  ↓
+属性条件：action.guard.store.type 是否为 memory？
+  ├─ 否：跳过内存配置，不处理其中的默认仓储定义
+  └─ 是：继续处理 @Bean 方法
+       ↓
+       缺失条件：是否已有 ActionInstanceRepository 候选？
+         ├─ 有：默认仓储退让，不注册其定义
+         └─ 没有：注册默认仓储定义
+                    ↓
+                    后续实例化阶段才调用方法创建对象
+```
+
+**条件不匹配不等于配置校验报错。** 未配置 `store.type` 时，属性条件只是跳过内存配置；项目中“必须显式配置”的异常来自 `ActionGuardAutoConfiguration#actionGuardStoreSelectionValidator` 返回的 `BeanFactoryPostProcessor`。它在配置定义处理后执行显式校验，不是 `@ConditionalOnProperty` 自己抛出的错误。
 
 ### 5) 追问：@ConditionalOnMissingBean 的 Missing 怎么判断？
-- 结论（最重要的一句）
-  - Missing 的判断是“看容器里是否已经存在匹配条件的 Bean（或 BeanDefinition）”，存在则不创建默认 Bean；不存在才创建。它不是只看运行时实例，有时会看 BeanDefinition 元数据与类型预测（避免过早实例化）。
-- 判断维度（常见匹配项）
-  - 按类型：是否存在某个类型（或其子类型/实现）的 Bean
-  - 按名称：是否存在指定 beanName
-  - 按注解：是否存在带某些注解的 Bean（部分条件支持）
-  - 按泛型：例如 `RedisTemplate<String, Object>` 这类，Boot 会尽量做泛型匹配（但复杂场景可能退化）
-- 判断时机与策略（工程理解）
-  - 在注册 @Bean 时就评估：如果用户在更早阶段已注册了同类型 BeanDefinition，那么 Missing 条件就会失败
-  - 为避免“为了判断而提前实例化”，Boot 会优先做：
-    - BeanDefinition/类型预测层面的检查（例如 `BeanFactory#getBeanNamesForType` 的逻辑）
-    - 必要时再延后到实例化阶段确认（少数复杂条件）
-- 为什么能覆盖默认 Bean（你在面试里这么说）
-  - 自动配置提供的是“有条件的默认实现”；用户自己定义 Bean 属于“更明确的意图”，所以 Missing 条件让默认实现退让，确保用户配置优先级更高
+
+#### 5.1 检查的是当前候选，不是只检查已经创建的对象
+
+`OnBeanCondition` 在 `REGISTER_BEAN` 阶段提取注解要求，再匹配当前 BeanFactory 可见的候选。`@ConditionalOnMissingBean` 只有在指定要求都没有匹配候选时才成立；无需由同一个 Bean 同时满足所有要求才能让条件失败。
+
+常见检查维度：
+- `value` / `type`：按类型检查，包括兼容的子类或实现；`type` 使用类名字符串。
+- `name`：按 Bean 名称检查；不是所有用法都自动追加“同名判断”。
+- `annotation`：按 Bean 上的指定注解检查。
+- `search`：决定是否搜索父容器，默认 `SearchStrategy.ALL`。
+- `parameterizedContainer`：可显式指定需要检查泛型参数的容器类型；**不要把它误解成与 `@Autowired` 一样自动精确区分所有泛型组合。** 例如仅按 `RedisTemplate.class` 检查并不等于限定 `RedisTemplate<String, Object>`。
+
+标在 `@Bean` 方法上且未指定类型、名称等要求时，会推断方法声明的返回类型：
+
+```java
+@Bean
+@ConditionalOnMissingBean // 此处按 ActionInstanceRepository 类型判断。
+public ActionInstanceRepository actionInstanceRepository() {
+    return new InMemoryActionInstanceRepository();
+}
+```
+
+因此自定义 Bean 即使叫 `customActionInstanceRepository`，只要类型匹配，也可以让这个默认实现退让。返回类型应暴露足够的类型信息：若默认方法声明为某个具体实现，条件可能只检查该具体类型；若自定义方法声明为 `Object`，框架可能无法提前识别其仓储接口。
+
+#### 5.2 为什么处理顺序重要？
+
+- 判断只能使用**当时已经处理**的 Bean 定义及可获得的类型信息，不会预知之后其他配置将注册什么。
+- 普通业务配置通常先于延迟导入的自动配置处理，所以业务自定义 Bean 可以使自动配置退让。
+- 自动配置之间有依赖时，应通过 `@AutoConfiguration(before = ... / after = ...)` 等明确顺序；该顺序控制定义处理，不承诺对象按同样顺序实例化。
+- 缺少可预测的类型信息时，不能依赖“先注册默认实现，之后到实例化阶段再统一补判、撤销注册”。这里没有这样的通用兜底机制。
+
+#### 5.3 三种机制不要混淆
+
+| 机制 | 生效点 | 实际作用 |
+|---|---|---|
+| `@ConditionalOnMissingBean` | 定义注册阶段 | 已有匹配候选时，默认定义不注册 |
+| 同名 BeanDefinition 覆盖 | 定义注册阶段 | 在允许覆盖时，用后注册定义替换同名定义，属于另一套机制 |
+| `@Primary` / `@Qualifier` | 依赖解析阶段 | 从已经存在的候选中选择，不负责移除其他定义 |
+
+面试复述：**默认实现退让，不是先创建再替换；Missing 看当前可见候选，不是启动结束后统一去重。**
+
+#### 5.4 源码阅读与断点顺序
+
+1. `ConfigurationClassPostProcessor#processConfigBeanDefinitions`：确认配置类处理入口。
+2. `ConfigurationClassParser#processConfigurationClass`：观察类级条件和 `PARSE_CONFIGURATION`。
+3. `ConditionEvaluator#shouldSkip`：观察当前 `metadata`、`phase` 和条件实现。
+4. `OnPropertyCondition#getMatchOutcome`：观察真实的 `Environment` 配置值。
+5. `ConfigurationClassBeanDefinitionReader#loadBeanDefinitionsForBeanMethod`：观察 `@Bean` 定义是否跳过。
+6. `OnBeanCondition#getMatchOutcome`：观察判断时可见的候选，而非只看最终容器结果。
+
+源码参考（固定版本，便于对照）：
+- [Spring Framework 6.2.0：ConditionEvaluator](https://github.com/spring-projects/spring-framework/blob/v6.2.0/spring-context/src/main/java/org/springframework/context/annotation/ConditionEvaluator.java)
+- [Spring Framework 6.2.0：ConfigurationClassParser](https://github.com/spring-projects/spring-framework/blob/v6.2.0/spring-context/src/main/java/org/springframework/context/annotation/ConfigurationClassParser.java)
+- [Spring Framework 6.2.0：ConfigurationClassBeanDefinitionReader](https://github.com/spring-projects/spring-framework/blob/v6.2.0/spring-context/src/main/java/org/springframework/context/annotation/ConfigurationClassBeanDefinitionReader.java)
+- [Spring Boot 3.4.0：OnPropertyCondition](https://github.com/spring-projects/spring-boot/blob/v3.4.0/spring-boot-project/spring-boot-autoconfigure/src/main/java/org/springframework/boot/autoconfigure/condition/OnPropertyCondition.java)
+- [Spring Boot 3.4.0：OnBeanCondition](https://github.com/spring-projects/spring-boot/blob/v3.4.0/spring-boot-project/spring-boot-autoconfigure/src/main/java/org/springframework/boot/autoconfigure/condition/OnBeanCondition.java)
 
 ### 6) 生产级排障要点（非常实用）
 - 现象 1：某个自动配置没生效
   - 排查：是否被 exclude？是否 classpath 缺少依赖（OnClass）？是否某个 property 没开（OnProperty）？是否被用户 Bean 覆盖导致默认 Bean 没创建（OnMissingBean）？
 - 现象 2：Bean 冲突/同类型多个 Bean
-  - 排查：是否引入多个 starter 都提供了同类 Bean？是否 Missing 条件没挡住（因为类型不匹配/泛型不匹配/名称不同）？
+  - 排查：是否引入多个 starter 都提供了同类 Bean？是否遗漏 Missing 条件、声明返回类型过宽、检查类型不一致，或者自动配置处理顺序不符合预期？仅按类型检查时，Bean 名称不同不会阻止默认实现退让。
 - 现象 3：配置没生效
   - 排查：Environment 优先级、profile 激活、绑定到 @ConfigurationProperties 是否成功（可用 actuator/configprops 或日志确认）
 
