@@ -1,0 +1,28 @@
+.idea/Learning-document.iml
+.idea/modules.xml
+.idea/.gitignore
+.idea/vcs.xml
+杭电/.DS_Store
+杭电/408/计算机网络/.DS_Store
+杭电/408/.DS_Store
+设计模式/.DS_Store
+.DS_Store
+架构师/.DS_Store
+设计模式/.DS_Store
+便笺/
+
+# 临时工作文件
+/tmp/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 学习进度自动备份
+/00-索引与面试/AI应用后端三个月复习/.学习进度备份/
+
+# 学习进度工具的本机构建产物
+/学习进度工具/.native-build/
+/学习进度工具/.native-build-log.txt
+/学习进度工具/*.app/
