@@ -1,565 +1,431 @@
-# RabbitMQ
+# RabbitMQ：从路由与确认机制到复制、重试和业务一致性
 
-> [!abstract] 文档定位
-> 本文关注 RabbitMQ 的稳定心智模型、可靠性边界和生产实践。它不承诺“配置几个开关就绝不丢消息”，而是说明消息从业务事务到最终消费之间，每一段由谁负责、可能怎样失败，以及如何检测和补偿。
+> 本文以 **RabbitMQ 4.3.x、AMQP 0-9-1、工作队列模型**为讨论基线，核查日期为 2026-10-28。AMQP 1.0、Stream 协议和其他 Broker 版本不能直接套用全部结论；官方滚动文档可能已切换到更新版本，版本特性以 4.3 专页为准。
+>
+> [[RabbitMQ场景题|RabbitMQ 项目实践]] 将这些机制落实到支付、医嘱、叫号和处方审核；数据库事务原理见 [[03-数据存储与缓存/数据库/MySQL|MySQL]]。案例与参数均用于解释设计，不代表已有生产系统的实际配置。
 
-> [!info] 版本基线
-> 本文以 **RabbitMQ 4.3.x、AMQP 0-9-1** 为主要基线，最后核验于 2026-07-17。RabbitMQ 文档按版本发布；使用 3.13、4.0～4.2 或其他协议时，应先核对文末的版本差异和官方文档。
+理解 RabbitMQ，关键是区分：**事件是否在业务库成立、发布是否被代理接管、是否路由到目标队列、是否交给消费者、业务是否提交，以及提交后能否安全重放。**
 
-相关文档：[[RabbitMQ场景题|RabbitMQ 场景化排障与架构决策]]
+这些阶段不共享一个总开关。“发送没有异常”“confirm 为 ack”“队列已经清空”分别只说明一部分事实。消息系统可靠性的核心，是在每个不确定窗口留下可以恢复的证据。
 
-## 1. RabbitMQ 解决什么问题
+## 1. RabbitMQ 的职责与系统边界
 
-RabbitMQ 是消息代理（message broker）。生产者把消息发布给交换机，交换机根据绑定规则把消息路由到队列，消费者再从队列取得消息。
+### 1.1 队列把生产与处理的时间拆开
 
-```text
-业务事务
-  │
-  ▼
-Producer ── publish ──> Exchange ── binding/routing ──> Queue ── delivery ──> Consumer
-   ▲                         │                              │                       │
-   │ publisher confirm      └─ unroutable                 │ consumer ack          └─ 业务提交
-   │                           return / AE                 │
-   └──────── 生产端责任边界                      Broker 责任边界 ────────────────┘
+```mermaid
+flowchart LR
+    A[业务事务与 Outbox] --> B[生产者发布]
+    B --> C[Exchange 路由]
+    C --> D[Queue 保存与投递]
+    D --> E[消费者业务事务]
+    E --> F[业务结果与 Inbox]
+    D -. publisher confirm .-> B
+    E -. consumer ack .-> D
 ```
 
-它常用于：
+生产者不用等待每个订阅方完成业务；队列可以吸收短期峰值，消费者按可持续速度处理。代价是结果延迟、重复投递、积压容量和恢复协议成为系统设计的一部分。
 
-- **异步解耦**：请求线程只完成必要事务，耗时工作由消费者异步处理。
-- **削峰填谷**：队列吸收短时流量峰值，消费者按可持续速率处理。
-- **工作分发**：多个竞争消费者共同处理同一个队列。
-- **事件分发**：一个事件通过多个绑定进入不同队列，每个订阅方独立消费。
-- **失败隔离**：通过有限重试、死信交换机和补偿流程隔离异常消息。
+削峰并不创造处理能力。若长期到达速率高于实际完成速率，积压最终耗尽磁盘、时间预算或业务耐心。异步解耦也不代表业务从此无需关注下游结果：支付成功后的票据是否开出，仍要有独立状态和对账。
 
-RabbitMQ 不直接解决：
+### 1.2 发布订阅与竞争消费是两种拓扑
 
-- 生产者的“数据库提交”和“发送消息”之间的原子性；
-- 消费者的“业务提交”和“发送 ack”之间的原子性；
-- 跨服务的端到端 exactly-once；
-- 精确到某一时刻执行的长期任务调度；
-- 没有业务标识、审计记录和对账机制时的事后追溯。
-
-因此，可靠系统通常采用 **at-least-once 投递 + 幂等消费 + Outbox/Inbox + 业务对账**，而不是把“绝不重复、绝不丢失”全部寄托在 Broker 上。
-
-## 2. 核心对象与路由
-
-### 2.1 核心对象
-
-| 对象 | 作用 | 容易混淆的边界 |
-| --- | --- | --- |
-| Producer | 发布消息 | 通常发布到交换机，不直接感知消费者是否处理成功 |
-| Exchange | 根据类型、routing key 和 binding 决定路由 | 默认交换机是特殊例外，可用队列名作为 routing key |
-| Binding | 交换机到队列（或交换机到交换机）的路由规则 | 它是拓扑配置，不是消费订阅记录 |
-| Queue | 保存待投递和未确认消息 | 队列类型决定是否复制、如何持久化以及支持哪些特性 |
-| Consumer | 接收并处理消息 | consumer ack 只向 Broker 表示本次 delivery 已由消费者接管 |
-| Virtual host | 隔离交换机、队列、绑定和权限 | 同名对象在不同 vhost 中互不相同；排障时必须先确认 vhost |
-| Connection / Channel | TCP 连接及其上的轻量协议通道 | delivery tag、confirm 序号等状态通常以 channel 为作用域 |
-
-### 2.2 交换机类型
-
-| 类型 | 路由规则 | 典型用途 |
-| --- | --- | --- |
-| `direct` | binding key 与 routing key 完全匹配 | 按业务类型或目标精确分发 |
-| `fanout` | 忽略 routing key，路由到所有绑定 | 广播事件 |
-| `topic` | 按以 `.` 分段的模式匹配；`*` 匹配一段，`#` 匹配零段或多段 | 多维度事件订阅，如 `order.created.cn` |
-| `headers` | 按消息 headers 及 `x-match` 规则匹配 | 路由条件不适合表达为字符串键时使用 |
-| 默认交换机 `""` | 每个队列会以队列名自动绑定；routing key 等于队列名即可路由 | 简单点对点发布 |
-
-交换机不会保存消息。消息没有匹配到任何队列时：
-
-1. `mandatory=false`（默认）且没有可用的 alternate exchange（AE）：消息会被丢弃；
-2. `mandatory=true`：Broker 通过 `basic.return` 把不可路由消息返回给生产者，客户端必须注册 return handler；
-3. 配置了 AE：原交换机无法路由时，消息会尝试经 AE 再路由。若 AE 成功路由，`mandatory` 会把它视为已路由，不会再 return。默认交换机不支持配置 AE。
-
-发布到**不存在的 exchange** 不属于 `basic.return` 场景，Broker 会以 channel exception 关闭 channel。生产者需要同时监控 return、confirm 和 channel/connection 异常。
-
-> [!warning] Confirm 不等于“每个订阅方都收到了”
-> Publisher confirm 的 `ack` 可以针对一条不可路由消息发出；它表示 Broker 已完成该次发布应承担的工作，不等于消息进入了某个预期队列。`mandatory` 也只判断“是否至少匹配一个队列”，无法证明多个预期订阅队列全部收到副本。关键 fan-out 拓扑还需要声明自检、拓扑测试和业务对账。
-
-### 2.3 拓扑声明与 Policy
-
-客户端重复声明同名交换机或队列时，关键属性必须等价；类型、`durable`、`exclusive` 或部分不可变参数不一致，通常会关闭 channel 并报告 `PRECONDITION_FAILED`。
-
-配置选择原则：
-
-- **需要在线调整的参数优先使用 policy**：如 DLX、消息 TTL、队列长度、alternate exchange；
-- **创建后不可原地改变的属性放在声明中**：如队列类型、classic queue 的 `x-max-priority`；
-- 将交换机、队列、绑定、policy 和权限作为代码或声明式配置管理，并在部署前做拓扑契约测试；
-- 不要依靠管理台手工修改形成“只有线上才存在”的隐式配置。
-
-## 3. 队列类型、持久化与高可用
-
-### 3.1 队列类型怎么选
-
-| 类型 | 数据模型与复制 | 适合 | 主要代价或限制 |
-| --- | --- | --- | --- |
-| Classic queue | 传统 FIFO 队列；RabbitMQ 4.x 中不复制队列内容 | 临时、排他、可重建或数据安全不是首要目标的任务 | 所在节点永久故障可能丢失队列内容 |
-| Quorum queue | 基于 Raft 的持久化复制队列，依赖多数副本形成 quorum | 订单、支付、医嘱等重视数据安全的工作队列 | 复制和磁盘 I/O 带来额外开销；失去多数副本时不可用 |
-| Stream | 追加写、按保留策略保存、消费者维护偏移量，可重复读取 | 事件日志、回放、多订阅、较高吞吐 | 消费模型不同于“处理后从队列删除”的工作队列 |
-
-关键结论：
-
-- **RabbitMQ 集群不等于队列内容自动高可用**。交换机、绑定等定义会在集群中复制，但 classic queue 的消息内容在 4.x 中不复制。
-- Classic mirrored queues 已在 RabbitMQ 4.0 移除。新设计不要再使用 `ha-mode`、`ha-sync-mode` 等镜像队列策略；需要复制的工作队列优先评估 quorum queue。
-- Quorum queue 在多数副本存活时可以选出 leader 并继续服务；如果多数副本永久丢失，不能承诺恢复数据。
-- 若目标是保留并重复读取事件，或单队列吞吐已逼近极限，应评估 stream/super stream，而不是无限增加 prefetch。
-
-### 3.2 三个经常混为一谈的维度
-
-| 维度 | 解决的问题 | 不解决的问题 |
-| --- | --- | --- |
-| `durable` exchange/queue | Broker 重启后恢复对象定义 | 不自动让消息持久，也不复制 classic queue 内容 |
-| persistent message（AMQP 0-9-1 `delivery_mode=2`） | 与 durable queue 配合，使消息可在重启后恢复 | 未收到 confirm 前仍不能假设 Broker 已安全接管 |
-| replicated queue（quorum） | 节点故障下复制队列状态和消息 | 仍需要 publisher confirm、消费者 ack 和业务幂等 |
-
-对于关键消息，通用组合是：
-
-1. durable exchange；
-2. durable quorum queue；
-3. 消息标记为 persistent；
-4. 开启 publisher confirms；
-5. 消费者手动 ack，并在业务提交后确认；
-6. 业务侧实现幂等、Outbox 和对账。
-
-Quorum queue 会把发布给它的消息持久化到磁盘，但显式标记 persistent 仍有助于保持协议语义一致，尤其是消息后续被 dead-letter 到其他队列时。
-
-## 4. 端到端可靠性：逐段建立证据
-
-### 4.1 可靠性链路
-
-| 链路 | 主要机制 | 成功证据 | 仍然存在的风险 |
-| --- | --- | --- | --- |
-| 业务库 → 待发布事件 | Transactional Outbox | 业务数据与 outbox 同一事务提交 | relay 可能重复发布 |
-| Producer → Broker | Publisher confirms | 对应发布序号收到 confirm `ack` | 连接断开造成结果未知；重发可能重复 |
-| Exchange → Queue | binding + `mandatory`/return 或 AE | 已启用并正确关联 return handler 时未收到 return，或 AE 捕获记录符合契约 | 只证明至少一个目标可路由，不能证明每个预期队列 |
-| Queue → Consumer | manual consumer ack | 业务成功后发送 `basic.ack` | 提交后、ack 前崩溃会重新投递 |
-| Consumer → 业务结果 | 幂等键、Inbox、唯一约束、状态机 | 业务提交记录 | 外部副作用仍需下游幂等键或补偿 |
-| 跨服务最终状态 | 对账、审计、补偿 | 业务差集归零 | 仅靠 MQ 指标无法证明业务完成 |
-
-### 4.2 Publisher confirms
-
-Publisher confirms 与 consumer acknowledgements 相互独立：
-
-- confirm 处理 **Producer → RabbitMQ**；
-- consumer ack 处理 **RabbitMQ → Consumer**；
-- confirm 不会等待消费者处理，更不会证明业务落库成功。
-
-在 confirm 模式下，Broker 会对发布返回 `ack` 或 `nack`：
-
-- 消息路由到 durable queue 且标记为 persistent 时，通常在消息已持久化后确认；
-- 消息路由到 quorum queue 时，需要多数副本接受该消息后确认；
-- 消息路由到多个队列时，Broker 在所有目标队列接受后确认；
-- 消息完全不可路由时仍可能 confirm `ack`，因此必须结合 return/AE 处理路由失败。
-
-多目标 fan-out 中，`nack` 也不等于“所有队列都没收到”。例如一个目标队列因 `reject-publish` 拒收时，其他有容量的队列仍可能已接受消息。整条重发会在成功队列产生重复，因此每个订阅方仍需幂等，排障时要逐队列判断。
-
-生产者必须维护“发布序号/CorrelationData → event ID → 当前状态”的映射，并处理：
-
-- `ack`：记录 Broker confirm 已成功；只有结合 return/AE 结果后，才能更新路由相关状态；
-- `nack`：记录本次发布未被全部目标接受，保留待恢复状态并按逐目标副作用处理；
-- `basic.return`：记录 `UNROUTABLE`；return 会先于同一发布的 confirm 到达，两者不是互斥结果；
-- 超时或连接断开：结果是 **UNKNOWN**，使用同一个 event ID 重发，并假设可能产生重复。
-
-异步 confirm 或批量等待通常比“每发一条就同步等待”吞吐更高。批量确认的代价是失败时需要准确找出尚未确认的消息，不能把整个批次盲目生成新 ID 重发。
-
-### 4.3 Consumer acknowledgements
-
-自动确认模式会在消息写入消费者连接后即认为 delivery 已处理。消费者进程随后崩溃时，消息可能已经从 Broker 删除。可靠业务通常使用手动确认：
+一个队列上的多个消费者分担工作，并不各得一份消息。收费、叫号和短信都需要收到挂号事件时，应分别拥有自己的队列，再把这些队列绑定到事件交换机。
 
 ```text
-receive
-  ├─ 已处理过 event_id ───────────────> ack
-  └─ 未处理
-       ├─ 同一数据库事务：写 Inbox + 执行业务变更
-       ├─ commit 成功 ────────────────> ack
-       ├─ 可重试失败 ────────────────> 有界、延迟重试
-       └─ 不可重试失败 ──────────────> reject/nack(requeue=false) → DLX
+appointment.events.x
+  ├─ billing.q  → 收费消费者 A/B
+  ├─ calling.q  → 叫号消费者 A/B
+  └─ sms.q      → 短信消费者 A/B
 ```
 
-注意事项：
+队列是独立的保留与消费进度边界。三个服务错误地共同监听一个队列时，可能表现为“收费偶尔收到、短信偶尔收到”，本质上却是正常竞争分发，不能通过增加重试解决。
 
-- delivery tag 以 channel 为作用域；必须在收到消息的同一 channel 上 ack/nack。
-- channel 或 connection 关闭时，未确认的 delivery 通常会自动重新入队。
-- `multiple=true` 会确认当前 delivery tag 及其之前所有尚未确认的 delivery。并发处理完成顺序不一致时，误用批量 ack 会提前确认尚未成功的消息。
-- `redelivered=true` 只表示“可能曾投递过”，不是可靠的去重 ID。
-- `basic.nack(requeue=true)` 可能让消息很快再次投递；所有消费者面对同一故障时，会形成 CPU、网络和日志都很昂贵的重投循环。
+### 1.3 哪些保证属于业务层
 
-### 4.4 投递语义
-
-下表描述的是限定故障模型下的投递语义，不代表生产者此前没有重复发布：
-
-| 语义 | 典型实现 | 结果与边界 |
+| 问题 | RabbitMQ 能提供的机制 | 应用仍需承担的责任 |
 | --- | --- | --- |
-| At-most-once | 自动确认，或先 ack 再处理 | Broker→Consumer 段可能丢且通常不重投；Producer 仍可能已发布重复 |
-| At-least-once | durable/replicated queue、persistent message、confirm 与结果未知重发、手动 ack | 在所覆盖的故障范围内不轻易丢，但允许重复 |
-| Effectively-once | at-least-once + 幂等/去重 + 业务约束 | 业务效果接近只发生一次 |
-| Exactly-once | 需要限定范围内的事务协议或专用系统语义 | RabbitMQ 单独不能提供跨数据库、Broker 和外部服务的端到端保证 |
+| 发送结果是否可确认 | publisher confirms、return、连接异常 | 稳定事件 ID、结果未知后的重试 |
+| 消费失败是否可重投 | manual ack、重新入队、死信 | 幂等、失败分类、恢复预算 |
+| 节点故障后是否继续 | quorum queue 多副本与选举 | 故障域部署、容量与演练 |
+| 数据库提交后是否一定发事件 | 不自动覆盖数据库事务 | 同事务 Outbox 与持续恢复 |
+| 外部副作用是否只发生一次 | 不理解下游业务 | 唯一凭证、幂等接口、状态查询与补偿 |
 
-## 5. 幂等、Inbox 与 Outbox
+at-least-once 也有前提：持久接收、复制、确认、重试、保留期限和可恢复故障范围必须匹配。TTL 到期、主动删除、无限期故障或多数副本永久损毁，不会因为系统写着“至少一次”就自动被排除。
 
-### 5.1 消息标识
+## 2. 连接、Channel 与一条消息的协议路径
 
-建议把“消息传输标识”和“业务幂等标识”分开：
+### 2.1 Channel 是协议状态，不是随意共享的工具对象
+
+多个 Channel 可以复用一条 TCP 连接，减少握手与连接资源成本。发布方法、消息属性和 body 通过协议帧传输；一条业务消息可能拆成多个帧，TCP 写入成功并不证明 Broker 已完成路由或持久化。
+
+delivery tag、发布确认序号、消费者注册和事务模式等状态与 Channel 关联。消费 Channel 上的 tag=8，不能拿到另一个 Channel 去确认；重连后的 tag=8 也不是旧连接的同一次投递。
+
+Java 应用应按客户端的并发契约管理 Channel，避免多个发布线程无约束共享同一个实例。连接自动恢复不能替代业务事件重发：原 Channel 上尚未确认的发布仍需由应用识别和恢复。
+
+Virtual host 划分资源命名与权限边界，同名 exchange/queue 在不同 vhost 是不同对象；它不是独立 CPU、磁盘或故障域。应用账号分别约束 configure/write/read 权限，生产连接使用合适的网络隔离与 TLS，管理权限和业务权限分开。仅知道队列名不能证明请求来自正确环境。
+
+### 2.2 连接故障和业务故障是两类信号
+
+heartbeat 帮助发现长时间没有通信的对端，不是“消费者业务执行超过十秒就回滚”的计时器。客户端进程还活着，也可能卡在数据库锁、线程池或下游 HTTP 调用中。
+
+网络超时存在三种可能：请求没发出去、Broker 已处理但回复丢失、回复已经到达但应用尚未记录。因此最安全的状态名称是 UNKNOWN，而不是一律 FAILED。用同一 eventId 重发，并准备接受重复。
+
+Channel 异常通常要求重新建立该 Channel 及相关状态。把协议异常当成某一条业务失败后继续使用已经关闭的 Channel，会让后续发送和 ack 连续失败。
+
+## 3. Exchange 路由：匹配规则与不可路由边界
+
+### 3.1 Exchange 不保存等待消费的消息
+
+交换机根据类型、routing key、headers 和 binding 决定进入哪些队列，队列负责保存。durable exchange 保存的是拓扑定义，不是一个额外消息仓库。
+
+| 类型 | 匹配方式 | 典型边界 |
+| --- | --- | --- |
+| direct | routing key 与 binding key 完全匹配 | 不是前缀匹配 |
+| topic | 以点分段，`*` 匹配一段，`#` 匹配零段或多段 | `order.*` 不匹配 `order.created.cn` |
+| fanout | 忽略 routing key，分发到绑定目标 | 不等于一个队列上的所有消费者都收到 |
+| headers | 依据 headers 与 x-match 条件 | 应核对类型与匹配规则，不只比较字符串外观 |
+| 默认交换机 `""` | 队列自动以自身名字绑定 | 不应与未命名的普通自建交换机混淆 |
+
+同一个队列经多条匹配路径被同一发布命中，不能简单按 binding 条数推算副本数；要关注最终目标集合。应用自己重新发布则是另一条消息，稳定 messageId 也不会让普通工作队列自动去重。
+
+### 3.2 mandatory、return 与 AE 分别解决什么
+
+没有任何队列匹配时，mandatory=true 可触发 basic.return；生产者必须实际注册并处理 return，不能只设置标志。若配置 Alternate Exchange，未被原交换机路由的消息先尝试备用路由；备用目标成功接收路由时，不会再以“不可路由”返回。
+
+如果预期有三个订阅队列，却只剩两个 binding，消息仍然可路由，mandatory 和 AE 都无法发现第三个订阅丢失。它们监测的是零匹配，不是完整订阅契约。
+
+发布到不存在的 exchange 则会导致 Channel 级异常，并不走普通的不可路由 return 流程。应同时观察确认、退回和 Channel/Connection 关闭。
+
+### 3.3 拓扑声明是契约校验，不是覆盖更新
+
+重复声明同名队列时，类型、durable、exclusive 及某些参数必须兼容。不匹配通常触发 PRECONDITION_FAILED 并关闭 Channel；不能用相同队列名把 classic 无缝改成 quorum，也不能靠重复声明给旧队列补上所有新属性。
+
+创建后固定的属性放在拓扑声明，可在线调整的 TTL、DLX、长度限制等优先通过 policy 管理。检查的是**生效配置**，不仅是某条 policy 是否存在：客户端 x-arguments、普通 policy、operator policy 的优先级和约束规则可能影响结果。
+
+普通 policy 不是按名字把所有匹配 JSON 自动叠加。重试、DLX 和容量限制若拆成互相竞争的策略，可能只生效其中一份；应合并需要共同生效的定义，并用管理 API 核对结果。Operator policy 对支持的资源上限另有约束规则。
+
+## 4. Queue 的状态与持久化到底保存什么
+
+### 4.1 ready、unacked、确认与存储回收
+
+工作队列中的消息从可投递状态进入消费者未确认窗口；manual ack 模式下，Broker 在处理确认后才允许移除相应交付责任。消费者关闭连接时，未确认消息通常重新可投递。
+
+ready 与 unacked 是观察处理阶段的指标，不是对某条 eventId 的完整历史。ready=0 可能表示已经成功消费，也可能表示都在 unacked、已经过期、进入延迟重试、被 dead-letter、被 purge，甚至查看了错误 vhost。
+
+逻辑上确认可删除，不代表磁盘文件立即缩小。日志分段、其他未完成记录和后台回收影响实际释放；尤其复制队列还有复制日志及压缩过程。排障应同时看业务积压、消息状态和磁盘使用，不能仅根据队列条数估算可用空间。
+
+### 4.2 durable、persistent、replicated 是独立维度
+
+- durable exchange/queue：重启后恢复对象定义。
+- persistent message：在支持该语义的持久队列中请求消息持久化。
+- replicated queue：在多个节点保存队列状态，承受指定范围的节点故障。
+- publisher confirm：让生产者得到 Broker 完成本次发布责任的信号。
+
+只声明 durable 队列，不能把所有发送调用瞬间变成安全落盘；只开启 confirm，也不能让临时队列获得永久保留能力。关键工作队列通常组合持久拓扑、persistent 属性、复制队列、发布确认与消费确认，再由业务协议处理重复。
+
+Quorum queue 会持久化发布给它的消息，不由单条 delivery_mode 决定是否写盘；但 dead-letter 会保留原消息 delivery mode，若后续进入 classic 队列，重启恢复语义仍受它影响。因此显式 persistent 不能因为第一跳用了 quorum 就被随意省略。
+
+### 4.3 三类队列的数据模型
+
+| 类型 | 保留与读取方式 | 主要适用场景 |
+| --- | --- | --- |
+| classic queue | 工作队列；4.x 不复制队列消息 | 临时、排他、可重建或明确接受单节点数据风险的工作 |
+| quorum queue | 基于 Raft 的复制工作队列 | 重视数据安全的支付、医嘱等任务 |
+| stream | 追加日志，按保留策略保存，可按偏移重复读取 | 事件回放、多订阅和日志型数据 |
+
+RabbitMQ 4.0 已移除 classic mirrored queues。旧教程的 ha-mode 不能作为 4.x 新建高可用工作队列方案。部署了三节点集群，也不表示所有 classic queue 的消息自动有三份。
+
+Stream 的消费完成不等同于工作队列的“这条消息从队列删除”。保留、偏移、去重与协议能力要按 Stream 模型理解，不能把工作队列 ack 的所有结论直接套过去。
+
+## 5. Quorum queue：多数派保护的是一条队列的状态
+
+### 5.1 leader、复制日志与提交
+
+每个 quorum queue 有自己的成员组、leader 和 followers。操作经 leader 协调写入复制日志，在多数成员认可后提交；生产者确认与这条队列的复制结果关联。
+
+三个成员的多数是两个，五个成员的多数是三个。关键是**该队列的成员**，不是管理界面显示整个集群还活着几台机器。客户端连接到非 leader 节点仍可通过集群处理请求，但多了一段内部通信，不等于本地完成全部操作。
+
+增加复制成员可以改变容错能力，也会增加磁盘、网络与协调成本；增加整个集群节点不一定自动按预期迁移所有队列成员或均衡所有 leader。应检查实际成员布局、自动成员协调配置及故障域。
+
+### 5.2 少数派无法继续提交时，应接受不可用
+
+网络分区后，缺少多数的一侧不能单独产生相同意义上的已提交结果。多数恢复和选主期间仍可能有发布超时、重复消费与客户端重连，业务层应通过同一 eventId 重试。
+
+如果多数副本永久丢失，不能用“强制恢复”按钮凭空找回已经不存在的数据。重建新队列也不等于恢复旧队列历史；需要 Outbox、业务事实或备份给出补偿来源。
+
+副本应分布于能隔离故障的节点和存储。跨高延迟、易分区的远距离网络部署集群会扩大复制延迟与可用性问题；跨地域需求应评估独立集群之间的复制/转发方案及重复恢复语义。
+
+### 5.3 为什么磁盘慢会表现为发送慢
+
+当日志写入、复制确认或存储回收跟不上时，confirm 延迟和内部流控都会上升。生产者如果因此无界并发重试，会增加在途发布、缓冲和重复消息，使原瓶颈进一步恶化。
+
+控制发布并发与未确认窗口，观察队列 leader、磁盘延迟、复制网络、消息大小与 confirm 分布，比盲目增加发送线程更有效。功能与版本边界参见 [RabbitMQ 4.3 Quorum Queues](https://www.rabbitmq.com/docs/4.3/quorum-queues)。
+
+## 6. Publisher confirm：一个发布尝试的异步结算
+
+### 6.1 confirm 序号不等于 eventId
+
+Channel 进入 confirm 模式后，发布序号用于关联 ack/nack；multiple 标记可能一次确认一段序号。不同消息的确认可能因路由和持久化路径不同而非按业务完成顺序返回，应用应按标识关联，不按“第几个回调”猜对应关系。
+
+推荐区分三层标识：
+
+```text
+eventId：同一业务事件，重试保持不变
+attemptId：本次发布尝试，重试重新生成
+channel + publishSequence：协议确认作用域
+```
+
+同一 eventId 可以存在先后两个在途 attempt。迟到的旧回调不能无条件覆盖新尝试的数据库状态，具体条件更新见 [[RabbitMQ场景题#3. Relay：短事务领取，网络等待放在事务外|Relay 实现]]。
+
+### 6.2 return 与 confirm 是两个维度
+
+| 观察结果 | 可以推断 | 不能推断 |
+| --- | --- | --- |
+| confirm ack，且同次发布被 return | Broker 已处理发布，但没有可路由终点 | 目标业务队列已收到 |
+| confirm ack，路由结算无 return | 按当前路由至少有目标承担接收，或 AE 已路由 | 全部预期订阅存在、消费者完成 |
+| confirm nack | 本次发布未按目标接收条件成功完成 | 所有目标队列都没接收 |
+| 超时或连接中断 | 当前缺少确定结果 | Broker 必然没有收到 |
+
+不可路由 mandatory 消息的 return 在协议上先于该次 confirm 发出。框架若把回调转交不同线程，应用仍需建立正确的关联与汇合，不要让 confirm 回调先把数据库标为成功，再被 return 覆盖又被另一次 ack 覆盖。
+
+一条消息路由到多个实际目标时，确认与这些目标的接收结果有关；部分队列可能已接受，另一个因容量拒收而使发布 nack。重发会在成功目标产生重复。Publisher confirm 不等待 consumer ack。[确认机制](https://www.rabbitmq.com/docs/confirms)
+
+### 6.3 Spring 中常见的配置缺口
+
+使用 Spring AMQP 的 correlated confirms 时，需要连接工厂启用对应确认类型，RabbitTemplate 使用 CorrelationData 关联尝试。处理 returns 还需开启 publisher returns，并对发布设置 mandatory；只注册一个 ReturnsCallback 不会自动让所有发布都可退回。
+
+`convertAndSend` 返回通常表示调用路径已完成，不表示异步确认已经到达。使用确认 future 或 callback 时，还要处理异常完成、超时、returned 信息和关闭状态；不能仅 `ack=true` 就修改 Outbox。
+
+每个 RabbitTemplate 只有对应的共享回调配置，不应在每次业务请求临时替换回调。具体关联与回调执行保证应核对所用 Spring AMQP 版本。[RabbitTemplate 确认与退回](https://docs.spring.io/spring-amqp/reference/amqp/template.html)
+
+## 7. Consumer ack：确认的是投递，不是数据库事务
+
+### 7.1 两种顺序只有一种能安全恢复
+
+```text
+先 ack → 数据库提交：中途崩溃可能永久漏处理
+数据库提交 → ack：中途崩溃可能重复投递
+```
+
+选择后者，并通过持久幂等记录和业务约束消除重复效果。ack 没有自动撤销外部接口，也不会检查你是否真的提交数据库；Broker 只按协议处理消费者声明。
+
+basic.ack 本身不再由 Broker 返回一个同级“ack 的 ack”。应用日志通常只能证明尝试发出确认，不能证明 Broker 在断线前一定处理了它。事务已提交但 ack 结果不确定时，应接受重投，再根据 Inbox 识别原结果。
+
+### 7.2 批量 ack 与并发处理的危险组合
+
+delivery tag 按 Channel 递增。若 tag=10 尚未处理完，tag=11 先完成，`basicAck(11, true)` 会连带确认此前未确认的 delivery，可能提前删除 tag=10 的恢复机会。
+
+并发完成顺序不一致时，使用单条确认，或维护连续完成水位后才推进批量确认。消费池、框架 batch 与业务批事务是三种不同边界，不能只因为“配置 batchSize=100”就认为一百条已经一起成功。
+
+重复确认同一 tag、在错误 Channel 确认，可能导致 unknown delivery tag 等协议错误。协议异常关闭 Channel 后，又可能重投该 Channel 其他未确认消息，扩大故障范围。
+
+### 7.3 Spring AUTO 不等于 Broker autoAck
+
+| Spring acknowledgeMode | 确认责任 | 常见误用 |
+| --- | --- | --- |
+| NONE | Broker 视为自动确认，无应用 ack | 当成“不确认，永远不删” |
+| AUTO | 容器根据 listener 执行结果等配置确认 | 吞掉异常后正常返回，导致被当成功 |
+| MANUAL | listener 明确调用确认 | 没有确认任何分支，消息长期 unacked |
+
+AUTO 和原生 `autoAck=true` 不是同一含义。若 listener 把工作扔进线程池后立即返回，容器可能已经按成功处理，而异步任务尚未完成；使用受支持的异步返回类型也要核实容器的确认行为。[Spring 容器配置](https://docs.spring.io/spring-amqp/reference/amqp/containerAttributes.html)
+
+在带 `@Transactional` 的 listener 方法内部调用 basicAck，还可能早于代理退出时的事务提交。更明确的教学边界是由 listener 调用另一个事务 Service，确认 Service 已完成提交，再 ack；异常必须传播或进入明确恢复分支。
+
+### 7.4 消费超时不等于旧业务线程停止
+
+RabbitMQ 4.3 quorum queue 的 consumer timeout 可以将长时间未确认的消息返回队列；AMQP 0-9-1 下，根据客户端能力，可能取消 consumer，或关闭 Channel。不要用一个跨版本的“超时一定关闭整个 Channel”概括所有实现。
+
+Broker 收回投递责任后，旧线程可能仍卡在数据库或外部调用里；它随后恢复，会与重投消费者竞争同一业务。超时保护的是交付窗口，不替代持久幂等、条件更新和下游幂等键。
+
+## 8. Prefetch、并发与反压：控制在途工作量
+
+### 8.1 Prefetch 是信用窗口，不是每秒速率
+
+manual ack 模式中，prefetch 限制消费者尚未确认的 delivery 数量，确认后释放窗口。RabbitMQ 常用的 `global=false` 行为是按 consumer 应用限制；quorum queue 不支持 global QoS 方式的全 Channel 共享限额。
+
+设置 0 表示客户端没有请求常规协议级数量限制，服务端或队列类型仍可能另有上限，不能理解成生产环境的安全默认。autoAck 模式也不能依赖相同的未确认窗口提供保护。
+
+单个 consumer 的串行 listener 即使 prefetch=100，也不会因此变成一百条并行业务；更多消息只是提前在应用或客户端等待。N 个 consumer、每个 prefetch=P，可能形成约 N×P 的在途规模，还要计入框架与应用自己的缓冲。
+
+### 8.2 估算容量时先分清平均值与尾延迟
+
+稳定负载下，可用 `在途量 ≈ 到达速率 × 平均停留时间` 建立直觉；粗略执行并发需求可用 `目标吞吐 × 平均处理秒数 ÷ 目标利用率` 估算。p95/p99 用于压力场景与等待预算，不能把 p95 直接冒充严格的平均排队公式。
+
+例如平均每条执行 40ms，目标 500 条/秒，不含额外约束时约需 20 个持续忙碌的执行单元；按 70% 利用率估算约 29 个。该数字只是教学估算，数据库连接池、远程限额、热点事务和重试会限制实际扩展。
+
+prefetch 应能覆盖流水线需要，又不让待执行消息长时间占住窗口。先测平均与尾延迟、消息体大小、执行并发和下游容量，再调整；不存在通用的 1、50 或 250 最优值。
+
+### 8.3 flow 与 blocked 不是一个故障
+
+内部 credit flow 在队列、复制、存储等环节处理不过来时向发布链路施加背压；memory/disk alarm 则可在集群范围阻塞发布连接。HTTP 管理接口仍可访问，不代表发布链路健康。
+
+发布和消费共用受阻连接时可能互相影响，关键系统可按客户端支持分离连接职责。无界积累未确认发布或应用任务，只是把 Broker 的背压搬进 JVM，最终变成内存与重试风暴。
+
+## 9. TTL、长度限制与死信：消息离队有多种原因
+
+### 9.1 消息 TTL 与队列 TTL 不同
+
+消息 TTL 控制消息在队列中的有效等待时间；队列 TTL 控制未使用队列的生命周期。队列到期被删除，不会因此把里面所有消息逐条送进 DLX。
+
+给消息设置 expiration，不等于到某时刻精确触发业务。过期移除或死信转发受队首和处理时机影响；已经投递的消息也可能在处理前超过业务有效时间，消费者必须重新检查业务 deadline。
+
+不同 per-message TTL 混在同一延迟队列，可能出现短到期消息被长到期消息挡住。固定队列 TTL 的分桶方案更容易预测，但仍是近似延迟，不是可靠的长期业务调度器。
+
+### 9.2 长度上限不是所有消息状态的总内存上限
+
+队列长度/字节限制主要围绕 ready 等队列保留计数语义，不应直接当成 JVM 在途内存或整个复制存储的硬上限。unacked、消息头、复制副本和保留死信还需单独计量。
+
+默认 drop-head 倾向移除旧消息；reject-publish 拒绝新发布并通过确认失败反馈。多路由目标中一个拒收，其他目标可能已接受，所以拒收不等于全局回滚。
+
+经典队列的 reject-publish-dlx 与 quorum 的支持范围不同，不能看到同名参数就默认跨类型可用。
+
+### 9.3 DLX 是再次发布，不是原地换标签
+
+消息因 reject/nack(requeue=false)、过期、队列长度策略或 quorum delivery limit 等事件离开源队列后，可以被重新路由到 DLX。DLQ 是最终承接的普通队列，而不是一个自动保证永不丢失的特殊存储。
+
+没有 DLX、目标不存在、绑定错误、目标拒收，都要明确处理。默认 dead-lettering 的转发安全性不能视为“源队列持久，所以下一跳也持久”。关键源 quorum queue 可配置 at-least-once dead-lettering，通常需要同时设置：
 
 ```json
 {
-  "event_id": "01J...全局唯一事件ID",
-  "event_type": "payment.succeeded",
-  "schema_version": 2,
-  "aggregate_id": "PAY202607170001",
-  "occurred_at": "2026-07-17T10:30:00Z",
-  "trace_id": "trace-...",
-  "payload": {}
+  "dead-letter-exchange": "hospital.failed.x",
+  "dead-letter-strategy": "at-least-once",
+  "overflow": "reject-publish"
 }
 ```
 
-- `event_id`：同一业务事件重发时保持不变，用于追踪和 Inbox 去重；
-- `aggregate_id`：订单号、支付单号、医嘱号等业务实体标识，用于状态约束与对账；
-- `schema_version`：显式管理兼容性，不依赖消费者猜测字段版本；
-- `trace_id`：用于链路日志，不替代幂等键。
+还需满足实际版本的 feature flag 等前提（4.3 文档要求 `stream_queue` 已启用），并设置可承受的保留容量。源队列等待转发确认期间会保留消息，目标不可用可能令源队列容量持续上涨；重试也可能给已接收目标造成重复。它改善移交可靠性，不解决消费业务幂等。[死信机制](https://www.rabbitmq.com/docs/dlx)
 
-### 5.2 消费端 Inbox
+在线把 at-least-once 改回 at-most-once，或把 overflow 从 reject-publish 改为不兼容的 drop-head，可能删除尚未完成目标确认的保留死信。配置变更也属于数据生命周期操作，不能因为 policy 可动态修改就认为可以无损随时切换。
 
-可靠做法是把 Inbox 记录与业务变更放在同一数据库事务中：
+### 9.4 x-death 是死信历史，不是总尝试次数
 
-```sql
-BEGIN;
+x-death 按队列、原因等记录死信信息，可能合并计数并更新顺序。不能总取数组第一个 count 当成整个系统的“已重试几次”；消息经过多个队列或应用重新发布后，含义会变化。
 
-WITH accepted AS (
-    INSERT INTO consumer_inbox(consumer_name, event_id, received_at)
-    VALUES ('invoice-service', :event_id, CURRENT_TIMESTAMP)
-    ON CONFLICT (consumer_name, event_id) DO NOTHING
-    RETURNING event_id
-)
-UPDATE invoice
-SET payment_status = 'PAID'
-WHERE payment_order_id = :aggregate_id
-  AND payment_status = 'UNPAID'
-  AND EXISTS (SELECT 1 FROM accepted);
+应用重新 publish 不会自动增加 Broker 的死信次数。自建 attemptCount、x-delivery-count 与 x-acquired-count 也有不同作用域，应明确哪个约束业务总预算。
 
-COMMIT;
--- commit 成功后再 ack
-```
+DLX 配错回环还可能形成死信循环；Broker 对某些循环有保护或丢弃行为，不能把循环本身当作无限可靠存储。
 
-上例使用 PostgreSQL CTE，使“首次插入 Inbox”成为业务更新的前置条件。具体数据库语法不同，也可以先执行去重 INSERT，再依据受影响行数决定是否继续，但两个动作必须处于同一事务。核心约束不变：
+## 10. 重试：先分错误，再选择移交方式
 
-- 唯一约束必须由持久化数据库执行，而不是只做“先查后写”；
-- 状态更新使用条件表达合法迁移，例如 `UNPAID → PAID`；
-- 应用必须检查两步的受影响行数：Inbox 插入 0 行表示已处理的重复事件；插入 1 行且业务更新 1 行才是本例的正常首次处理；插入 1 行但业务更新 0 行时，要判断是否为合法终态，否则回滚事务并隔离/告警，不能提交 Inbox 后静默 ack；
-- commit 后、ack 前崩溃会产生重投，Inbox 唯一约束使它安全；
-- 若调用外部支付、短信或第三方接口，应向下游传递 idempotency key，或用本地状态机记录每一步。
+### 10.1 有限重试必须同时限制时间与速率
 
-Redis `SET NX` 可做短期防抖或降低数据库压力，但缓存过期、淘汰、主从切换和“标记成功但业务失败”的窗口，使它不适合作为资金、库存等场景唯一的幂等事实源。
+单条瞬时失败可以延迟重试，非法数据应隔离；整体数据库或 Redis 不可用时，应暂停或降速消费者，而不是让每条消息高速重试。
 
-### 5.3 生产端 Transactional Outbox
+预算至少包含尝试次数、总有效期限、退避、速率、最终去向和恢复负责人。延迟只降低频率，不自动终止；最大次数也不能保证业务仍在允许的处理窗口内。
 
-直接双写数据库和 MQ 缺少原子性，两种执行顺序分别产生失败窗口：
+### 10.2 RabbitMQ 4.3 quorum 内部 delayed retry
 
-1. 数据库先提交、MQ 后发送：数据库成功但发布失败，业务已发生而事件缺失；
-2. MQ 先发送、数据库后提交：发布成功但数据库回滚，下游看到并未成立的业务事件。
+4.3 quorum queue 可按策略把返回消息延迟再投递，并提供线性退避。配置项包括 delayed-retry-type、delayed-retry-min 和 delayed-retry-max；它不同于历史 delayed-message-exchange 插件，也不能复制到 classic queue 或旧版本直接使用。
 
-Outbox 把业务变更与事件记录放在同一本地事务中：
-
-```text
-业务事务：写业务表 + 写 outbox(NEW) → commit
-                                  │
-                                  ▼
-Relay：读取 NEW → publish（同一 event_id）→ 等 confirm
-                                  │
-                     ├─ Confirm 维度：ACK / NACK / UNKNOWN
-                     └─ Routing 维度：RETURNED / AE_CAPTURED / AT_LEAST_ONE
-
-只有两个维度的组合符合业务契约时才标记 PUBLISHED；
-RETURNED + ACK 是合法组合，必须保留为 UNROUTABLE。
-```
-
-Relay 在发布成功后、标记 `PUBLISHED` 前崩溃，仍可能重复发布。因此 Outbox 解决“最终会发”，不替代消费端幂等。对于必须到达多个下游的事件，一个全局 `PUBLISHED` 也不能表达每个订阅方的处理结果；这些结果应由独立 receipt/Inbox/对账记录。
-
-## 6. 失败处理、重试与死信
-
-### 6.1 先分类，再决定动作
-
-| 失败类型 | 示例 | 建议动作 |
+| 4.3 AMQP 0-9-1 路径 | delivery-count 是否增加 | 设计含义 |
 | --- | --- | --- |
-| 短暂失败 | 网络抖动、行锁冲突、短时限流 | 有上限的延迟重试，带退避与抖动 |
-| 整体依赖不可用 | 数据库、Redis、下游服务整体宕机 | 暂停消费者或降低并发，避免给每条消息创建重试风暴 |
-| 永久业务失败 | 字段非法、状态不允许、schema 不兼容 | 不重试，进入隔离队列并告警 |
-| 未知失败 | 新异常、无法确认根因 | 小预算重试后隔离；保留完整上下文 |
+| basic.reject 返回重试 | 是 | 可以配合失败计数与 delivery limit |
+| basic.nack 返回重试 | 否 | 不能单靠 delivery limit 终止此类循环 |
+| 客户端崩溃、连接丢失 | 是 | 大 prefetch 会使一批在途消息共同受到影响 |
+| consumer timeout | 4.3 专页定义为不增加 | 不能把所有返回都叫一次失败 |
 
-重试预算至少包含：
+`failed` 延迟计入失败的路径，`returned` 延迟未增加该计数的返回，`all` 覆盖两类。失败数递增时按最小延迟线性增长并受最大值限制；不增加计数的返回通常保持最小延迟。以 1 秒最小、30 秒最大举例，第四次递增应是约 4 秒，而不是直接达到 30 秒；具体计数、调度和上限以版本实现与实验核对。
 
-- 最大尝试次数；
-- 最大总时间窗口；
-- 退避策略；
-- 单位时间重试速率；
-- 最终去向；
-- 人工或自动回放的准入条件。
+4.x quorum 的默认 delivery limit 为 20，但 4.3 改变了计数含义。没有有效 DLX 时达到限额可导致丢弃；显式 nack 不增长失败计数又可能无限循环。升级不能只确认应用还能连上，还应验证 reject、nack、断线和超时四条路径。[4.3 重试与计数定义](https://www.rabbitmq.com/docs/4.3/quorum-queues#delayed-retry)
 
-“无限 `requeue=true`”不是重试策略。它没有延迟、没有预算，也无法区分暂时失败与永久失败。
+### 10.3 固定 TTL 重试桶的可靠移交
 
-### 6.2 RabbitMQ 4.3 quorum queue 的延迟重试
-
-RabbitMQ 4.3 为 quorum queue 引入 Broker 内部的 delayed retry。被退回的消息可以先在原队列中延迟，之后再变为可投递，避免“重新发布到重试队列，再经 TTL/DLX 回原队列”的两次改写和客户端双写窗口。
-
-Policy 示例：
-
-```bash
-rabbitmqctl set_policy qq-delayed-retry \
-  "^critical\\." \
-  '{"delayed-retry-type":"all","delayed-retry-min":1000,"delayed-retry-max":30000}' \
-  --priority 10 \
-  --apply-to "quorum_queues"
-```
-
-延迟按 delivery count 做线性退避：
+兼容旧版本或需要明确的多档延迟时，可以使用 retry.10s、retry.1m 等固定 TTL 队列，到期经 DLX 回业务队列。但一个源队列只有一套生效 DLX，不能让一次 reject 根据异常动态选“重试”或“最终隔离”。
 
 ```text
-delay = min(delayed-retry-min × delivery-count, delayed-retry-max)
+暂时错误：应用发布到指定 retry 目标
+          → 等目标确认与路由结算
+          → 再 ack 原 delivery
+永久错误：进入已验证的隔离目标
 ```
 
-使用前必须确认：
+目标接收成功后原 ack 丢失会重复，先 ack 再发布失败则会丢失。采用前一种顺序，并用稳定 eventId、持久重试预算处理重复；重试桶到主队列的 Broker 移交仍需评估 DLX 安全性。
 
-- 仅 RabbitMQ 4.3+ quorum queue 支持该能力；
-- `delayed-retry-type=failed` 只延迟会增加 `delivery-count` 的失败，`returned` 只延迟不增加该计数的返回，`all` 两者都延迟；
-- 在 RabbitMQ 4.3 的 AMQP 0-9-1 语义中，`basic.reject`、连接/Channel 异常等失败会增加 `delivery-count`，`basic.nack` 返回不增加；不增加计数的返回通常一直使用最小延迟，不能形成递增退避；
-- delayed retry 本身不强制启用 delivery limit 或 DLX；生产架构仍应为会增加 `delivery-count` 的失败设计终止条件，并为不增加该计数的 `basic.nack` 路径实现应用级预算；
-- 如果所有消息都因同一依赖宕机而失败，官方建议暂停消费者，而不是延迟每一条消息。
+核查时 [rabbitmq-delayed-message-exchange 仓库](https://github.com/rabbitmq/rabbitmq-delayed-message-exchange)显示已于 **2026-09-24** 归档。既有部署需独立评估兼容与迁移，不把“启用插件”当作跨版本默认方案，也不要将它与 4.3 quorum 内部 delayed retry 混为一谈。持久业务定时任务还应保留任务表和扫描恢复来源。
 
-### 6.3 旧版本的 TTL + DLX 重试
+## 11. 顺序与优先级：从入队次序到业务提交次序
 
-RabbitMQ 4.2 及更早版本常用固定延迟桶。需要先明确：一个源队列只有一套有效 DLX 配置，消费者不能靠一次 `reject` 根据异常类型临时选择 retry exchange 或最终 DLQ。
+### 11.1 FIFO 不能约束所有并发层
 
-```text
-Consumer 分类失败
-  ├─ transient ── app publish + confirm/route ─> Retry exchange
-  │                                               └─> retry.10s / 1m / 5m
-  │                                                      │ TTL 到期
-  │                                                      └─ DLX ─> Main exchange
-  └─ permanent/超限 ─ reject(requeue=false) ─> Source queue DLX ─> DLQ
+一条队列的一次投递序列，与多个消费者的实际提交序列不同。多个生产 Channel 并发、消费者执行时间不同、重投、重试绕行、优先级都会改变端到端观察到的顺序。
 
-transient 目标发布确认且路由符合契约后，才 ack 原 delivery
-```
+按 aggregateId 稳定分片、分片内单活消费者，可以缩小乱序范围，但如果活跃消费者内部并行处理，完成顺序仍会变化。Single Active Consumer 提供消费角色切换，不提供业务事件版本校验。
 
-设计注意：
+严格事件序列需要连续序号与缺口处理；完整状态快照可以按版本取新，增量扣减不能跳过中间事件。失败事件进入延迟重试后，后续事件是否可以继续，必须由业务协议决定。
 
-- 对不同延迟使用多个“队列级 TTL”桶，通常比把不同 per-message TTL 混在一个队列更可预测；
-- 过期消息通常在到达队首时才被移除或 dead-letter，队列拥堵时延迟不是精确定时；
-- TTL + DLX 是近似延迟和失败重试机制，不应承担要求精确执行时刻的长期业务调度；
-- “客户端重新 publish，确认可路由后再 ack 原消息”仍不是跨两次 Broker 操作的原子事务：确认丢失会导致重复，目标发布失败时不能无条件 ack 原消息；
-- 如果选择“源队列统一 reject 到 retry”的纯 Broker DLX 拓扑，永久错误也会先进入同一 retry 路径；最终分类仍需要应用逻辑或拆分源队列。
+### 11.2 消息优先级不会抢占在途任务
 
-历史上的 `rabbitmq_delayed_message_exchange` 社区插件已于 2026-04 归档。既有 RabbitMQ 4.2 部署可按兼容性评估维护风险，新系统不应再把它作为默认方案。
+Classic priority queue 在创建时配置 x-max-priority，增加等级有额外成本；quorum 4.0～4.2 的相对两档语义，与 4.3 的 0～31 严格优先级不同。4.3 quorum 默认未指定消息 priority 为 4；被返回的消息进入 returns queue，不保留原消息 priority，按返回顺序重新安排，不能把严格优先级理解为所有重投都按原优先级插回。
 
-### 6.4 DLX 与 DLQ
+高优先级不能召回已 prefetch 的普通消息，不能打断已经开始的处方审核。持续紧急流量也可能饿死普通业务。需要独立延迟 SLO 时，紧急队列与专属容量往往比一个巨型优先级队列更容易控制。
 
-Dead Letter Exchange（DLX）是普通交换机。消息从队列发生以下事件时可以被 dead-letter：
+consumer priority 是选择优先向哪个消费者分发，message priority 是选择优先投递哪条消息，两者不是同一个配置。
 
-1. 消费者 `basic.reject` 或 `basic.nack` 且 `requeue=false`；
-2. 消息 TTL 到期；
-3. 队列达到长度限制：默认 `drop-head` 会在已配置 DLX 时 dead-letter 队首旧消息；classic queue 的 `reject-publish-dlx` 可 dead-letter 被拒的新消息；
-4. quorum queue 的消息超过 delivery limit。
+## 12. 从数据库到 MQ：事务能力不能跨界推导
 
-需要纠正的常见说法：
+### 12.1 本地事务无法覆盖一次普通发布
 
-- “消息未确认就会自动进入 DLQ”不准确；未确认消息仍属于 unacknowledged，channel/connection 关闭后通常重新入队。
-- 队列本身到期被删除时，其中消息不会因此逐条 dead-letter。
-- 没有配置 DLX 时，`reject/nack(requeue=false)` 会丢弃消息。
-- 建议用 policy 配置 DLX，便于在线调整；硬编码 `x-dead-letter-exchange` 往往需要删除并重建队列才能修改。
+先写库后发消息，中途崩溃会留下无事件的业务事实；先发消息后提交库，则下游可能看到后来回滚的业务。afterCommit 回调改善顺序，却不能在提交后进程退出时可靠补发。
 
-`reject-publish` 本身只拒绝新发布并通过 confirm `nack` 通知生产者，不会把该新消息送入 DLX；quorum queue 也不支持 classic queue 的 `reject-publish-dlx`。
+Outbox 将业务变更与待发布事件放入同一个数据库事务。Relay 负责不断尝试发布，并把确认状态持久化。事件发布后标记前崩溃会重复，因此 Outbox 不能代替 Inbox。
 
-RabbitMQ 默认 dead-letter 转发采用 at-most-once 策略，目标不可用、无法路由或拒收时可能丢失。对关键消息，可在 **源队列为 quorum queue** 时显式启用 at-least-once dead-lettering。必要配置是：
+AMQP Channel 事务与 publisher confirm 是不同机制，同一 Channel 上也不能随意混用；即使使用 AMQP 事务，也不会天然把 MySQL 纳入同一原子提交。Spring 的事务同步应按框架保证理解，不能把注解名称当作分布式事务证明。
 
-- `dead-letter-strategy=at-least-once`；
-- `overflow=reject-publish`；
-- 配置有效的 `dead-letter-exchange`；
-- 对从旧版本升级的集群，确认官方要求的 `stream_queue` feature flag 已启用。
+### 12.2 Inbox 与业务修改必须一起提交
 
-容量保护方面，强烈建议为源队列配置长度/字节上限并监控死信积压。源 quorum queue 会保留死信，直到所有实际路由目标都返回 publisher confirm；任一目标不可用、拒收或未确认都会触发周期重试，其他已经接收的目标因而可能收到重复。
+消费事务先以 `(consumerName, eventId)` 唯一约束识别事件，再执行合法业务迁移，最后一起提交。重复消息查询已提交记录，确认内容一致后可安全 ack。
 
-RabbitMQ 会在 AMQP 0-9-1 消息中维护 `x-death` 数组，记录队列、原因、次数、交换机和路由键等。不要为了“头太大”无条件删除它；`x-death` 只由 Broker dead-lettering 更新，应用主动重新 publish 一个新消息不会自动增加这段记录。RabbitMQ 4.3 quorum queue 用 `x-acquired-count` 记录取得/返回次数，用 `x-delivery-count` 记录计入 delivery limit 的失败次数；应用自建 `retry_count` 时要明确它与这些 Broker 计数的关系。
+把去重标记写入 Redis 后再改数据库，会产生“标记存在、业务没完成”的窗口；把 Inbox 单独提前提交也有同样问题。数据库业务更新零行必须判断是合法幂等终态还是异常状态，不能提交一条空完成记录后 ack。
 
-### 6.5 DLQ 不是垃圾桶
+外部开票、短信、支付调用仍需要下游幂等键或查询恢复协议。把远程 HTTP 放进数据库事务，只会延长持锁，不会让回滚撤销已经发生的外部效果。
 
-可运营的 DLQ 至少需要：
+## 13. 排障：先选一个事件，再看整个系统
 
-- 队列名能反映来源和事件类型；
-- 告警：新增速率、总量、最老消息年龄；
-- 可检索字段：`event_id`、`aggregate_id`、`event_type`、生产者、消费者、首次/最后失败时间、错误分类；
-- 对 payload 中敏感信息做访问控制和脱敏；
-- 明确“修复后回放、业务补偿、确认丢弃”的审批与审计；
-- 回放保留原 `event_id`，限速执行，并验证消费端幂等；
-- 定期演练目标 exchange/queue 不存在、DLQ 满、回放再次失败等场景。
+### 13.1 用证据限定结论
 
-## 7. 堆积、流控与容量
-
-### 7.1 先看趋势，不看单点截图
-
-| 信号 | 含义 | 常见解释 |
+| 现象 | 优先确认 | 避免的跳跃结论 |
 | --- | --- | --- |
-| `messages_ready` | 尚未投递给消费者 | 无消费者、消费能力不足、消费者暂停或路由到冷队列 |
-| `messages_unacknowledged` | 已投递但尚未 ack | 处理慢、卡死、prefetch/并发过大、ack 逻辑异常 |
-| publish / deliver / ack rate | 生产、投递、确认速率 | 手动 ack 模式下持续 `publish > ack` 会形成容量缺口；其他确认模式要选对应 delivery 指标 |
-| consumer count / capacity | 消费者数量及队列向消费者投递的能力 | capacity 低需要结合消费者是否忙、prefetch 和处理耗时解释 |
-| 队首 timestamp / 业务 lag | 等待时间线索 | 消息 timestamp 可能缺失或错误；SLO 优先用可信 `occurred_at`、Outbox 时间和 Consumer 观测 |
-| redelivery / reject / dead-letter rate | 失败与重投 | 突增常见于依赖故障、毒消息或错误的 requeue |
-| confirm latency / connection `flow` | Broker 接收压力 | 磁盘、复制、队列进程或下游存储跟不上 |
-| memory/disk alarm | Broker 资源水位 | 任一节点触发时，集群会阻塞发布连接 |
+| ready 持续增长 | 流入、完成速率、消费者与下游 | 立刻增加全部线程 |
+| unacked 高 | 执行耗时、prefetch、线程池、提交与确认路径 | 消息一定丢了 |
+| confirm 慢 | 复制、磁盘、flow、alarm、发布并发 | 必须立刻重发全部 |
+| 下游结果缺失、ready=0 | Outbox、拓扑历史、Inbox、TTL/DLX、环境 | 发送端肯定没发 |
+| redelivery 高 | 断线、错误分类、重试计数与版本 | 增大 delivery limit 就结束问题 |
+| 节点恢复但业务未恢复 | 队列实际成员、消费状态、业务差集 | 管理台绿色等于恢复完成 |
 
-`Ready=0` 只说明此刻没有 ready 消息，不能证明某个业务事件“从未进入队列”。它还可能已经被消费、处于 unacknowledged、过期、dead-letter、被清理、进入另一个 vhost/队列，或者队列被删除重建。
+### 13.2 Management UI 与 Trace 都不是业务账本
 
-### 7.2 Prefetch 的真实作用
+管理台展示当前状态和部分统计，不保存可随时按 messageId 检索的完整消息历史。Firehose/tracing 需要事先开启，会复制 publish/deliver 事件并增加负载；它不替代逐条业务提交证据，也不能凭空还原开启之前的事件。
 
-`basic.qos(prefetch)` 限制未确认 delivery 的滑动窗口，主要用于：
+长期保存 Outbox/Inbox、必要的结构化日志、拓扑版本与业务对账结果。患者、支付等 payload 应最小化采集与脱敏，诊断不应变成复制全部敏感数据的渠道。
 
-- 防止单个消费者内存中堆积过多消息；
-- 平衡多个消费者之间的分发；
-- 让网络和处理流水线保持适度并行。
+### 13.3 恢复目标是业务收敛
 
-它不是“每秒消费 N 条”的限流器。`prefetch=0` 表示不设协议级上限，通常风险很高。过小会让消费者等待网络往返，过大则会造成不公平、故障恢复时大量重投，并降低紧急消息插队的响应性。
+观察队列净积压趋势，可以粗估恢复时间；若处理能力 μ、持续流入 λ 满足 μ>λ，稳定条件下约需 `积压量/(μ-λ)`。如果 μ≤λ，再多等几分钟也不会追平。
 
-RabbitMQ 对 `basic.qos` 的解释与 AMQP 0-9-1 规范存在扩展，常见行为是把 prefetch count 分别应用到 channel 上的新 consumer。Spring AMQP 还会把 listener concurrency、batch 和 prefetch 组合起来；不要照抄 `1/50/100`，应以消息大小、p95 处理时延、并发模型和故障恢复成本压测。
+TTL 丢弃、DLX 转移和 purge 都可能让队列变短，所以队列变短不自动意味着业务成功。最终检查应包括最老业务年龄、Outbox/DLQ 遗留、各订阅结果差集，以及是否出现重复副作用。
 
-粗略容量估算：
+## 14. 验证机制：把断线和失败插入关键边界
 
-```text
-所需并发数 ≈ 峰值到达速率 × 单条 p95 处理秒数 ÷ 目标利用率
-```
+下表为隔离测试环境的验证方案，不是允许直接在生产删除绑定或制造故障。
 
-例如峰值 500 msg/s、p95 处理 40 ms、目标利用率 70%，理论并发约为 `500 × 0.04 / 0.7 ≈ 29`。还要为重试、GC、下游抖动和分片不均预留余量。
+| 实验 | 操作 | 预期观察 |
+| --- | --- | --- |
+| 零匹配 | 向存在但无匹配队列的交换机 mandatory 发布 | return 与 confirm ack 可同时出现 |
+| 部分订阅缺失 | 保留 A 绑定，去掉 B 绑定 | A 收到，无不可路由 return；B 缺失需契约检查发现 |
+| 结果未知 | 在发布与确认持久记录之间切断连接 | 稳定 eventId 重试，可能产生重复 |
+| 提交后重投 | 消费事务提交后、ack 前停止消费者 | 重投依靠 Inbox，不产生第二次业务效果 |
+| 批量确认 | 先完成高 tag，低 tag 保持未完成 | multiple=true 有提前确认风险 |
+| 4.3 重试计数 | 分别 reject、nack、断线、触发超时 | 核对 acquired/delivery 计数及 DLX 最终去向 |
+| 死信目标不可用 | 阻断目标接收 | 对比默认与 at-least-once 移交的保留和积压 |
+| 复制故障 | 三成员队列分别失去一个、两个成员 | 区分可选主继续与失去多数不可用 |
+| 优先级 | 普通消息进入 unacked 后再发紧急消息 | 已交付任务不会被召回 |
 
-### 7.3 堆积的处理顺序
+本轮文档维护完成官方资料核对与文档结构检查；当前机器无可用 RabbitMQ 服务，Docker daemon 未运行，因此未执行上述 Broker 实验。项目篇中的独立 Java 状态判定示例另行做本地编译与断言验证，不能用它替代 RabbitMQ 集成测试。
 
-1. **确认数据安全**：停止无限 requeue；确认消息是否有持久化、DLX、Outbox 和重放来源。
-2. **定位瓶颈**：比较 publish/ack 趋势，区分 ready 高、unacked 高、Broker 流控和下游故障。
-3. **控制新增量**：对非关键生产流量限流；必要时暂停批任务。
-4. **恢复依赖**：数据库、Redis 或第三方整体不可用时，单纯扩消费者会放大故障。
-5. **提高可持续消费能力**：优化慢查询/远程调用，调整并发与 prefetch，确认没有线程池和连接池瓶颈。
-6. **按证据扩容或分片**：增加消费者前先验证单队列仍有投递余量；确有队列热点时再按稳定业务键分片。
-7. **限速追平**：恢复后同时保护在线流量和下游，监控最老消息年龄直到回到 SLO。
+## 15. 资料与下一步阅读
 
-RabbitMQ 推荐长连接、长生命周期的 push consumer。不要用循环 `basic.get` 伪造“批量消费”；它效率较低且更难正确管理 delivery tag。业务批处理可以在消费者内聚合，但只有在整批结果都已安全提交时才可以批量 ack。
+机制查阅优先使用 [RabbitMQ 4.3 Quorum Queues](https://www.rabbitmq.com/docs/4.3/quorum-queues)，稳定协议与概念参照 [Confirms](https://www.rabbitmq.com/docs/confirms)、[DLX](https://www.rabbitmq.com/docs/dlx)、[TTL](https://www.rabbitmq.com/docs/ttl)、[Consumer Prefetch](https://www.rabbitmq.com/docs/consumer-prefetch)、[Policies](https://www.rabbitmq.com/docs/policies)。滚动页面所显示版本可能高于本文，部署前需要对照。
 
-## 8. 顺序、并发与优先级
+Java 集成核对 [Spring AMQP 容器配置](https://docs.spring.io/spring-amqp/reference/amqp/containerAttributes.html)与 [RabbitTemplate](https://docs.spring.io/spring-amqp/reference/amqp/template.html)，不要把 Spring AUTO 与 Broker autoAck 混为一谈。
 
-### 8.1 FIFO 的边界
-
-普通队列在不考虑优先级、多个消费者和重投时，按入队顺序投递。要区分 Broker 投递顺序与业务完成顺序：prefetch 不改变入队顺序，但会扩大在途窗口，并在多消费者或应用并行时放大完成顺序差异。端到端顺序还可能被以下因素改变：
-
-- 多个消费者并行处理完成顺序不同；
-- 消息重新入队；
-- 高 prefetch 使更多消息提前处于在途状态；
-- 生产者使用多个 channel/connection 并发发布；
-- priority queue 先投递高优先级消息。
-
-需要“同一订单内有序”时，常见做法是按 `aggregate_id` 稳定分片，让同一实体进入同一队列，并在该分片内限制并发；需要每个队列严格单消费者时可评估 Single Active Consumer。顺序越严格，可用并行度通常越低。
-
-### 8.2 优先级怎么设计
-
-优先考虑**独立队列**：
-
-```text
-urgent queue  ── dedicated capacity ──> urgent workers
-normal queue  ── reserved capacity  ──> normal workers
-```
-
-它能提供资源隔离、独立 SLO 和独立扩容，也能避免低优先级永久饿死。一个“巨型优先级队列”更难推理和运维。
-
-使用 Broker 消息优先级时：
-
-- Classic queue 必须在创建时设置 `x-max-priority`，无法通过 policy 给既有队列补上；优先级层级越多，CPU 和内存开销越高，通常只用少量等级。
-- RabbitMQ 4.0～4.2 的 quorum queue 只有两档相对优先级；RabbitMQ 4.3 起支持 0～31 的严格优先级，且不使用 classic queue 的 `x-max-priority`。
-- RabbitMQ 4.3 quorum queue 中，未设置 priority 的消息按 4 处理、越界值会截断到 0～31；被 reject/nack/modify 返回的消息进入 returns queue，不保留原优先级，而是按返回顺序重排。
-- 已经被 prefetch 到消费者的普通消息不会被 Broker 召回，因此“高优先级”不等于端到端抢占。
-- 必须设计普通流量的最低服务份额，避免持续紧急流量造成饥饿。
-
-## 9. 可观测性、审计与运行规范
-
-### 9.1 每条消息的证据链
-
-关键事件至少记录以下结构化阶段：
-
-```text
-OUTBOX_CREATED
-PUBLISH_ATTEMPTED
-PUBLISH_CONFIRMED | PUBLISH_NACKED | PUBLISH_UNKNOWN
-PUBLISH_RETURNED | AE_CAPTURED | ROUTED_TO_AT_LEAST_ONE
-CONSUMER_RECEIVED
-BUSINESS_COMMITTED | BUSINESS_FAILED
-DELIVERY_ACKED | DELIVERY_REJECTED
-DLQ_STORED | REPLAY_REQUESTED | REPLAY_SUCCEEDED
-```
-
-每条记录携带 `event_id`、`aggregate_id`、exchange、routing key、queue、vhost、应用版本和时间。日志中的 “send success” 只有在语义明确时才有价值；把“调用客户端 API 未抛异常”写成“消息已入队”会误导排障。
-
-### 9.2 监控与告警
-
-生产环境优先使用 Prometheus 插件和 Grafana 保存趋势，Management UI 适合交互式排查，不是历史审计系统。建议至少建立：
-
-- 节点：存活、网络分区、CPU、内存、磁盘、文件描述符、Erlang 进程；
-- 连接：blocked、blocking、`flow`、连接/Channel 数、认证失败；
-- 队列：ready、unacked、publish/deliver/ack/redelivery、consumer、consumer capacity、队首 timestamp；同时从业务时间计算真实 lag；
-- 可靠性：confirm/nack/return 计数与延迟、DLX/DLQ 增量、Outbox 未发送年龄；
-- 业务：事件产生到最终业务状态的端到端 lag、对账差异量。
-
-RabbitMQ 的 memory/disk alarm 是集群范围的：任一节点越过水位，所有节点都会阻塞曾尝试发布的连接，直到全群告警清除；纯消费连接仍可继续收到投递。`blocked` 是资源 alarm 的客户端状态，`flow` 则是队列、复制或磁盘跟不上发布速率时的瞬态背压，两者不是同一机制。应用必须分别暴露 blocked、flow 和 confirm 延迟，不能只看 HTTP API 是否存活。
-
-### 9.3 Trace 的定位
-
-Firehose / `rabbitmq_tracing` 可以在指定节点和 vhost 复制 publish/deliver 事件，适合短期调试。开启后会生成并路由额外消息，降低性能，并可能复制完整消息体：
-
-- 不要默认在全生产集群长期全量开启；
-- 使用前评估 PHI/PII 等敏感数据暴露；
-- 它能看到 publish 和 deliver，不记录逐消息 consumer ack/nack，也不是业务事务提交与最终一致性的权威审计；
-- 长期审计应依靠 Outbox、Inbox、结构化业务日志和对账表。
-
-### 9.4 生产检查清单
-
-- [ ] 明确 RabbitMQ、协议和客户端版本，并记录升级差异
-- [ ] 核心工作队列使用 quorum queue；不再配置 classic mirrored queue
-- [ ] durable topology + persistent message + publisher confirms
-- [ ] `mandatory`/return 或 AE 有处理器和告警
-- [ ] 关键 fan-out 订阅有拓扑契约测试和业务对账
-- [ ] 消费者手动 ack，业务提交后确认
-- [ ] event ID、业务 ID、schema version 统一
-- [ ] Inbox/唯一约束保证幂等；Producer 使用 Outbox
-- [ ] 重试有限、有延迟、有时间预算；永久错误直接隔离
-- [ ] DLX/DLQ 的转发安全性、容量、告警和回放流程经过演练
-- [ ] 用压测确定 concurrency、prefetch、连接池和下游容量
-- [ ] 告警关注趋势与最老消息年龄，而不是只看队列条数
-- [ ] 定期做“业务事实 vs 下游结果”的差集对账
-
-## 10. 常见误区速查
-
-| 误区 | 更准确的说法 |
-| --- | --- |
-| “消息持久化后就绝不会丢” | durable、persistent、confirm、复制队列分别解决不同失败窗口 |
-| “confirm ack 说明消费者处理成功” | confirm 与 consumer 完全无关 |
-| “confirm ack 说明每个订阅队列都收到” | 它可能不可路由，也无法证明每个预期订阅；要结合 return、拓扑测试和对账 |
-| “手动 ack 可以避免重复消费” | 手动 ack 减少丢失，但提交后 ack 前崩溃会重复；幂等负责安全重放 |
-| “nack(requeue=true) 就是重试” | 它可能形成即时重投循环；重试必须有限、延迟、可观测 |
-| “未 ack 的消息会进入 DLQ” | 未 ack 消息通常保持 unacked，连接关闭后重入队；只有明确死信事件才经 DLX |
-| “RabbitMQ 集群会复制所有队列消息” | 4.x classic queue 不复制；quorum queue 和 stream 才是复制数据结构 |
-| “镜像队列是生产推荐” | classic queue mirroring 已在 RabbitMQ 4.0 移除 |
-| “prefetch 越大吞吐越高” | 超过流水线需要后收益很小，却增加不公平、内存和故障重投成本 |
-| “Ready=0 说明消息没发” | 它只是当前队列状态，不能代替消息轨迹和业务对账 |
-| “DLQ 有消息就不会丢” | 默认 dead-letter 转发可能 at-most-once；DLQ 也需要容量、告警和幂等回放 |
-| “TTL + DLX 是精确定时器” | 到期处理受队首和负载影响，只适合近似延迟/重试 |
-
-## 11. 官方资料
-
-- [RabbitMQ 4.3 Documentation](https://www.rabbitmq.com/docs)
-- [Reliability Guide](https://www.rabbitmq.com/docs/reliability)
-- [Consumer Acknowledgements and Publisher Confirms](https://www.rabbitmq.com/docs/confirms)
-- [Publishers and Unroutable Messages](https://www.rabbitmq.com/docs/publishers)
-- [Queues](https://www.rabbitmq.com/docs/queues)
-- [Quorum Queues](https://www.rabbitmq.com/docs/quorum-queues)
-- [Streams](https://www.rabbitmq.com/docs/streams)
-- [Dead Letter Exchanges](https://www.rabbitmq.com/docs/dlx)
-- [Message TTL](https://www.rabbitmq.com/docs/ttl)
-- [Priority Queues](https://www.rabbitmq.com/docs/priority)
-- [Monitoring](https://www.rabbitmq.com/docs/monitoring)
-- [Memory and Disk Alarms](https://www.rabbitmq.com/docs/alarms)
-- [Flow Control](https://www.rabbitmq.com/docs/flow-control)
-- [RabbitMQ 4.3 Highlights：quorum priority 与 delayed retry](https://www.rabbitmq.com/blog/2026/04/23/rabbitmq-4.3-release)
-- [rabbitmq-delayed-message-exchange（已归档）](https://github.com/rabbitmq/rabbitmq-delayed-message-exchange)
+[[RabbitMQ场景题|项目实践]] 保留业务事务、重试和事故处理的完整时间线；[[04-消息与分布式/消息队列对比与选型|消息队列对比与选型]]讨论不同消息模型的取舍；[[08-部署与云原生/Linux/deployment/Docker环境下安装RabbitMQ|Docker 安装说明]]保留环境操作步骤。部署示例中的浮动镜像标签不能用来证明运行版本恰好等于本文基线。
