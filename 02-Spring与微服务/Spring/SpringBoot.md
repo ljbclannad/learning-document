@@ -1,1096 +1,301 @@
-# SpringBoot 核心知识
+# SpringBoot：启动、自动配置与工程边界
 
-> [!info] 文档定位
+> 学习基线：JDK 17、Spring Boot 3.4.0、Spring Framework 6.2.0。固定版本用于复现实验，不代表当前最新版或生产升级建议。Boot 2 的自动配置注册方式、Boot 3 的 Jakarta 迁移、Boot 4 的模块变化不能混用。
 >
-> 本文以 Spring Boot 3.x 为主线；Boot 2.x 的 `spring.factories` 注册方式仅用于理解存量项目。Spring Boot 建立在 [[Spring|《Spring》]] 之上，容器生命周期、AOP 和事务基础请先阅读基础主文。
+> 容器、代理与事务见 [[02-Spring与微服务/Spring/Spring核心原理|Spring核心原理]]；HTTP 请求链见 [[02-Spring与微服务/Spring/SpringMVC|SpringMVC]]。本文集中解释 Boot 如何选择和组装基础设施，以及如何验证这些选择。
 
 ## 目录
 
-1. [[#零、先建立整体理解|整体理解：Spring 与 Spring Boot 的关系]]
-2. [[#一、SpringBoot 启动流程|启动流程：从 `run()` 到应用就绪]]
-3. [[#二、SpringBoot 自动配置|自动配置：候选、条件与覆盖]]
-4. [[#三、读取自定义配置|外部化配置：绑定、优先级与多环境]]
-5. [[#总结|总结与复习主线]]
-
-## 零、先建立整体理解
-
-### 0.1 Spring 和 Spring Boot 的关系
-
-1. `Spring` 更像基础框架，核心提供的是 IoC、AOP、事务、MVC、Bean 生命周期这些底层能力。
-2. `Spring Boot` 不是替代 Spring，而是在 Spring 之上做了一层工程化封装，目标是让项目更快跑起来、减少样板配置、统一依赖管理、方便接入生产级能力。
-3. 一句话理解：
-   - **Spring 解决“能力怎么提供”，Spring Boot 解决“项目怎么更快落地”。**
-
-### 0.2 Spring Boot 到底解决了什么问题
-
-在没有 Spring Boot 的时候，做一个 Spring 项目通常要自己处理很多重复工作：
-
-- 依赖怎么选
-- MVC 怎么开
-- JSON 转换器怎么配
-- Tomcat 怎么部署
-- 数据源怎么建
-- 配置文件怎么组织
-
-Spring Boot 主要就是在解决这些工程问题。它最核心的三件事是：
-
-1. **Starter**
-   - 解决“依赖怎么组合”的问题
-2. **Auto Configuration**
-   - 解决“常见 Bean 怎么自动配起来”的问题
-3. **外部化配置**
-   - 解决“同一套程序怎么在不同环境下灵活运行”的问题
-
-### 0.3 一句话理解
-
-> Spring Boot 本质上不是新的 IoC 或 AOP 框架，它还是建立在 Spring 之上。它真正解决的是工程落地效率问题，通过 Starter、自动配置和外部化配置，把 Spring 项目里大量重复的依赖选择、Bean 配置和启动流程标准化，让项目能更快跑起来。
-
-## 一、SpringBoot 启动流程
-
-### 1.1 启动流程概述
-
-Spring Boot 应用的启动入口是包含 `@SpringBootApplication` 注解的主类，通过调用 `SpringApplication.run()` 方法启动应用。
-
-**启动入口示例**：
-```java
-@SpringBootApplication
-public class Application {
-    public static void main(String[] args) {
-        SpringApplication.run(Application.class, args);
-    }
-}
-```
-
-### 1.2 启动流程详解
-
-#### 第一步：SpringApplication 实例化
-
-创建 `SpringApplication` 对象时完成以下操作：
-
-1. **推断应用类型**
-   - 判断是普通 Java 应用、Servlet Web 应用还是 Reactive Web 应用
-   - 通过检查类路径中的特定类来判断（如 `DispatcherServlet`、`DispatcherHandler`）
-
-2. **加载初始化器（Initializers）**
-   - 从 `META-INF/spring.factories` 加载 `ApplicationContextInitializer` 实现类
-   - 用于在 ApplicationContext 刷新之前进行自定义初始化
-
-3. **加载监听器（Listeners）**
-   - 从 `META-INF/spring.factories` 加载 `ApplicationListener` 实现类
-   - 用于监听应用启动过程中的各种事件
-
-4. **推断主类**
-   - 通过堆栈跟踪找到包含 `main` 方法的类
-
-**源码示例**：
-```java
-public SpringApplication(ResourceLoader resourceLoader, Class<?>... primarySources) {
-    this.resourceLoader = resourceLoader;
-    this.primarySources = new LinkedHashSet<>(Arrays.asList(primarySources));
-    
-    // 推断应用类型
-    this.webApplicationType = WebApplicationType.deduceFromClasspath();
-    
-    // 加载初始化器
-    setInitializers((Collection) getSpringFactoriesInstances(ApplicationContextInitializer.class));
-    
-    // 加载监听器
-    setListeners((Collection) getSpringFactoriesInstances(ApplicationListener.class));
-    
-    // 推断主类
-    this.mainApplicationClass = deduceMainApplicationClass();
-}
-```
-
-#### 第二步：执行 run() 方法
-
-`SpringApplication.run()` 方法包含核心启动逻辑：
-
-**1. 准备环境（prepareEnvironment）**
-```java
-ConfigurableEnvironment environment = prepareEnvironment(listeners, applicationArguments);
-```
-- 创建并配置 `Environment` 对象
-- 加载配置文件（`application.properties`、`application.yml`）
-- 加载系统环境变量、命令行参数
-- 触发 `ApplicationEnvironmentPreparedEvent` 事件
-
-**2. 打印 Banner**
-```java
-Banner printedBanner = printBanner(environment);
-```
-- 在控制台打印 Spring Boot 标志
-- 可通过 `spring.banner.location` 自定义
-- 可通过 `spring.main.banner-mode=off` 关闭
-
-**3. 创建 ApplicationContext**
-```java
-context = createApplicationContext();
-```
-- 根据应用类型创建对应的 ApplicationContext：
-  - Servlet Web：`AnnotationConfigServletWebServerApplicationContext`
-  - Reactive Web：`AnnotationConfigReactiveWebServerApplicationContext`
-  - 非 Web：`AnnotationConfigApplicationContext`
-
-**4. 准备上下文（prepareContext）**
-```java
-prepareContext(context, environment, listeners, applicationArguments, printedBanner);
-```
-- 将 Environment 设置到 ApplicationContext
-- 执行 ApplicationContextInitializer
-- 触发 `ApplicationContextInitializedEvent` 事件
-- 加载主配置类（@SpringBootApplication 标注的类）
-- 触发 `ApplicationPreparedEvent` 事件
-
-**5. 刷新上下文（refreshContext）**
-```java
-refreshContext(context);
-```
-- 调用 `AbstractApplicationContext.refresh()` 方法
-- 完成 Bean 的扫描、注册、实例化、依赖注入
-- 启动内嵌 Web 服务器（Tomcat、Jetty、Undertow）
-- 触发 `ApplicationStartedEvent` 事件
-
-**6. 执行运行器（callRunners）**
-```java
-callRunners(context, applicationArguments);
-```
-- 执行所有 `CommandLineRunner` 和 `ApplicationRunner` 实现类
-- 按 `@Order` 注解或 `Ordered` 接口指定的顺序执行
-- 触发 `ApplicationReadyEvent` 事件
-
-**7. 启动完成**
-- 应用开始监听请求（Web 应用）
-- 返回 ApplicationContext 对象
-
-### 1.3 启动流程图
-
-```
-主程序入口 (main)
-    ↓
-创建 SpringApplication 实例
-    ↓
-准备环境 (Environment)
-    ↓
-打印 Banner
-    ↓
-创建 ApplicationContext
-    ↓
-准备上下文 (加载配置类)
-    ↓
-刷新上下文 (Bean 初始化)
-    ↓
-执行 CommandLineRunner / ApplicationRunner
-    ↓
-启动完成 (监听请求)
-```
-
-### 1.4 生产实战
-
-#### 自定义启动行为
-
-**1. 实现 CommandLineRunner**
-```java
-@Component
-@Order(1)
-public class DataInitRunner implements CommandLineRunner {
-    
-    @Autowired
-    private UserRepository userRepository;
-    
-    @Override
-    public void run(String... args) throws Exception {
-        // 应用启动后初始化数据
-        if (userRepository.count() == 0) {
-            User admin = new User("admin", "admin@example.com");
-            userRepository.save(admin);
-            System.out.println("Admin user created");
-        }
-    }
-}
-```
-
-**2. 实现 ApplicationRunner（推荐）**
-```java
-@Component
-@Order(2)
-public class CacheWarmupRunner implements ApplicationRunner {
-    
-    @Autowired
-    private CacheManager cacheManager;
-    
-    @Override
-    public void run(ApplicationArguments args) throws Exception {
-        // 预热缓存
-        Cache userCache = cacheManager.getCache("users");
-        // 加载热点数据到缓存
-        System.out.println("Cache warmed up");
-    }
-}
-```
-
-**3. 自定义 ApplicationContextInitializer**
-```java
-public class CustomInitializer implements ApplicationContextInitializer<ConfigurableApplicationContext> {
-    
-    @Override
-    public void initialize(ConfigurableApplicationContext applicationContext) {
-        // 在 ApplicationContext 刷新之前执行
-        ConfigurableEnvironment environment = applicationContext.getEnvironment();
-        
-        // 添加自定义属性源
-        Map<String, Object> customProps = new HashMap<>();
-        customProps.put("custom.property", "value");
-        environment.getPropertySources().addFirst(
-            new MapPropertySource("customProperties", customProps));
-        
-        System.out.println("Custom initializer executed");
-    }
-}
-
-// 注册方式 1：在 META-INF/spring.factories 中注册
-// org.springframework.context.ApplicationContextInitializer=com.example.CustomInitializer
-
-// 注册方式 2：在主类中手动添加
-@SpringBootApplication
-public class Application {
-    public static void main(String[] args) {
-        SpringApplication app = new SpringApplication(Application.class);
-        app.addInitializers(new CustomInitializer());
-        app.run(args);
-    }
-}
-```
-
-**4. 监听启动事件**
-```java
-@Component
-public class ApplicationEventListener {
-    
-    @EventListener
-    public void handleContextRefreshed(ContextRefreshedEvent event) {
-        System.out.println("ApplicationContext refreshed");
-    }
-    
-    @EventListener
-    public void handleApplicationReady(ApplicationReadyEvent event) {
-        System.out.println("Application is ready to serve requests");
-        // 记录启动时间
-        long startupTime = System.currentTimeMillis() - event.getTimestamp();
-        System.out.println("Startup time: " + startupTime + "ms");
-    }
-    
-    @EventListener
-    public void handleApplicationFailed(ApplicationFailedEvent event) {
-        System.err.println("Application failed to start");
-        event.getException().printStackTrace();
-    }
-}
-```
-
-### 1.5 复述卡片：启动流程
-
-#### 30 秒口述版
-
-Spring Boot 启动我一般会从 `SpringApplication.run()` 讲起。它先推断应用类型，准备环境和配置源，再创建对应的 `ApplicationContext`，然后加载主配置类和自动配置类，执行 `refresh()` 完成 Bean 创建、依赖注入和后置处理器注册；如果是 Web 应用，还会在这个过程中启动内嵌 Tomcat，最后再执行 `ApplicationRunner` / `CommandLineRunner`。
-
-#### 一条主线记忆
-
-可以把启动流程记成：
-
-`run() -> 准备 Environment -> 创建 ApplicationContext -> 加载配置类 -> refresh 容器 -> 启动内嵌服务器 -> 执行 Runner`
-
----
-
-## 二、SpringBoot 自动配置
-
-### 2.1 自动配置原理
-
-Spring Boot 的自动配置（Auto Configuration）是其核心特性，可以根据项目依赖和环境自动配置 Spring 应用。
-
-#### 核心注解
-
-**@SpringBootApplication 复合注解**
-```java
-@Target(ElementType.TYPE)
-@Retention(RetentionPolicy.RUNTIME)
-@Documented
-@Inherited
-@SpringBootConfiguration      // 等同于 @Configuration
-@EnableAutoConfiguration       // 启用自动配置
-@ComponentScan                 // 组件扫描
-public @interface SpringBootApplication {
-    // ...
-}
-```
-
-**@EnableAutoConfiguration 注解**
-```java
-@Target(ElementType.TYPE)
-@Retention(RetentionPolicy.RUNTIME)
-@Documented
-@Inherited
-@AutoConfigurationPackage
-@Import(AutoConfigurationImportSelector.class)
-public @interface EnableAutoConfiguration {
-    // 排除指定的自动配置类
-    Class<?>[] exclude() default {};
-    String[] excludeName() default {};
-}
-```
-
-### 2.2 自动配置加载机制
-
-#### 第一步：加载自动配置类
-
-Spring Boot 自动配置的核心入口是 `@EnableAutoConfiguration`，它通过 `AutoConfigurationImportSelector` 导入候选自动配置类。
-
-**版本口径要区分**
-
-- **Spring Boot 2.6 及以前的常见口径**：
-  - 自动配置类通常通过 `META-INF/spring.factories` 中的 `EnableAutoConfiguration` 键注册
-- **Spring Boot 2.7 / 3.x 更推荐的口径**：
-  - 自动配置类通过 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` 注册
-  - 这是官方现在更推荐、也更适合新项目的说法
-
-更稳的理解不是死背某一个文件名，而是：
-
-> Spring Boot 会从约定的自动配置注册文件里加载候选自动配置类，再结合条件注解决定哪些真正生效。
-
-**早期 / 兼容口径示例（spring.factories）**
-```java
-public class AutoConfigurationImportSelector implements DeferredImportSelector {
-    
-    protected List<String> getCandidateConfigurations(AnnotationMetadata metadata, 
-                                                      AnnotationAttributes attributes) {
-        // 从 META-INF/spring.factories 加载自动配置类
-        List<String> configurations = SpringFactoriesLoader.loadFactoryNames(
-            EnableAutoConfiguration.class, 
-            getBeanClassLoader());
-        
-        return configurations;
-    }
-}
-```
-
-**spring.factories 文件示例（Boot 2.x 常见）**
-```properties
-# Auto Configure
-org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
-org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration,\
-org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration,\
-org.springframework.boot.autoconfigure.web.servlet.WebMvcAutoConfiguration,\
-org.springframework.boot.autoconfigure.security.servlet.SecurityAutoConfiguration
-```
-
-**AutoConfiguration.imports 文件示例（Boot 3.x 更推荐）**
-```properties
-org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
-org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration
-org.springframework.boot.autoconfigure.web.servlet.WebMvcAutoConfiguration
-org.springframework.boot.autoconfigure.security.servlet.SecurityAutoConfiguration
-```
-
-#### 第二步：条件装配
-
-Spring Boot 使用条件注解判断是否启用某个配置。
-
-**常用条件注解**
-
-| 注解                              | 作用                         | 示例                                                     |
-| --------------------------------- | ---------------------------- | -------------------------------------------------------- |
-| `@ConditionalOnClass`             | 类路径存在指定类时生效       | `@ConditionalOnClass(DataSource.class)`                  |
-| `@ConditionalOnMissingClass`      | 类路径不存在指定类时生效     | `@ConditionalOnMissingClass("com.example.CustomConfig")` |
-| `@ConditionalOnBean`              | 容器中存在指定 Bean 时生效   | `@ConditionalOnBean(DataSource.class)`                   |
-| `@ConditionalOnMissingBean`       | 容器中不存在指定 Bean 时生效 | `@ConditionalOnMissingBean(DataSource.class)`            |
-| `@ConditionalOnProperty`          | 配置属性满足指定条件时生效 | `@ConditionalOnProperty(prefix="sms", name="enabled", havingValue="true")` |
-| `@ConditionalOnWebApplication`    | 当前应用是 Web 应用时生效    | `@ConditionalOnWebApplication(type=Type.SERVLET)`        |
-| `@ConditionalOnNotWebApplication` | 当前应用不是 Web 应用时生效  | `@ConditionalOnNotWebApplication`                        |
-
-**自动配置示意（不是 `DataSourceAutoConfiguration` 的真实源码）**
-```java
-@AutoConfiguration
-@ConditionalOnClass(SmsClient.class)
-@ConditionalOnMissingBean(SmsClient.class)
-@EnableConfigurationProperties(SmsProperties.class)
-public class SmsAutoConfiguration {
-
-    @Bean
-    @ConditionalOnMissingBean
-    @ConditionalOnProperty(prefix = "sms", name = "enabled", havingValue = "true")
-    public SmsClient smsClient(SmsProperties properties) {
-        return new SmsClient(properties.getEndpoint());
-    }
-}
-```
-
-真实自动配置通常由多个嵌套配置和条件共同组成，不宜把简化代码当作框架源码。以数据源为例：类路径存在相关 JDBC 能力且用户未声明 `DataSource` 时，Boot 会继续尝试配置；既可以绑定 `spring.datasource.*`，也可能配置嵌入式数据库，并非必须提供 `spring.datasource.url`。
-
-#### 第三步：用户配置覆盖默认配置
-
-Spring Boot 自动配置不是“强行配死”，而是会给用户留覆盖入口。
-
-最常见的覆盖方式有：
-
-1. 你自己声明同类型 Bean
-   - 配合 `@ConditionalOnMissingBean`，默认配置就会让位
-2. 通过配置项开关控制
-   - 比如 `@ConditionalOnProperty`
-3. 显式排除自动配置类
-   - 例如：
-   ```java
-   @SpringBootApplication(exclude = DataSourceAutoConfiguration.class)
-   ```
-
-这也是理解 Spring Boot 的关键点：
-
-> 它不是“偷偷帮你配”，而是“先按约定给默认值，你要特殊行为时再覆盖它”。
-
-### 2.3 常见自动配置模块
-
-| 模块 | 代表性自动配置类 | 作用 | 常见前提（还会叠加其他条件） |
-| --- | --- | --- | --- |
-| Web MVC | `WebMvcAutoConfiguration` | 配置 Spring MVC | Servlet Web 环境与 MVC 相关类存在 |
-| 数据源 | `DataSourceAutoConfiguration` | 配置 `DataSource` 或嵌入式数据库 | JDBC 相关类存在且用户未声明 `DataSource` |
-| JPA | `HibernateJpaAutoConfiguration` | 配置 JPA 与 Hibernate | JPA/Hibernate 相关类、数据源等条件满足 |
-| Redis | `RedisAutoConfiguration` | 配置 Redis 连接工厂与模板 | Redis 客户端相关类存在 |
-| Security | `SecurityAutoConfiguration` | 导入基础安全配置 | Spring Security 相关类存在 |
-| Actuator | `EndpointAutoConfiguration` | 装配端点基础设施 | Actuator 端点基础设施与相应端点条件满足 |
-| 缓存 | `CacheAutoConfiguration` | 配置缓存管理器 | Cache API 与具体缓存实现条件满足 |
-
-### 2.4 Starter 是什么
-
-1. `Starter` 不是自动配置本身，而是**一组依赖的聚合入口**。
-2. 例如 `spring-boot-starter-web` 往往会帮你带上：
-   - Spring MVC
-   - Jackson
-   - Validation
-   - 内嵌 Tomcat
-   - 一些常用日志依赖
-3. 所以更准确地说：
-   - **Starter 负责把依赖组织好**
-   - **Auto Configuration 负责把默认 Bean 配起来**
-4. 两者职责不同：Starter 决定“带什么依赖”，自动配置决定“在什么条件下创建哪些默认 Bean”。
-
-### 2.5 Starter 的工程边界
-
-一个可复用的 Starter 通常拆为两个模块：
-
-| 模块 | 职责 | 典型内容 |
+- [[#1. Boot 解决的是默认组装与运行问题]]
+- [[#2. 依赖、扫描和自动配置是三条不同路径]]
+- [[#3. SpringApplication 的启动时序]]
+- [[#4. 自动配置如何从候选变成 Bean]]
+- [[#5. ActionGuard：整组选择与单项退让]]
+- [[#6. 外部配置：来源、覆盖与 Profile]]
+- [[#7. 类型安全绑定与失败前置]]
+- [[#8. 自研 Starter 的边界与测试矩阵]]
+- [[#9. 执行器、调度与优雅关闭]]
+- [[#10. 排障：从缺失 Bean 到可服务状态]]
+- [[#11. 实验与源码阅读]]
+
+## 1. Boot 解决的是默认组装与运行问题
+
+Spring 提供容器、事务、MVC 等机制，但单独使用这些模块时，项目还要选择兼容依赖、注册基础设施、加载环境配置、创建 Web 容器并建立运维入口。Boot 把这部分重复工作变成有条件的默认配置。
+
+因此，Boot 不会改变 Java 的对象模型，也不会让事务绕过代理。`@SpringBootApplication` 不等于“所有框架功能都自动启用”：例如提供执行器的自动配置与启用 `@Async` 拦截是两件事。
+
+| 组成 | 负责什么 | 不应推导出的结论 |
 | --- | --- | --- |
-| `xxx-spring-boot-starter` | 依赖聚合，不放业务实现 | 依赖 `spring-boot-starter`、`xxx-spring-boot-autoconfigure` 和必要的第三方库 |
-| `xxx-spring-boot-autoconfigure` | 条件装配与扩展点 | `@AutoConfiguration`、`@ConfigurationProperties`、`AutoConfiguration.imports` |
+| 依赖管理 BOM | 管理一组依赖版本 | 项目随意覆盖一个版本仍保证兼容 |
+| Starter | 提供常用依赖组合 | 只要依赖存在就必定创建某个 Bean |
+| 自动配置 | 根据类路径、配置和已有 Bean 注册默认定义 | 容器会持续按运行时配置热切换全部对象 |
+| SpringApplication | 协调环境、上下文、刷新和启动回调 | `main` 返回前所有外部系统已经可用 |
+| Actuator | 提供管理端点、健康与观测集成 | 健康探针已经覆盖所有业务正确性 |
 
-自动配置应避免组件扫描；使用显式 `@Import`、条件注解和用户 Bean 覆盖点来保持边界清晰。若自动配置之间存在先后要求，可用 `@AutoConfiguration(before = …, after = …)` 表达 **Bean 定义注册顺序**，它不等同于 Bean 的实例化顺序。
+以医生助手为例，应用可以复用数据库连接池、Web 转换器和配置绑定，但“高风险工具必须先审批”“患者数据按机构隔离”仍由业务与安全设计实现。
 
-### 2.6 生产实战
+## 2. 依赖、扫描和自动配置是三条不同路径
 
-#### 自定义自动配置
+### 2.1 先有兼容的类路径，再谈条件装配
 
-**1. 创建自动配置类**
-```java
-@AutoConfiguration
-@ConditionalOnClass(SmsService.class)
-@EnableConfigurationProperties(SmsProperties.class)
-public class SmsAutoConfiguration {
-    
-    @Bean
-    @ConditionalOnMissingBean
-    @ConditionalOnProperty(name = "sms.provider", havingValue = "aliyun")
-    public SmsService aliyunSmsService(SmsProperties properties) {
-        return new AliyunSmsService(properties.getAccessKey(), properties.getSecretKey());
-    }
-    
-    @Bean
-    @ConditionalOnMissingBean
-    @ConditionalOnProperty(name = "sms.provider", havingValue = "tencent")
-    public SmsService tencentSmsService(SmsProperties properties) {
-        return new TencentSmsService(properties.getAccessKey(), properties.getSecretKey());
-    }
-}
-```
+Starter 通常通过传递依赖引入自动配置模块和客户端实现；BOM 提供版本约束，不能代替实际声明依赖。应用使用 Boot parent 或导入 BOM 后，仍需声明所用 Starter。
 
-**2. 创建配置属性类**
-```java
-@ConfigurationProperties(prefix = "sms")
-public class SmsProperties {
-    
-    private String provider = "aliyun";
-    private String accessKey;
-    private String secretKey;
-    private int timeout = 5000;
-    
-    // Getters and Setters
-}
-```
+遇到 `NoSuchMethodError`、类缺失或 Jakarta/Javax 类型不兼容，先看实际解析出的依赖树和冲突来源。修改 `@ComponentScan` 通常不能修复二进制版本冲突。
 
-**3. 注册自动配置**
+在本实验工程中：
 
-Spring Boot 3.x 更推荐：
-```properties
-# META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
-com.example.autoconfigure.SmsAutoConfiguration
-```
-
-Spring Boot 2.x 常见写法：
-```properties
-# META-INF/spring.factories
-org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
-com.example.autoconfigure.SmsAutoConfiguration
-```
-
-**4. 使用自动配置**
-```yaml
-# application.yml
-sms:
-  provider: aliyun
-  access-key: your-access-key
-  secret-key: your-secret-key
-  timeout: 10000
-```
-
-```java
-@Service
-public class UserService {
-    
-    @Autowired
-    private SmsService smsService;  // 自动注入
-    
-    public void sendVerificationCode(String phone) {
-        String code = generateCode();
-        smsService.send(phone, "Your code is: " + code);
-    }
-}
-```
-
-#### 排除自动配置
-
-**方式 1：使用 @SpringBootApplication 注解**
-```java
-@SpringBootApplication(exclude = {
-    DataSourceAutoConfiguration.class,
-    SecurityAutoConfiguration.class
-})
-public class Application {
-    public static void main(String[] args) {
-        SpringApplication.run(Application.class, args);
-    }
-}
-```
-
-**方式 2：使用配置文件**
-```yaml
-spring:
-  autoconfigure:
-    exclude:
-      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
-      - org.springframework.boot.autoconfigure.security.servlet.SecurityAutoConfiguration
-```
-
-#### 查看自动配置报告
-
-**启用 debug 模式**
-```yaml
-debug: true
-```
-
-或启动时添加参数：
 ```bash
-java -jar app.jar --debug
+mvn dependency:tree
+mvn help:effective-pom
 ```
 
-**输出示例**：
-```
-============================
-CONDITIONS EVALUATION REPORT
-============================
+第一条用于确认实际依赖，第二条用于看继承与管理后的配置。不要把示例中的固定旧版本当作业务项目的升级结论；生产升级还需核查安全维护周期、第三方兼容与回归结果。
 
-Positive matches:
------------------
-   DataSourceAutoConfiguration matched:
-      - @ConditionalOnClass found required classes 'javax.sql.DataSource', 'org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseType' (OnClassCondition)
+### 2.2 三类注册入口
 
-Negative matches:
------------------
-   SomeAutoConfiguration:
-      Did not match:
-         - @ConditionalOnClass did not find required class 'com.example.OptionalLibrary' (OnClassCondition)
-```
+`@SpringBootApplication` 组合了 Boot 配置标识、组件扫描和自动配置启用。
 
-**排障闭环**：
+- **应用组件扫描**：从启动类所在包向下发现组件；启动类放错包可能漏扫，也可能扫进测试或不相关配置。
+- **显式导入**：`@Import`、选择器、注册器等把指定配置或定义加入容器。
+- **自动配置导入**：从约定元数据得到候选配置，再经过筛选与条件判断。
 
-- 启动期先用 `--debug` 或 `debug=true` 查看条件报告。
-- 已启用 Actuator 时，可用 `/actuator/conditions` 查看条件匹配结果；用 `/actuator/configprops` 和 `/actuator/env` 追踪配置绑定值及其来源。
-- 这些端点可能暴露配置和环境细节，生产环境应按需暴露并配置访问控制、脱敏策略。
+普通组件扫描不会天然把依赖包里所有带注解的类全部导入。自研 Starter 应通过自动配置元数据注册，不应要求业务方扫描第三方库的大包名。
 
-### 2.7 复述卡片：自动配置
+### 2.3 Boot 3 的自动配置注册文件
 
-#### 30 秒口述版
+Boot 3.4 的候选文件是：
 
-Spring Boot 自动配置的核心不是“自动猜”，而是“按条件装配”。启动时它会加载一批候选自动配置类，再根据类路径、配置项、容器里已有的 Bean 等条件判断哪些配置该生效。比如你引入了 Web 依赖，它就可能自动配 MVC；你自己又声明了同类 Bean，默认配置就会让位。
-
-#### 最好记的一句话
-
-> Spring Boot 自动配置 = 候选配置类加载 + 条件判断 + 用户配置覆盖默认配置。
-
----
-
-## 三、读取自定义配置
-
-### 3.1 配置文件格式
-
-Spring Boot 支持多种配置文件格式：
-
-**application.properties**
-```properties
-myapp.name=SpringBootDemo
-myapp.version=1.0.0
-myapp.features.enabled=true
-myapp.database.url=jdbc:mysql://localhost:3306/db
-myapp.database.username=root
-myapp.database.password=password
+```text
+META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
 ```
 
-**application.yml（推荐）**
-```yaml
-myapp:
-  name: SpringBootDemo
-  version: 1.0.0
-  features:
-    enabled: true
-  database:
-    url: jdbc:mysql://localhost:3306/db
-    username: root
-    password: password
+内容为每行一个自动配置类全限定名，例如：
+
+```text
+com.example.guard.autoconfigure.ActionGuardAutoConfiguration
 ```
 
-### 3.2 读取配置的方式
+旧教程把自动配置类写到 `spring.factories` 的 `EnableAutoConfiguration` 键下，是版本相关的历史方式；不能把它当成 Boot 3 的备用自动配置注册方式。`spring.factories` 仍用于其他扩展机制，“自动配置不再用该键”不等于“整个文件失效”。
 
-#### 方式一：@Value 注解
+## 3. SpringApplication 的启动时序
 
-**适用场景**：读取少量配置
+可以先按职责看，再跟源码，而不是背一串方法名：
 
-```java
-@Component
-public class MyAppConfig {
-    
-    @Value("${myapp.name}")
-    private String appName;
-    
-    @Value("${myapp.version}")
-    private String version;
-    
-    @Value("${myapp.features.enabled:false}")  // 默认值
-    private boolean featuresEnabled;
-    
-    // 普通配置占位符；SpEL 仅用于确有表达式计算需求的场景
-    @Value("${myapp.database.url}")
-    private String dbUrl;
-    
-    public void printConfig() {
-        System.out.println("App Name: " + appName);
-        System.out.println("Version: " + version);
-        System.out.println("Features Enabled: " + featuresEnabled);
-    }
-}
+```text
+构造 SpringApplication，确定应用类型与扩展
+  → 准备 Environment，读取配置数据与启动参数
+  → 创建对应 ApplicationContext
+  → 应用初始化器，加载应用配置源
+  → refresh：解析定义、处理扩展、创建基础设施和对象
+  → 上下文刷新完成，发布启动阶段事件
+  → 执行 ApplicationRunner / CommandLineRunner
+  → 发布就绪阶段事件，进入可服务状态
 ```
 
-**优点**：
-- 简单直观
-- 支持 SpEL 表达式
+容器创建细节回到核心文。Web 应用刷新期间会创建和启动嵌入式服务器；**端口已经监听不等于所有 Runner 完成、业务已经就绪**。流量接入应关注应用就绪状态及探针策略。
 
-**缺点**：
-- 配置项多时代码冗长
-- 缺乏类型安全
-- 不支持复杂嵌套结构
+`ApplicationRunner` 接收解析后的 `ApplicationArguments`，`CommandLineRunner` 接收字符串数组。两类 Runner 可以排序，但不要靠“Bean 文件顺序”推断执行顺序，也不要在 Runner 中无限阻塞地执行后台消费循环。
 
-#### 方式二：@ConfigurationProperties（推荐）
+### 3.1 启动事件能观察哪些阶段
 
-**适用场景**：批量读取配置，支持复杂嵌套结构
+| 观察点 | 适合做什么 | 注意事项 |
+| --- | --- | --- |
+| 环境准备 | 观察配置来源、激活环境 | 完整 Bean 容器尚不可用 |
+| 上下文初始化/准备 | 添加定义或观察装配准备 | 不要提前拉起大量普通 Bean |
+| 刷新后、Runner 前 | 观察上下文启动 | 仍可能在 Runner 中失败 |
+| Ready | 应用启动回调完成 | 下游随时仍可故障，需持续健康监测 |
+| Failed | 汇总启动失败 | 早期失败不能只依赖容器内 `@EventListener` |
 
-```java
-@Component
-@ConfigurationProperties(prefix = "myapp")
-@Validated  // 启用 JSR-303 验证
-public class MyAppProperties {
-    
-    @NotBlank(message = "应用名称不能为空")
-    private String name;
-    
-    @Pattern(regexp = "\\d+\\.\\d+\\.\\d+", message = "版本号格式不正确")
-    private String version;
-    
-    private Features features = new Features();
-    private Database database = new Database();
-    
-    public static class Features {
-        private boolean enabled = false;
-        private List<String> modules = new ArrayList<>();
-        
-        // Getters and Setters
-        public boolean isEnabled() {
-            return enabled;
-        }
-        
-        public void setEnabled(boolean enabled) {
-            this.enabled = enabled;
-        }
-        
-        public List<String> getModules() {
-            return modules;
-        }
-        
-        public void setModules(List<String> modules) {
-            this.modules = modules;
-        }
-    }
-    
-    public static class Database {
-        @NotBlank
-        private String url;
-        
-        @NotBlank
-        private String username;
-        
-        @NotBlank
-        private String password;
-        
-        private int maxPoolSize = 10;
-        private int minIdle = 5;
-        
-        // Getters and Setters
-        public String getUrl() {
-            return url;
-        }
-        
-        public void setUrl(String url) {
-            this.url = url;
-        }
-        
-        public String getUsername() {
-            return username;
-        }
-        
-        public void setUsername(String username) {
-            this.username = username;
-        }
-        
-        public String getPassword() {
-            return password;
-        }
-        
-        public void setPassword(String password) {
-            this.password = password;
-        }
-        
-        public int getMaxPoolSize() {
-            return maxPoolSize;
-        }
-        
-        public void setMaxPoolSize(int maxPoolSize) {
-            this.maxPoolSize = maxPoolSize;
-        }
-        
-        public int getMinIdle() {
-            return minIdle;
-        }
-        
-        public void setMinIdle(int minIdle) {
-            this.minIdle = minIdle;
-        }
-    }
-    
-    // Getters and Setters
-    public String getName() {
-        return name;
-    }
-    
-    public void setName(String name) {
-        this.name = name;
-    }
-    
-    public String getVersion() {
-        return version;
-    }
-    
-    public void setVersion(String version) {
-        this.version = version;
-    }
-    
-    public Features getFeatures() {
-        return features;
-    }
-    
-    public void setFeatures(Features features) {
-        this.features = features;
-    }
-    
-    public Database getDatabase() {
-        return database;
-    }
-    
-    public void setDatabase(Database database) {
-        this.database = database;
-    }
-}
-```
+需要接收早期事件的监听器应通过 `SpringApplication` 注册等对应扩展入口加入，而不是假设组件扫描已经发生。事件的时间戳是事件发生时间，不能直接当“总启动耗时”；计时应明确起终点或使用该版本提供的阶段耗时信息。
 
-**使用配置类**：
-```java
-@Service
-public class ConfigService {
-    
-    @Autowired
-    private MyAppProperties properties;
-    
-    public void printConfig() {
-        System.out.println("App Name: " + properties.getName());
-        System.out.println("Version: " + properties.getVersion());
-        System.out.println("Features Enabled: " + properties.getFeatures().isEnabled());
-        System.out.println("DB URL: " + properties.getDatabase().getUrl());
-    }
-}
-```
+### 3.2 启动慢要拆分证据
 
-**优点**：
-- 类型安全
-- 支持复杂嵌套结构
-- 支持 JSR-303 验证
-- 配置集中管理
-- IDE 自动补全
+先区分配置加载、类扫描与解析、Bean 初始化、服务器启动、Runner、外部连接握手。条件报告解释“为什么装配/没装配”，不负责完整度量每个阶段耗时。
 
-**缺点**：
-- 需要定义配置类
-- 代码量稍多
+`ApplicationStartup` 可记录启动步骤，结合支持的实现与 Actuator startup 端点或 JFR 分析。采集本身也有成本；不要在启动线程逐个打印完整 Bean 对象，`toString()` 可能触发额外初始化甚至访问敏感数据。
 
-**Boot 3 推荐的注册与不可变绑定方式**：
+## 4. 自动配置如何从候选变成 Bean
 
-在业务应用中，可在启动类上使用 `@ConfigurationPropertiesScan` 统一发现属性类；在自动配置模块中则继续使用 `@EnableConfigurationProperties`。对于不需要运行期修改的配置，`record` 能减少样板代码并保证不可变性：
+### 4.1 配置解析和定义注册不是一次判断
 
-```java
-@ConfigurationProperties(prefix = "myapp")
-@Validated
-public record MyAppProperties(
-        @NotBlank String name,
-        Database database) {
+以 `@EnableAutoConfiguration` 导入链为主线，选择器读取候选、排除显式 exclusions、过滤明显不匹配的配置，再在配置解析和注册阶段应用具体条件。`@ConditionalOnClass`、`@ConditionalOnBean` 等并不全在同一时刻完成判断。
 
-    public record Database(@NotBlank String url, @NotBlank String username) {
-    }
-}
-```
+理解两个阶段尤其有用：配置类是否继续解析，与其内部 Bean 定义是否可以注册。Bean 条件依赖当时已经处理的定义，因此自动配置的顺序会影响条件观察到什么。
 
-```java
-@SpringBootApplication
-@ConfigurationPropertiesScan
-public class Application {
-}
-```
+`@AutoConfiguration(before/after = ...)` 调整的是**自动配置定义的处理顺序**。实例何时创建仍由依赖关系、懒加载和容器流程决定，不是把自动配置排序直接变成所有 Bean 的构造顺序。
 
-#### 方式三：Environment 动态读取
+### 4.2 常见条件与误判
 
-**适用场景**：动态读取配置，获取未知配置项
+| 条件 | 判断对象 | 常见坑 |
+| --- | --- | --- |
+| `@ConditionalOnClass` | 类路径上的指定类型 | 配置方法签名过早引用可选类型，条件尚未保护就加载失败 |
+| `@ConditionalOnMissingBean` | 已处理的 Bean 定义/类型信息 | `@Bean` 返回类型过于宽泛，条件识别不符合预期 |
+| `@ConditionalOnProperty` | Environment 中的属性 | 把绑定对象里的默认值当作 Environment 属性 |
+| `@ConditionalOnWebApplication` | 应用上下文/Web 类型 | Servlet 与 Reactive 的条件混为一谈 |
+| `@ConditionalOnResource` | 指定资源存在与否 | 资源存在并不保证内容有效 |
 
-```java
-@Component
-public class DynamicConfigReader {
-    
-    @Autowired
-    private Environment environment;
-    
-    public void printConfig() {
-        String appName = environment.getProperty("myapp.name");
-        String version = environment.getProperty("myapp.version", "1.0.0");  // 默认值
-        boolean featuresEnabled = environment.getProperty("myapp.features.enabled", Boolean.class, false);
-        
-        System.out.println("App Name: " + appName);
-        System.out.println("Version: " + version);
-        System.out.println("Features Enabled: " + featuresEnabled);
-        
-        // 检查配置是否存在
-        if (environment.containsProperty("myapp.database.url")) {
-            String dbUrl = environment.getProperty("myapp.database.url");
-            System.out.println("DB URL: " + dbUrl);
-        }
-        
-        // 获取激活的 profile
-        String[] activeProfiles = environment.getActiveProfiles();
-        System.out.println("Active Profiles: " + String.join(", ", activeProfiles));
-    }
-}
-```
+对于可选第三方类型，可将有关 Bean 方法放入受类路径条件保护的独立配置中，避免在不满足条件的场景仍要求 JVM 解析其方法类型。排查需要同时看“类能否加载”和“条件是否命中”。
 
-**优点**：
-- 灵活动态
-- 可获取未知配置项
-- 可检查配置是否存在
+`@ConditionalOnProperty` 默认语义不是简单的布尔类型转换：在未指定 `havingValue` 时，通常是属性存在且不等于 `false`；集合属性也不能按普通单值属性随意推断。关键开关应明确 `havingValue` 与缺失行为。
 
-**缺点**：
-- 缺乏类型安全
-- 需要手动类型转换
-- 无法利用 IDE 自动补全
+排除自动配置适合明确不需要整个能力、或由应用完整接管的情况，可通过对应注解排除项或 `spring.autoconfigure.exclude` 表达。排除某个上游配置可能连带让下游条件失效；缺少一个 Bean 时先查原因，不应反复 exclude 直到错误消失。
 
-### 3.3 配置方式对比
+### 4.3 退让、覆盖、选择是三件事
 
-| 方式                       | 适用场景           | 优点                         | 缺点               |
-| -------------------------- | ------------------ | ---------------------------- | ------------------ |
-| `@Value`                   | 少量配置           | 简单直观                     | 冗长，缺乏类型安全 |
-| `@ConfigurationProperties` | 批量配置、复杂结构 | 类型安全、支持验证、IDE 友好 | 需定义配置类       |
-| `Environment`              | 动态读取、未知配置 | 灵活动态                     | 缺乏类型安全       |
+- **退让**：`@ConditionalOnMissingBean` 让默认定义不注册。
+- **覆盖**：同名定义冲突时是否允许后者替换前者，是容器策略；Boot 默认不鼓励依靠覆盖解决冲突。
+- **选择**：多个候选已存在时，`@Primary`、`@Qualifier` 等影响注入选择。
 
-**推荐实践**：
-- 业务配置：使用 `@ConfigurationProperties`
-- 简单配置：使用 `@Value`
-- 动态配置：使用 `Environment`
+声明了 `@Primary` 不会删除默认 Bean，也不保证默认 Bean 停止初始化；允许覆盖不等于按类型退让。Starter 优先提供清晰的按类型退让契约，业务需要多个实现时再用限定符表达意图。
 
-### 3.4 配置优先级怎么理解
+## 5. ActionGuard：整组选择与单项退让
 
-Spring Boot 支持多种配置源，不必死背完整顺序，但至少要知道：
-
-1. **命令行参数** 通常优先级很高
-2. **JVM 参数 / 环境变量** 通常会覆盖本地配置文件
-3. **application.yml / application.properties** 是项目里最常见的默认配置源
-4. **profile 配置文件** 会在通用配置基础上做环境覆盖
-
-可以这样理解：
-
-- `application.yml` 放通用默认值
-- `application-prod.yml` 覆盖生产差异
-- 命令行参数或环境变量再覆盖部署时的最终值
-
-一句话收口：
-
-> Spring Boot 的配置体系本质上是“多配置源叠加 + 高优先级覆盖低优先级”，目的就是让同一套程序在不同环境下不用重新打包就能运行。
-
-### 3.5 Config Data 与 Profile 的组织方式
-
-`application.yml` 适合放通用默认值，`application-{profile}.yml` 放环境差异。Profile 专用文件会覆盖同一位置的通用配置；不要在 profile 专用文件中再配置 `spring.profiles.active` 或 `spring.profiles.include`。
-
-跨文件或外部配置中心使用 `spring.config.import`；缺失允许时加 `optional:`，避免部署环境没有该文件而启动失败：
+以下沿用原笔记的 ActionGuard 设计示例，不声称已验证某个生产组件。设组件有待审批任务仓储、审批记录仓储，以及共享的存储类型配置。
 
 ```yaml
-spring:
-  config:
-    import: optional:file:./secrets.yml
-  profiles:
-    group:
-      production: prod,metrics
+action:
+  guard:
+    store:
+      type: memory
+      timeout: 2s
 ```
 
-`spring.config.location` 会替换默认搜索位置，`spring.config.additional-location` 则是在默认位置之外追加；两者都应由环境变量、JVM 参数或命令行在启动早期提供。
+### 5.1 类级条件选方案，方法级条件让用户替换
 
-### 3.6 生产实战
+一种设计是内存配置类上使用 `@ConditionalOnProperty(prefix="action.guard.store", name="type", havingValue="memory")`，类内每个仓储方法再使用 `@ConditionalOnMissingBean(对应接口.class)`。
 
-#### 多环境配置
+含义是：先选择整套内存方案，再在每个能力上允许业务提供实现。如果业务只替换任务仓储，审批记录仍可用默认仓储。这种灵活性也引入风险：两个仓储是否要求同事务、同数据源？如果要求，却允许混搭，组件接口就隐含了无法兑现的一致性保证。
 
-**配置文件命名规则**：
-- `application.yml`：通用配置
-- `application-dev.yml`：开发环境
-- `application-test.yml`：测试环境
-- `application-prod.yml`：生产环境
+因此需先明确替换单位：可独立替换时按单个接口退让；必须成组时通过聚合 SPI 或启动校验约束完整组合。不要只为了“扩展方便”把全部 Bean 都无条件开放替换。
 
-**application.yml（通用默认值，不固定激活环境）**：
-```yaml
-myapp:
-  name: SpringBootDemo
-  version: 1.0.0
-```
+### 5.2 未配置 type，不等于自动选择 memory
 
-**application-dev.yml**：
-```yaml
-myapp:
-  database:
-    url: jdbc:mysql://localhost:3306/db_dev
-    username: dev_user
-    password: dev_pass
-  
-logging:
-  level:
-    root: DEBUG
-```
+设 `@ConfigurationProperties` 的 `type` 默认值是 `memory`，但 `@ConditionalOnProperty` 没有 `matchIfMissing=true`。配置绑定后对象可以读到 `memory`，条件仍会因为 Environment 中没有该属性而不匹配。
 
-**application-prod.yml**：
-```yaml
-myapp:
-  database:
-    url: jdbc:mysql://prod-server:3306/db_prod
-    username: prod_user
-    password: ${DB_PASSWORD}  # 从环境变量读取
-  
-logging:
-  level:
-    root: WARN
-```
+实验 `AutoConfigurationTest` 专门验证了这个差异。要让缺失时默认选择，必须让装配契约与属性契约一致，例如显式采用 `matchIfMissing=true`；如果要求用户必须选择存储，缺失就应该以清晰错误失败。
 
-**激活 profile**：
-```bash
-# 方式 1：命令行参数
-java -jar app.jar --spring.profiles.active=prod
+原笔记中的启动失败来自显式校验逻辑，不能归因于条件注解“自动报错”。`@ConditionalOnProperty` 不匹配通常只是跳过注册。
 
-# 方式 2：环境变量
-export SPRING_PROFILES_ACTIVE=prod
-java -jar app.jar
+### 5.3 条件不是运行时热开关
 
-# 方式 3：JVM 参数
-java -Dspring.profiles.active=prod -jar app.jar
-```
+修改配置中心的 type，并不会自动销毁旧仓储、替换对象图、迁移内存数据。普通条件在容器构建阶段起作用。运行时切换需要独立设计路由、数据一致性、连接清理及并发切换策略。
 
-#### 敏感信息管理
+对审批任务来说，从 memory 切到 JDBC 还涉及未完成任务持久化和重复执行防护。即使 Bean 能被替换，也没有证明任务状态已经安全迁移。
 
-不要把明文密钥、数据库密码提交到仓库，也不要把应用内“可解密的密文”当成密钥管理的替代方案。生产环境优先使用云 Secret Manager、Vault、Kubernetes Secret 或 CI/CD 注入；应用只从环境变量或受控挂载文件读取。
+## 6. 外部配置：来源、覆盖与 Profile
 
-```yaml
-myapp:
-  database:
-    username: ${DB_USERNAME}
-    password: ${DB_PASSWORD}
-```
+### 6.1 查最终值，也查来源
 
-如果由于遗留系统必须使用 Jasypt 等应用内加密方案，应让主密钥由外部密钥系统注入，并避免已不安全的 `PBEWithMD5AndDES`；同时评估轮换、审计与泄露后的处置流程。
+Boot 将多个来源组织成 Environment，后加入且优先级更高的来源可覆盖前面的同名属性。常见生产场景中，命令行参数通常能覆盖系统属性、环境变量和配置文件；测试还可引入优先级更高的测试属性来源。完整顺序应查所用版本的官方表，不要背一条省略测试、JSON 和配置数据阶段的全局公式。
 
-#### 配置刷新（Spring Cloud Config）
+配置文件还受外部/包内、Profile 文件、导入位置、位置分组与加载顺序影响。同目录混用 `.properties` 和 YAML 会增加认知负担，统一格式并查看实际来源更可靠。
 
-`@RefreshScope` 和 `/actuator/refresh` 属于 **Spring Cloud Context** 能力，并非纯 Spring Boot Actuator 默认提供。需要引入 Spring Cloud 相关依赖、配置端点暴露策略，并认识到刷新会重建带 `@RefreshScope` 的 Bean；数据库连接池、静态字段和已被其他对象缓存的值未必会按预期更新。
+`spring.config.location` 用于指定配置位置时会替换默认搜索位置；要在默认位置之外增加配置，使用 `spring.config.additional-location`。误用前者会表现为“本地默认配置突然不见了”。`optional:` 表示允许该位置缺失，不是忽略文件内容中的全部错误。
 
-**使用 @RefreshScope 实现配置热更新**：
+### 6.2 Profile 是装配条件，不是完整隔离环境
+
+Profile 可以选择配置文档与 `@Profile` Bean。`@Profile("!prod")` 是一个否定条件，并不意味着剩余每个环境都适合开启测试能力。对危险调试功能优先明确允许环境，避免新增环境时意外启用。
+
+激活 Profile 的配置应放在合法的非 Profile 专属来源中，避免在已经由 Profile 激活的文档里反向声明激活规则。Profile group 可组织组合，但不要制造隐式的多层激活迷宫。
+
+测试替身和生产实现同时注册时，先确认激活环境、扫描范围和条件报告；不能仅加 `@Primary` 把冲突藏起来。数据库地址、认证凭据、日志与管理端口仍需单独隔离，Profile 名字本身不提供安全边界。
+
+### 6.3 脱敏与配置诊断
+
+排查配置问题可记录来源名、是否存在和非敏感摘要，不应打印整份 Environment。管理端点的访问控制与敏感值展示策略需要单独配置；“仅内网可访问”不等于可以公开密钥。
+
+## 7. 类型安全绑定与失败前置
+
+配置应优先映射成职责明确的 `@ConfigurationProperties` 对象，而不是在几十个类里散布 `@Value` 字符串。
+
 ```java
-@Component
-@RefreshScope  // 支持配置刷新
-@ConfigurationProperties(prefix = "myapp")
-public class RefreshableConfig {
-    
-    private String name;
-    private String version;
-    
-    // Getters and Setters
+import java.time.Duration;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.DefaultValue;
+
+@ConfigurationProperties("action.guard.store")
+public record GuardProperties(
+        @DefaultValue("memory") String type,
+        @DefaultValue("2s") Duration timeout) {
 }
 ```
 
-**触发刷新**：
-```bash
-curl -X POST http://localhost:8080/actuator/refresh
-```
+通过 `@EnableConfigurationProperties(GuardProperties.class)` 或配置属性扫描注册。使用构造器绑定的配置对象，不应再机械地当普通组件走无关的组件创建路径。上例与实验里的属性模型一致，但没有承担完整生产校验。
 
-### 3.7 复述卡片：配置体系
+关键边界：
 
-#### 30 秒口述版
+1. `Duration`、`DataSize` 等带单位的类型减少“这个 30 是秒还是毫秒”的歧义；仍应明确允许范围。
+2. 校验需要校验实现依赖及 `@Validated` 等合适入口；Boot 3 的 Web Starter 不应被当作已经显式引入 validation Starter。
+3. 嵌套对象要触发级联校验，需要正确使用 `@Valid`，不能只在最外层写一次 `@Validated` 就假设所有内层约束都生效。
+4. record 限制字段重新赋值，不会自动深度冻结其中的可变集合；需要防御性复制或不可变值设计。
+5. 绑定失败应报告具体属性与约束，同时避免把密钥原值写进异常日志。
 
-Spring Boot 配置体系我一般会从三点讲：第一是外部化配置，支持 `application.yml`、环境变量、命令行参数等多种配置源；第二是配置绑定，少量配置可以用 `@Value`，批量结构化配置更推荐 `@ConfigurationProperties`；第三是多环境覆盖，同一套程序可以通过 `profile` 和更高优先级配置源在不同环境下运行。
+配置元数据处理器可改善 IDE 提示，它不等于运行时验证器。程序能启动也不证明超时、池容量和外部服务地址在业务上合理。
 
----
+## 8. 自研 Starter 的边界与测试矩阵
 
-## 总结
+### 8.1 模块职责
 
-本文档覆盖了 Spring Boot 最核心的几条主线：
+可按需要区分纯 API/核心实现、自动配置模块、Starter 依赖聚合。小组件不必为形式拆出过多模块，但核心业务接口应尽量避免依赖 Boot 的启动过程。
 
-1. **Spring 和 Spring Boot 的关系**：Boot 解决的是工程落地效率问题，不是替代 Spring 核心能力
-2. **启动流程**：从 `SpringApplication.run()` 到容器刷新、内嵌服务器启动的完整链路
-3. **自动配置**：候选配置类加载、条件装配、用户配置覆盖默认配置
-4. **Starter**：依赖聚合入口，和自动配置配合实现开箱即用
-5. **外部化配置**：`@Value`、`@ConfigurationProperties`、`Environment`、profile、多配置源覆盖
+自动配置应具有明确前缀、可解释的默认值、稳定替换点、资源销毁责任和失败消息。不要默认扫描业务包、偷偷注册全局过滤器或无界线程池，更不要让引入依赖就自动连接生产服务执行破坏性动作。
 
-快速复习时，可优先记住下面这 4 句：
+### 8.2 用 ApplicationContextRunner 验证装配
 
-1. Spring Boot 不是替代 Spring，而是把 Spring 项目的依赖、配置和启动流程标准化。
-2. `SpringApplication.run()` 的本质是准备环境、创建容器、加载配置、刷新上下文、启动内嵌服务器。
-3. 自动配置不是“猜配置”，而是“候选配置类 + 条件判断 + 用户可覆盖默认配置”。
-4. Starter 负责依赖聚合，AutoConfiguration 负责默认 Bean 装配，外部化配置负责让同一套程序适配不同环境。
+`ApplicationContextRunner` 创建小上下文，适合验证条件、默认值、用户定义优先与失败报告。最基本的矩阵包括：
+
+| 场景 | 应验证的结果 |
+| --- | --- |
+| 属性缺失 | 明确是退让、默认注册还是启动失败 |
+| 属性为支持值 | Bean 数量、类型与绑定值正确 |
+| 属性为不支持值 | 不应静默落到意外实现 |
+| 用户已有同类型实现 | 默认实现退让，其他必要能力仍存在 |
+| 可选依赖不存在 | 不因类加载提前失败 |
+| 多个自动配置组合 | 条件和定义处理顺序符合契约 |
+| 关闭上下文 | 自建执行器、连接、调度资源被正确关闭 |
+
+配套实验覆盖前四项的精简契约。它通过 `AutoConfigurations.of(...)` 直接导入类，**没有验证发布后的 JAR 是否正确携带 imports 文件**。发布 Starter 还应增加打包后消费者应用测试，确认依赖、资源文件和真实扫描路径。
+
+## 9. 执行器、调度与优雅关闭
+
+自动配置执行器要结合应用类型、已有 Bean、名称与条件理解。业务不能只因为注入了某个 `Executor` 就假设它同时承担 MVC 异步、`@Async` 与所有后台任务。
+
+审批执行、消息通知和慢速报告生成应按隔离需求划分容量与拒绝语义。共用一个无界队列会把流量突增变成持续堆积；共用过小的连接池会让任务线程全部阻塞在取连接上。先估算请求并发、任务耗时、数据库连接和下游限流，再设置线程与队列。
+
+启用虚拟线程也不会增加数据库连接数、下游配额或消除线程绑定事务的边界。采用虚拟线程前要重新观察阻塞点、上下文传递和关闭行为，而不是只比较线程创建成本。
+
+优雅关闭应协调入口停止接流、在途请求、后台任务、消息消费、事务完成与资源关闭。Boot 的 Web 服务器关闭配置不等于所有自建线程都被等待；容器销毁回调、执行器关闭策略与部署平台终止宽限期必须配合。
+
+## 10. 排障：从缺失 Bean 到可服务状态
+
+| 现象 | 先看什么 | 常见错误修法 |
+| --- | --- | --- |
+| 找不到某个 Bean | 类路径、扫描范围、条件报告、属性来源 | 扩大扫描到所有第三方包 |
+| 同类型 Bean 歧义 | Bean 名与来源、用户实现、退让条件 | 全部加 Primary |
+| 配置类默认值正确但 Bean 未注册 | Environment 属性与条件缺失策略 | 误以为属性绑定会回写 Environment |
+| 启动慢 | 阶段耗时、外部连接、初始化与 Runner | 把所有 Bean 改懒加载后宣布解决 |
+| 启动成功但第一批请求失败 | Ready、缓存预热、连接就绪、探针 | 只检查端口已开放 |
+| 退出后进程不结束 | 非守护线程、调度器、销毁回调 | 直接隐藏泄漏而不明确所有权 |
+
+懒加载会把部分初始化错误和耗时推迟到首次使用，可能降低表面启动时间，但需要评估首次请求延迟、故障暴露时机和容量准备。
+
+健康、存活与就绪也要区别。短暂下游故障是否应该让所有实例重启，取决于恢复模型；把共享数据库波动直接映射成全实例存活失败，可能造成重启风暴。
+
+## 11. 实验与源码阅读
+
+[[02-Spring与微服务/Spring/示例/spring-mechanism-lab/README|Spring 机制实验]] 的 `AutoConfigurationTest` 验证属性缺失、显式选择、用户实现退让与不支持值。容器部分则用实验区分 full/lite 配置，避免把 `@Bean` 方法调用误读成普通业务 AOP。
+
+阅读源码时围绕具体问题：
+
+| 问题 | 入口 |
+| --- | --- |
+| 谁协调启动阶段 | `SpringApplication.run` |
+| 自动配置候选从哪里来 | `AutoConfigurationImportSelector`、`ImportCandidates` |
+| 属性为什么没命中 | `OnPropertyCondition` |
+| 默认 Bean 为什么没退让 | `OnBeanCondition` 与定义处理顺序 |
+| 配置绑定与转换如何完成 | `Binder`、配置属性绑定后处理器 |
+| 条件结果如何诊断 | `ConditionEvaluationReport` |
+
+官方依据：[Boot 3.4 自动配置开发](https://docs.spring.io/spring-boot/3.4/reference/features/developing-auto-configuration.html)、[外部配置](https://docs.spring.io/spring-boot/3.4/reference/features/external-config.html)、[SpringApplication](https://docs.spring.io/spring-boot/3.4/reference/features/spring-application.html)。源码可从 [Boot v3.4.0](https://github.com/spring-projects/spring-boot/tree/v3.4.0) 固定标签开始，避免跟随 main 分支解释旧项目。
+
+继续阅读：[[02-Spring与微服务/Spring/Spring学习路线图|学习路线]] · [[02-Spring与微服务/Spring/Spring核心原理|核心机制]] · [[02-Spring与微服务/Spring/SpringMVC|MVC 请求链]] · [[02-Spring与微服务/Spring/Spring-Q|自测问题]]。
