@@ -1,1493 +1,260 @@
-# 医生助手ReAct Agent开发方案 - 代码实现篇
+# 医生助手与 AI 对话系统：实现契约
 
-> **材料状态（2026-10-29 复查）**：本文属于设计方案与示例材料，不是上线验收报告。当前知识库未找到本方案对应的可构建 Java 应用及联调记录，不能据此判断外部项目是否已实现。能力状态统一见 [[医生助手Agent开发方案-总览#能力状态与证据边界]]；新增机制属于可选演进，不能视为已经接入。
+> **状态（2026-10-29）**：本篇是模块接口、事务和状态转换设计，伪代码不等于完整 Spring 应用。原材料中的不完整 Java 拼装代码由统一契约替代，避免将空实现、占位成功或绕过授权的执行方式复制进业务系统。统一基线见 [[医生助手Agent开发方案]]。
 
-> **术语约定**：Function Calling / Tool Calling 是工具调用机制，可用于固定工作流，也可用于 Agent 循环。示例中的 `Thought`、`THOUGHT`、`thinking` 是历史字段名，仅表示面向用户的简短行动说明或证据摘要，不代表模型内部思维链；`Observation` 应由执行系统根据真实工具结果写入，不能由模型编造。
+## 一、实现单元与依赖方向
 
+建议从单个可构建 Java 应用开始，包边界按职责划分：
 
-## 示例范围与待补齐项
+```text
+api             请求校验、认证上下文、DTO 与错误码
+application     ChatOrchestrator、AgentOrchestrator、ApprovalService
+domain          Run、Turn、Draft、Approval、ActionExecution、EvidenceSnapshot
+ports           EvidenceReader、ModelGateway、ToolGateway、JobRepository
+adapters        MySQL、Redis、Milvus、消息通知、模型供应商、业务接口
+workers         摘要、记忆提取、索引同步、动作执行、恢复扫描
+```
 
-本文是分模块设计代码，不是可以直接编译运行的完整工程。仅确认片段出现了相关逻辑，不能据此标为业务已实现：
+domain 不依赖模型 SDK、HTTP Controller 或 Redis；application 负责用例和事务边界。模型只能产生候选决策，任务状态由 domain 的合法迁移和持久化提交决定。
 
-- `registerTools` 展示 5 个注册项；13 个是设计清单。`sendReminder` 未调用发送服务，`draftPrescription` 返回 `null`。
-- `continueExecution` 循环体被省略，且以 `history.size()` 当步数会混淆事件数与决策轮次；`resume` 还重复追加 Observation。审批恢复尚不完整。
-- `AgentResult` 缺少调用处使用的若干成员/工厂方法，`pendingTaskService`、`TextBlock` 等依赖或类型未完整给出；本次不宣称 Java 构建通过。
-- `inputSchema` 是描述性 Map，执行器没有展示标准 Schema 校验、患者/租户绑定和主体鉴权。`doctorId` 等请求参数不能代替认证身份。
-- 审批只有状态更新示意，缺少过期、归属、条件转换、执行幂等和结果不明时查证。`APPROVED` 不能等同于动作已成功。
-- 配置、超时和并发约束尚未完整接入引擎；类名或配置项存在不代表已生效。原 `application.yml` 还重复定义顶层 `agent`，落地前需合并并校验实际绑定。
+所有公开入口接收服务端 `ExecutionContext`，至少有 tenantId、actorId、role、customerId、purpose、policyVersion、deadline。不能让 HTTP body 或工具参数构造这个对象。持久化 actorId 用于重新检查授权，不长期保存登录令牌。
 
-新增机制统一按 [[医生助手Agent开发方案#十、可选演进方向与验收条件]] 评估，本文不伪装为已经接入动态发现、模型侧异步或托管运行时。
+## 二、共享接口与返回状态
 
-## 一、核心数据模型
+下列为接口形状，需在正式 Java 工程中定义完整类型、校验和序列化测试：
 
-### 1.1 Agent执行相关
+```text
+EvidenceService.capture(context, selection, minVersions)
+    -> EvidenceSnapshot
+PromptBuilder.prepare(context, snapshot, taskState, messages, budget)
+    -> PreparedPrompt(messages, tools, sourceManifest, omittedReasons)
+ModelGateway.next(preparedPrompt, callBudget)
+    -> ModelDecision(finalCandidate | toolCalls, usage, providerRequestId, stopReason)
+ToolGateway.execute(context, runRevision, callId, toolName, validatedArgs)
+    -> ToolResult(status, evidenceRefs, receipt, retryClass, resultHash)
+ApprovalService.decide(context, approvalId, expectedVersion, requestKey, decision)
+    -> DecisionReceipt(approvalId, decision, runId, actionId?, executionStatus?)
+JobRepository.claim(jobId, now, leaseDuration)
+    -> ClaimedJob(payload, attemptToken, leaseUntil)
+```
 
-```java
-// ========== AgentResult ==========
-@Data
-@Builder
-public class AgentResult {
-    private ResultStatus status;  // SUCCESS, PENDING_APPROVAL, ERROR, MAX_STEPS
-    private String finalAnswer;
-    private PendingTask pendingTask;
-    private String errorMessage;
-    private List<Step> executionHistory;
-    private int totalSteps;
-    
-    public static AgentResult success(String answer, List<Step> history, int steps) {
-        return AgentResult.builder()
-            .status(ResultStatus.SUCCESS)
-            .finalAnswer(answer)
-            .executionHistory(history)
-            .totalSteps(steps)
-            .build();
-    }
-    
-    public static AgentResult pendingApproval(PendingTask task, List<Step> history, int steps) {
-        return AgentResult.builder()
-            .status(ResultStatus.PENDING_APPROVAL)
-            .pendingTask(task)
-            .executionHistory(history)
-            .totalSteps(steps)
-            .build();
-    }
-}
+资料返回 FOUND / NOT_FOUND 或 EMPTY / UNAVAILABLE，并带 `complete` 与原因；工具返回 SUCCEEDED / FAILED / UNKNOWN，不用任意 Object 的非空判断业务成功。外部接口 HTTP 200 仍需检查业务码和必需 receipt。未实现适配器在注册或启动阶段禁用，不能返回 `success=true` 或 `null` 冒充已执行。
 
-// ========== Step ==========
-@Data
-@Builder
-public class Step {
-    private StepType type;  // THOUGHT, ACTION, OBSERVATION
-    private String content;
-    private ActionDecision action;
-    private LocalDateTime timestamp;
-    
-    public static Step thought(String thinking) {
-        return Step.builder()
-            .type(StepType.THOUGHT)
-            .content(thinking)
-            .timestamp(LocalDateTime.now())
-            .build();
-    }
-    
-    public static Step action(ActionDecision action) {
-        return Step.builder()
-            .type(StepType.ACTION)
-            .action(action)
-            .timestamp(LocalDateTime.now())
-            .build();
-    }
-    
-    public static Step observation(String result) {
-        return Step.builder()
-            .type(StepType.OBSERVATION)
-            .content(result)
-            .timestamp(LocalDateTime.now())
-            .build();
-    }
-}
+`PreparedPrompt` 增加 audience、purpose、modelPolicyVersion 和来源清单。对话模式使用患者规则；医生模式注入当前目标、允许工具、证据、未完成调用和预算。恢复通过持久化任务状态重建，不把 Thought/Action/Observation 三条日志当成一个固定数组分组。
 
-// ========== ActionDecision ==========
-@Data
-@Builder
-public class ActionDecision {
-    private String toolName;
-    private Map<String, Object> input;
-    private String reason;
-}
+## 三、工具定义、参数与模型协议
 
-// ========== ThoughtResult ==========
-@Data
-@Builder
-public class ThoughtResult {
-    private String thinking;
-    private boolean finished;
-    private String finalAnswer;
-    private ActionDecision action;
-    
-    public static ThoughtResult finished(String thinking, String answer) {
-        return ThoughtResult.builder()
-            .thinking(thinking)
-            .finished(true)
-            .finalAnswer(answer)
-            .build();
-    }
-    
-    public static ThoughtResult continueWith(String thinking, ActionDecision action) {
-        return ThoughtResult.builder()
-            .thinking(thinking)
-            .finished(false)
-            .action(action)
-            .build();
-    }
+### 3.1 模型可见参数不包含授权身份
+
+以读取当前任务目标患者的体重历史为例，下面 JSON 是应用侧参数 Schema；具体供应商接受的子集需由适配器验证：
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "days": {"type": "integer", "minimum": 1, "maximum": 90}
+  },
+  "required": ["days"],
+  "additionalProperties": false
 }
 ```
 
+工具目录还需要 toolVersion、说明、返回 Schema、sideEffect、requiredPermission、approvalPolicy、timeout、idempotencyMode。返回的来源 ID 必须属于当前授权范围；模型传入 customerId、tenantId 或不存在的字段应拒绝，而非忽略后继续。
 
-## 二、工具系统实现
+工具定义用 JSON Schema 描述输入，不能把原 `Map.of("customerId", Map.of("required", true))` 当成标准 Schema。依据 [Anthropic 工具定义文档](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools)（2026-10-29 核对）；Schema 校验之外仍需业务授权、长度和查询范围限制。
 
-### 2.1 Tool定义
+### 3.2 统一执行入口
 
-```java
-@Data
-@Builder
-public class Tool {
-    private String name;
-    private String description;
-    private ToolRiskLevel riskLevel;
-    private Map<String, Object> inputSchema;
-    private ToolExecutor executor;
-}
-
-public enum ToolRiskLevel {
-    LOW,      // 低风险：查询、分析 - 直接执行
-    MEDIUM,   // 中风险：发消息、创建任务 - 直接执行但记录
-    HIGH      // 高风险：修改处方、诊断建议 - 需要医生确认
-}
-
-@FunctionalInterface
-public interface ToolExecutor {
-    Object execute(Map<String, Object> input);
-}
+```text
+executeTool(ctx, runId, revision, callId, name, args):
+  从权威记录加载 run，核对 tenant、actor 权限与固定 customer
+  拒绝终态、过期、取消中或版本不匹配的 run
+  从当前策略允许的目录取得工具版本，验证 Schema 和业务参数
+  canonicalArgs = 版本化规范化参数(args)  // 保留数值、单位、否定与文本含义
+  短事务登记 callId 与 inputHash；同 ID 不同参数报 CONFLICT
+  已有终态结果 → 返回已保存结果，不重复执行
+  需要副作用 → 创建不可变动作意图/审批，进入对应状态，不裸调适配器
+  只读 → 在截止时间内调用适配器，验证归属、状态、来源版本及结果大小
+  条件提交结果：run 修订号和 call attempt 仍匹配
+  旧结果 → 记录 stale，不加入当前证据，不驱动下一步
 ```
 
-### 2.2 ToolRegistry实现
+所有调用路径，包括审批后恢复、并行查询和人工重试，都使用该入口。具体只读查询仍带 tenantId/customerId SQL 条件；只在 Controller 鉴权一次不足以覆盖延迟执行时的撤权。
 
-```java
-@Component
-public class ToolRegistry {
-    
-    private final Map<String, Tool> tools = new HashMap<>();
-    
-    @Autowired
-    private UserProfileService profileService;
-    
-    @Autowired
-    private WeightService weightService;
-    
-    @Autowired
-    private ChatService chatService;
-    
-    @Autowired
-    private PrescriptionService prescriptionService;
-    
-    @PostConstruct
-    public void registerTools() {
-        // 低风险工具：查询类
-        register(Tool.builder()
-            .name("get_patient_profile")
-            .description("查询患者基本信息（年龄、性别、目标、慢性病等）")
-            .riskLevel(ToolRiskLevel.LOW)
-            .inputSchema(Map.of(
-                "customerId", Map.of("type", "string", "required", true)
-            ))
-            .executor(this::getPatientProfile)
-            .build());
-        
-        register(Tool.builder()
-            .name("get_weight_history")
-            .description("查询患者体重历史记录")
-            .riskLevel(ToolRiskLevel.LOW)
-            .inputSchema(Map.of(
-                "customerId", Map.of("type", "string", "required", true),
-                "days", Map.of("type", "integer", "default", 30)
-            ))
-            .executor(this::getWeightHistory)
-            .build());
-        
-        register(Tool.builder()
-            .name("get_chat_history")
-            .description("查询患者最近的聊天记录")
-            .riskLevel(ToolRiskLevel.LOW)
-            .inputSchema(Map.of(
-                "customerId", Map.of("type", "string", "required", true),
-                "limit", Map.of("type", "integer", "default", 20)
-            ))
-            .executor(this::getChatHistory)
-            .build());
-        
-        // 中风险工具：通知类
-        register(Tool.builder()
-            .name("send_reminder")
-            .description("给患者发送提醒消息")
-            .riskLevel(ToolRiskLevel.MEDIUM)
-            .inputSchema(Map.of(
-                "customerId", Map.of("type", "string", "required", true),
-                "message", Map.of("type", "string", "required", true)
-            ))
-            .executor(this::sendReminder)
-            .build());
-        
-        // 高风险工具：医疗决策类
-        register(Tool.builder()
-            .name("draft_prescription")
-            .description("起草处方建议（需要医生审核确认）")
-            .riskLevel(ToolRiskLevel.HIGH)
-            .inputSchema(Map.of(
-                "customerId", Map.of("type", "string", "required", true),
-                "recommendations", Map.of("type", "array", "required", true),
-                "reason", Map.of("type", "string", "required", true)
-            ))
-            .executor(this::draftPrescription)
-            .build());
-    }
-    
-    private void register(Tool tool) {
-        tools.put(tool.getName(), tool);
-    }
-    
-    public Tool getTool(String name) {
-        return tools.get(name);
-    }
-    
-    public List<Tool> getAllTools() {
-        return new ArrayList<>(tools.values());
-    }
-    
-    // 工具执行器实现
-    private Object getPatientProfile(Map<String, Object> input) {
-        String customerId = (String) input.get("customerId");
-        return profileService.getProfile(customerId);
-    }
-    
-    private Object getWeightHistory(Map<String, Object> input) {
-        String customerId = (String) input.get("customerId");
-        Integer days = (Integer) input.getOrDefault("days", 30);
-        return weightService.getRecentRecords(customerId, days);
-    }
-    
-    private Object getChatHistory(Map<String, Object> input) {
-        String customerId = (String) input.get("customerId");
-        Integer limit = (Integer) input.getOrDefault("limit", 20);
-        return chatService.getRecentMessages(customerId, limit);
-    }
-    
-    private Object sendReminder(Map<String, Object> input) {
-        String customerId = (String) input.get("customerId");
-        String message = (String) input.get("message");
-        // 发送消息逻辑
-        return Map.of("success", true, "message", "提醒已发送");
-    }
-    
-    private Object draftPrescription(Map<String, Object> input) {
-        // 这个方法不会被直接调用，因为是高风险操作
-        // 会被ActionExecutor拦截并创建待确认任务
-        return null;
-    }
-}
+### 3.3 为什么替换文本解析器
+
+原解析器使用 `response.contains("Final Answer:")` 判断完成。若工具参数是 `{"message":"请解释 Final Answer: 标签"}`，同样会被误判为最终答案；`indexOf` 还会截断 JSON 字符串内的标记。这是协议歧义，不能靠补一个正则彻底解决。
+
+实现基线使用结构化工具调用和调用 ID。模型返回的 tool call ID 由适配器映射到本地 callId；结果必须匹配已登记调用，模型文本中出现 Observation 不产生执行凭据。普通文本只有在供应商正常结束、没有未完成工具调用、结果校验通过时才成为 finalCandidate；截断、拒绝、协议错误分别处理。
+
+最终报告结构至少含 facts、evidenceRefs、uncertainties、draftRef。校验引用存在、归属和版本匹配，不承诺纯规则能证明全部自然语言结论正确；语义质量由固定样本和专业审核验收。
+
+## 四、患者轮次提交与后台任务
+
+### 4.1 接收、生成、完成分成短事务
+
+```text
+接收事务：
+  校验认证、会话 epoch 和队列容量
+  根据 requestKey 查已有 turn；同键异参拒绝
+  保存 QUEUED turn 与用户提交内容，返回 turnId
+
+运行事务：
+  锁 conversation，选择连续队头 turn，CAS QUEUED → RUNNING
+  在 chat_message 中为当前用户消息分配 seq 并持久化
+  读取上界 readThroughSeq；记录 attemptToken 与 deadline
+  提交后，在事务外准备输入、调用模型、流式返回 provisional
+
+完成事务：
+  锁 conversation 和 turn；复核 RUNNING、epoch、attemptToken 与当前发布权限
+  插入完整 assistant 消息，reply_to 指向当前用户消息
+  保存 COMPLETED、completed 事件与后处理任务，释放 active_turn_id
+  提交后才发布完成通知；MQ 发布失败由任务扫描兜底
 ```
 
+排队内容已经持久化在 turn，但尚未进入可摘要的 chat_message 序列。这使“连续消息水位”与“已运行对话历史”一致，避免把下一位排队用户输入提前注入上一轮。单条消息过长或快照不满足预算，明确拒绝或缩小任务，不悄悄截去否定与单位。
 
-## 三、ActionExecutor实现
+生成失败保存 FAILED/PARTIAL 状态并释放会话；部分助手内容不是完整记忆来源。用户消息已在有序日志中，后续摘要可覆盖它；需要及时提炼时可建立 USER_MESSAGE_SUMMARY 类型任务，不伪装成完整轮次后处理。清空 epoch 会使旧 turn 完成事务失败，旧回调不得重新创建会话。
 
-```java
-@Slf4j
-@Service
-public class ActionExecutor {
-    
-    @Autowired
-    private ToolRegistry toolRegistry;
-    
-    @Autowired
-    private PendingTaskService pendingTaskService;
-    
-    /**
-     * 执行Agent决定的行动
-     */
-    public ActionResult execute(ActionDecision action, String customerId, String sessionId) {
-        Tool tool = toolRegistry.getTool(action.getToolName());
-        
-        if (tool == null) {
-            return ActionResult.error("未知工具: " + action.getToolName());
-        }
-        
-        log.info("执行工具: {}, 风险等级: {}", tool.getName(), tool.getRiskLevel());
-        
-        // 根据风险等级决定执行策略
-        switch (tool.getRiskLevel()) {
-            case LOW:
-                // 低风险：直接执行
-                return executeDirectly(tool, action.getInput());
-                
-            case MEDIUM:
-                // 中风险：执行但记录审计日志
-                ActionResult result = executeDirectly(tool, action.getInput());
-                auditLog(customerId, action, result);
-                return result;
-                
-            case HIGH:
-                // 高风险：创建待确认任务，暂停Agent
-                return createPendingTask(customerId, sessionId, tool, action);
-                
-            default:
-                return ActionResult.error("未知风险等级");
-        }
-    }
-    
-    /**
-     * 直接执行工具
-     */
-    private ActionResult executeDirectly(Tool tool, Map<String, Object> input) {
-        try {
-            Object output = tool.getExecutor().execute(input);
-            return ActionResult.success(output);
-        } catch (Exception e) {
-            log.error("工具执行失败: {}", tool.getName(), e);
-            return ActionResult.error(e.getMessage());
-        }
-    }
-    
-    /**
-     * 创建待确认任务（高风险行动）
-     */
-    private ActionResult createPendingTask(
-        String customerId,
-        String sessionId,
-        Tool tool,
-        ActionDecision action
-    ) {
-        PendingTask task = PendingTask.builder()
-            .agentSessionId(sessionId)
-            .customerId(customerId)
-            .toolName(tool.getName())
-            .toolDescription(tool.getDescription())
-            .input(JSON.toJSONString(action.getInput()))
-            .reason(action.getReason())
-            .status(TaskStatus.PENDING)
-            .createdAt(LocalDateTime.now())
-            .expireAt(LocalDateTime.now().plusHours(24))
-            .build();
-        
-        pendingTaskService.save(task);
-        
-        log.info("创建待确认任务: taskId={}, tool={}", task.getId(), tool.getName());
-        
-        return ActionResult.pendingApproval(task);
-    }
-    
-    /**
-     * 审计日志
-     */
-    private void auditLog(String customerId, ActionDecision action, ActionResult result) {
-        log.info("审计日志: customerId={}, action={}, success={}", 
-            customerId, action.getToolName(), result.isSuccess());
-    }
-}
+### 4.2 后处理任务与索引任务不是一回事
 
-@Data
-@Builder
-public class ActionResult {
-    private boolean success;
-    private Object output;
-    private String errorMessage;
-    private boolean needsApproval;
-    private PendingTask task;
-    
-    public static ActionResult success(Object output) {
-        return ActionResult.builder()
-            .success(true)
-            .output(output)
-            .needsApproval(false)
-            .build();
-    }
-    
-    public static ActionResult pendingApproval(PendingTask task) {
-        return ActionResult.builder()
-            .success(false)
-            .needsApproval(true)
-            .task(task)
-            .build();
-    }
-    
-    public static ActionResult error(String message) {
-        return ActionResult.builder()
-            .success(false)
-            .errorMessage(message)
-            .needsApproval(false)
-            .build();
-    }
-}
+轮次后处理键为 `(tenantId, groupId, epoch, turnId, taskType)`，可拆成 SUMMARY 和 MEMORY_EXTRACT 两个任务，各自记录成功与失败。记忆保存以 `(tenantId, turnId, candidateKey)` 唯一，随后同事务创建 `(memoryId, memoryVersion, indexGeneration)` 索引任务。
+
+首次提取的候选集应在持久化边界冻结，candidateKey 不随每次模型随机结果变化。任务在保存候选前失败可以重算；保存后重试读已有候选，不再次随机生成另一批记忆。摘要提交采用 epoch/contextVersion/coveredThroughSeq 三个条件，见 [[会话上下文设计方案]]。
+
+## 五、任务领取、循环与恢复
+
+### 5.1 领取和外部调用分开
+
+短事务领取 async_job，保存递增 attemptToken 和 leaseUntil，然后释放锁再执行网络调用。查询待领取任务可以使用 MySQL 8.0 的 `FOR UPDATE SKIP LOCKED`，但必须在事务内使用；它跳过锁定行，不适合用来证明完整业务视图。依据 [MySQL 锁定读说明](https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html)。
+
+下面 SQL 是命名参数伪代码，验证条件更新语义用；不是数据库迁移脚本：
+
+```sql
+UPDATE async_job
+SET status = 'SUCCEEDED', completed_at = :now, lease_until = NULL
+WHERE tenant_id = :tenant_id AND job_id = :job_id
+  AND status = 'PROCESSING'
+  AND attempt_token = :attempt_token
+  AND lease_until > :now;
 ```
 
+受影响行数必须为 1；为 0 的旧 worker 只能停止提交。该条件仅保护任务账本，不保护已经发生的外部效果；业务资源也必须用 actionId 幂等或来源版本条件拒绝陈旧写入。
 
-## 四、ReActPromptBuilder实现
+### 5.2 每一步都可恢复
 
-```java
-@Component
-public class ReActPromptBuilder {
-    
-    /**
-     * 构建ReAct循环的System Prompt
-     */
-    public String buildSystemPrompt(List<Tool> availableTools) {
-        return String.format("""
-            你是一位资深健康管理医生的AI助手Agent。你的任务是通过多步推理和工具调用，帮助医生分析患者情况。
-            
-            ## 工作模式：ReAct (Reasoning + Acting)
-            
-            请使用以下教学文本协议输出简短行动说明和工具请求；不要输出内部逐步思维过程：
-            
-            Thought: [一句话说明下一步动作及已有证据，不输出内部思维链]
-            Action: [你决定调用的工具]
-            Action Input: [工具的输入参数，JSON格式]
-            
-            然后你会收到：
-            Observation: [工具执行的结果]
-            
-            你可以重复多次 Thought -> Action -> Observation 循环，直到你有足够信息完成任务。
-            
-            当你准备好给出最终答案时，使用：
-            Thought: [简短完成说明]
-            Final Answer: [你的完整回答]
-            
-            ## 可用工具
-            
-            %s
-            
-            ## 重要原则
-            
-            1. **循序渐进**：先查询基础信息，再根据发现决定下一步
-            2. **有的放矢**：只调用真正需要的工具，不要盲目查询所有数据
-            3. **关注异常**：重点关注风险信号（体重异常、负面情绪、长期未打卡）
-            4. **医疗谨慎**：涉及诊断和处方时，必须基于充分证据
-            5. **行动说明**：Thought仅提供简短动作依据；Observation由执行系统写入，不得伪造
-            
-            ## 示例
-            
-            Goal: 分析患者张三的健康状况
-            
-            Thought: 我需要先了解患者的基本信息，包括年龄、性别、目标和当前健康状况。
-            Action: get_patient_profile
-            Action Input: {"customerId": "张三"}
-            
-            Observation: {"age": 35, "gender": "女", "targetWeight": 55.0, "currentWeight": 62.0, "chronicDiseases": ["高血压"], "bmi": 22.5}
-            
-            Thought: 患者35岁女性，目标减重7kg，有高血压病史。BMI 22.5属于正常范围，但有减重目标。我需要查看体重变化趋势来评估进展。
-            Action: get_weight_history
-            Action Input: {"customerId": "张三", "days": 30}
-            
-            Observation: [体重数据显示最近30天下降了3kg，但最近3天反弹了1kg]
-            
-            Thought: 体重整体趋势良好，但最近出现反弹。这可能是正常波动，也可能有其他原因。我应该查看聊天记录，了解患者最近的状态和情绪。
-            Action: get_chat_history
-            Action Input: {"customerId": "张三", "limit": 10}
-            
-            Observation: [聊天记录显示患者提到"有点焦虑"、"是不是方法不对"]
-            
-            Thought: 患者出现焦虑情绪，这可能影响了体重管理。结合高血压病史，我现在有足够信息生成综合分析了。
-            Final Answer: [完整的患者分析报告]
-            
-            现在开始执行任务。
-            """, formatToolDescriptions(availableTools));
-    }
-    
-    /**
-     * 格式化工具描述
-     */
-    private String formatToolDescriptions(List<Tool> tools) {
-        return tools.stream()
-            .map(tool -> String.format("""
-                ### %s
-                描述: %s
-                风险等级: %s
-                参数: %s
-                """,
-                tool.getName(),
-                tool.getDescription(),
-                tool.getRiskLevel(),
-                JSON.toJSONString(tool.getInputSchema())
-            ))
-            .collect(Collectors.joining("\n"));
-    }
-    
-    /**
-     * 构建用户请求Prompt
-     */
-    public String buildUserPrompt(String goal, String customerId) {
-        return String.format("""
-            Goal: %s
-            Patient ID: %s
-            
-            请开始你的分析。记住使用 Thought -> Action -> Observation 的格式。
-            """, goal, customerId);
-    }
-    
-    /**
-     * 构建历史对话Prompt（用于继续ReAct循环）
-     */
-    public List<Message> buildHistoryMessages(List<Step> history) {
-        List<Message> messages = new ArrayList<>();
-        
-        StringBuilder currentAssistant = new StringBuilder();
-        
-        for (Step step : history) {
-            switch (step.getType()) {
-                case THOUGHT:
-                    currentAssistant.append("Thought: ").append(step.getContent()).append("\n");
-                    break;
-                    
-                case ACTION:
-                    currentAssistant.append("Action: ").append(step.getAction().getToolName()).append("\n");
-                    currentAssistant.append("Action Input: ").append(
-                        JSON.toJSONString(step.getAction().getInput())
-                    ).append("\n");
-                    
-                    // Assistant消息完成
-                    messages.add(Message.assistant(currentAssistant.toString()));
-                    currentAssistant = new StringBuilder();
-                    break;
-                    
-                case OBSERVATION:
-                    // Observation作为User消息
-                    messages.add(Message.user("Observation: " + step.getContent()));
-                    break;
-            }
-        }
-        
-        return messages;
-    }
-}
-
-@Data
-@AllArgsConstructor
-public class Message {
-    private String role;  // "user" or "assistant"
-    private String content;
-    
-    public static Message user(String content) {
-        return new Message("user", content);
-    }
-    
-    public static Message assistant(String content) {
-        return new Message("assistant", content);
-    }
-}
+```text
+runOneDecision(runId, attempt):
+  读持久化 run：授权、状态、修订号、stepCount、预算、未完成调用
+  有未完成动作 → 恢复该动作，不能重新让模型生成同一动作
+  无未完成动作 → 原子预留一次 decisionNo 与调用预算
+  事务外调用 ModelGateway，保存供应商请求 ID 和 usage（失败也记账）
+  条件提交模型候选，拒绝修订号或 attempt 已变化的结果
+  工具请求 → 登记稳定 callId 后交 ToolGateway
+  最终候选 → 校验来源与输出，保存报告/草稿、终态和事件
 ```
 
+模型请求中途崩溃可能重复计费，不能用本地 requestKey 承诺供应商去重。重试沿用逻辑 decisionNo，并单独计 modelAttempt；所有尝试计入总预算。工具调用要先登记后执行，模型重试不能重新分配 actionId 绕过去重。
 
-## 五、ReActResponseParser实现
+恢复加载 goal、snapshotId、待审批/待执行 actionId、结构化结果与预算，不依赖还原原始 Prompt 字节。stepCount 记录已预留的决策次数，不用 history.size；每个 callId 只写一次终态结果事件，相同结果重复回调返回已有终态，不同结果哈希标记冲突。
 
-```java
-@Component
-public class ReActResponseParser {
-    
-    /**
-     * 解析Claude的ReAct响应
-     */
-    public ThoughtResult parse(String response) {
-        // 提取Thought
-        String thought = extractSection(response, "Thought:");
-        
-        // 检查是否是最终答案
-        if (response.contains("Final Answer:")) {
-            String finalAnswer = extractSection(response, "Final Answer:");
-            return ThoughtResult.finished(thought, finalAnswer);
-        }
-        
-        // 提取Action
-        String actionName = extractSection(response, "Action:");
-        String actionInputStr = extractSection(response, "Action Input:");
-        
-        if (actionName == null || actionInputStr == null) {
-            throw new AgentException("无法解析Action: " + response);
-        }
-        
-        // 解析Action Input (JSON)
-        Map<String, Object> actionInput;
-        try {
-            actionInput = JSON.parseObject(actionInputStr, 
-                new TypeReference<Map<String, Object>>() {});
-        } catch (Exception e) {
-            throw new AgentException("Action Input不是有效的JSON: " + actionInputStr);
-        }
-        
-        // 提取推理原因
-        String reason = extractReason(thought);
-        
-        ActionDecision action = ActionDecision.builder()
-            .toolName(actionName.trim())
-            .input(actionInput)
-            .reason(reason)
-            .build();
-        
-        return ThoughtResult.continueWith(thought, action);
-    }
-    
-    /**
-     * 提取文本中的特定部分
-     */
-    private String extractSection(String text, String marker) {
-        int start = text.indexOf(marker);
-        if (start == -1) {
-            return null;
-        }
-        
-        start += marker.length();
-        
-        // 找到下一个标记或文本结束
-        String[] nextMarkers = {"Thought:", "Action:", "Action Input:", "Observation:", "Final Answer:"};
-        int end = text.length();
-        
-        for (String nextMarker : nextMarkers) {
-            int pos = text.indexOf(nextMarker, start);
-            if (pos != -1 && pos < end) {
-                end = pos;
-            }
-        }
-        
-        return text.substring(start, end).trim();
-    }
-    
-    /**
-     * 从Thought中提取推理原因
-     */
-    private String extractReason(String thought) {
-        if (thought.length() <= 100) {
-            return thought;
-        }
-        return thought.substring(0, 100) + "...";
-    }
-}
+用户更新目标或证据时推进修订号并作废旧草稿/审批。只读旧调用可以完成但结果不进入当前状态；已开始的副作用先查证，不能随目标更新将其事实抹掉。终态 run 不隐式复活，继续任务需要显式新版本或新 run，并保留关联。
+
+## 六、草稿、审批和副作用事务
+
+### 6.1 审批事务
+
+```text
+decide(approvalId, expectedVersion, requestKey, decision):
+  重新认证并检查审核权限；读取请求幂等记录
+  BEGIN
+    按统一顺序锁 run → approval → draft/action
+    核对对象归属、run 状态、有效期、expectedVersion、输入哈希
+    校验 goalRevision、evidenceRevision 和当前权威来源版本
+    同一 requestKey 同一请求：返回已有决定；异参：409
+    不同 requestKey 遇到已决定审批：同决定返回已有结果，反决定409
+    已过期、版本失效或授权撤销：拒绝，不创建任务
+    写审批终态及审计事件
+    草稿审核：标记指定 draftVersion 已审核，不产生发送
+    动作批准：创建唯一 action_execution 及 action job
+    拒绝：取消当前等待任务，记录 REVIEW_REJECTED
+    保存请求幂等结果
+  COMMIT
+  返回决定凭据；实际执行另由 worker 处理
 ```
 
+本地来源版本可在同一事务锁定/条件验证；外部来源不具备事务锁时，审核记录表达“审核了这个快照”，动作前再校验。若要求审核与外部资料变化绝无竞态，必须由资源端接受预期版本，做不到则禁止该类自动动作。
 
-## 六、ReActAgentEngine核心实现
+### 6.2 业务效果与执行结果
 
-```java
-@Slf4j
-@Service
-public class ReActAgentEngine {
-    
-    @Autowired
-    private ClaudeApiClient claudeClient;
-    
-    @Autowired
-    private ReActPromptBuilder promptBuilder;
-    
-    @Autowired
-    private ReActResponseParser responseParser;
-    
-    @Autowired
-    private ActionExecutor actionExecutor;
-    
-    @Autowired
-    private ToolRegistry toolRegistry;
-    
-    @Autowired
-    private AgentSessionService sessionService;
-    
-    private static final int MAX_STEPS = 15;
-    
-    /**
-     * 执行Agent任务
-     */
-    public AgentResult execute(String goal, String customerId, String doctorId) {
-        log.info("Agent开始执行任务: goal={}, customerId={}", goal, customerId);
-        
-        // 创建会话
-        AgentSession session = sessionService.createSession(customerId, doctorId, goal);
-        
-        List<Step> history = new ArrayList<>();
-        List<Message> messages = new ArrayList<>();
-        
-        // 构建System Prompt
-        String systemPrompt = promptBuilder.buildSystemPrompt(toolRegistry.getAllTools());
-        
-        // 构建初始User Prompt
-        String userPrompt = promptBuilder.buildUserPrompt(goal, customerId);
-        messages.add(Message.user(userPrompt));
-        
-        for (int step = 0; step < MAX_STEPS; step++) {
-            log.info("Agent执行第{}步", step + 1);
-            
-            try {
-                // 1. 调用Claude API获取Thought和Action
-                ClaudeResponse response = claudeClient.chat(systemPrompt, messages);
-                
-                String responseText = extractText(response);
-                log.info("Agent响应: {}", responseText);
-                
-                // 2. 解析响应
-                ThoughtResult thought = responseParser.parse(responseText);
-                
-                // 记录Thought
-                history.add(Step.thought(thought.getThinking()));
-                messages.add(Message.assistant(responseText));
-                
-                // 3. 检查是否完成
-                if (thought.isFinished()) {
-                    log.info("Agent任务完成");
-                    sessionService.completeSession(session.getId(), history);
-                    return AgentResult.success(thought.getFinalAnswer(), history, step + 1);
-                }
-                
-                // 4. 执行Action
-                ActionDecision action = thought.getAction();
-                history.add(Step.action(action));
-                
-                log.info("Agent执行行动: tool={}, input={}", 
-                    action.getToolName(), 
-                    JSON.toJSONString(action.getInput())
-                );
-                
-                ActionResult actionResult = actionExecutor.execute(
-                    action, 
-                    customerId, 
-                    session.getId()
-                );
-                
-                // 5. 检查是否需要人工确认
-                if (actionResult.needsApproval()) {
-                    log.info("行动需要医生确认，Agent暂停");
-                    sessionService.pauseSession(session.getId(), history);
-                    return AgentResult.pendingApproval(
-                        actionResult.getTask(),
-                        history,
-                        step + 1
-                    );
-                }
-                
-                // 6. 记录Observation
-                String observation = formatObservation(actionResult);
-                history.add(Step.observation(observation));
-                messages.add(Message.user("Observation: " + observation));
-                
-                log.info("Agent观察结果: {}", observation);
-                
-                // 7. 更新会话状态
-                sessionService.updateSession(session.getId(), history, step + 1);
-                
-            } catch (Exception e) {
-                log.error("Agent执行异常", e);
-                sessionService.failSession(session.getId(), e.getMessage());
-                return AgentResult.error(e.getMessage(), history, step + 1);
-            }
-        }
-        
-        log.warn("Agent达到最大步数限制");
-        sessionService.failSession(session.getId(), "达到最大步数限制");
-        return AgentResult.maxStepsReached(history, MAX_STEPS);
-    }
-    
-    /**
-     * 继续执行（用于人工确认后恢复）
-     */
-    public AgentResult resume(String sessionId, Long approvedTaskId) {
-        log.info("Agent恢复执行: sessionId={}, taskId={}", sessionId, approvedTaskId);
-        
-        // 从数据库恢复Agent状态
-        AgentSession session = sessionService.getById(sessionId);
-        if (session == null) {
-            throw new AgentException("会话不存在: " + sessionId);
-        }
-        
-        List<Step> history = JSON.parseArray(session.getHistoryJson(), Step.class);
-        
-        // 获取已批准的任务
-        PendingTask task = pendingTaskService.getById(approvedTaskId);
-        if (task == null || !TaskStatus.APPROVED.equals(task.getStatus())) {
-            throw new AgentException("任务未批准: " + approvedTaskId);
-        }
-        
-        // 执行已批准的行动
-        Map<String, Object> input = JSON.parseObject(task.getInput(), 
-            new TypeReference<Map<String, Object>>() {});
-        Tool tool = toolRegistry.getTool(task.getToolName());
-        Object output = tool.getExecutor().execute(input);
-        
-        // 记录Observation
-        String observation = JSON.toJSONString(output);
-        history.add(Step.observation(observation));
-        
-        // 构建消息历史
-        List<Message> messages = promptBuilder.buildHistoryMessages(history);
-        messages.add(Message.user("Observation: " + observation));
-        
-        // 继续ReAct循环
-        return continueExecution(session, history, messages);
-    }
-    
-    /**
-     * 继续执行ReAct循环
-     */
-    private AgentResult continueExecution(
-        AgentSession session,
-        List<Step> history,
-        List<Message> messages
-    ) {
-        String systemPrompt = promptBuilder.buildSystemPrompt(toolRegistry.getAllTools());
-        int startStep = history.size();
-        
-        for (int step = startStep; step < MAX_STEPS; step++) {
-            // 继续执行逻辑（与execute方法类似）
-            // ... 省略重复代码
-        }
-        
-        return AgentResult.maxStepsReached(history, MAX_STEPS);
-    }
-    
-    private String extractText(ClaudeResponse response) {
-        return response.getContent().stream()
-            .filter(block -> "text".equals(block.getType()))
-            .map(block -> ((TextBlock) block).getText())
-            .collect(Collectors.joining("\n"));
-    }
-    
-    private String formatObservation(ActionResult result) {
-        if (result.isSuccess()) {
-            return JSON.toJSONString(result.getOutput());
-        } else {
-            return "Error: " + result.getErrorMessage();
-        }
-    }
-}
+```text
+执行准备事务：
+  核对授权、批准绑定、run 修订、来源版本和动作状态
+  READY/RETRY_WAIT → EXECUTING，记录 attemptToken
+
+事务外：
+  调用资源端，始终携带相同 actionId / businessEffectKey
+  若成功返回可验证 receipt，提交 SUCCEEDED
+  若明确未执行且可重试，提交 RETRY_WAIT + nextAttemptAt
+  若可能已执行（超时、断连），提交 UNKNOWN，转查证任务
+
+查证：
+  资源端确认已完成 → 保存 receipt，动作 SUCCEEDED
+  确认未执行且原请求不可能再执行 → 重新授权并以同业务键重试
+  仍不确定 → MANUAL；禁用自动重发
 ```
 
+进程在 EXECUTING 中退出，过期租约回收也进入 UNKNOWN，不能像纯摘要任务那样直接重算。迟到回执只有在动作身份、参数及资源结果匹配后才可作为查证证据；不能让旧 attempt 无条件覆盖新状态。
 
-## 七、Controller层实现
+本地草稿保存与动作账本同库时，将业务行和账本终态放在同一短事务；对外发送无法与 MySQL 原子提交，保留结果不明是必要状态。取消仅阻止尚未发出的动作，不能撤销已接受的外部请求。
 
-```java
-@Slf4j
-@RestController
-@RequestMapping("/api/agent")
-public class AgentController {
-    
-    @Autowired
-    private ReActAgentEngine agentEngine;
-    
-    @Autowired
-    private AgentSessionService sessionService;
-    
-    @Autowired
-    private PendingTaskService pendingTaskService;
-    
-    /**
-     * 执行Agent任务
-     */
-    @PostMapping("/execute")
-    public Result<AgentExecutionVO> execute(@RequestBody AgentExecuteRequest request) {
-        log.info("收到Agent执行请求: goal={}, customerId={}", 
-            request.getGoal(), request.getCustomerId());
-        
-        // 执行Agent
-        AgentResult result = agentEngine.execute(
-            request.getGoal(),
-            request.getCustomerId(),
-            request.getDoctorId()
-        );
-        
-        // 构建响应
-        AgentExecutionVO vo = AgentExecutionVO.builder()
-            .sessionId(result.getSessionId())
-            .status(result.getStatus())
-            .finalAnswer(result.getFinalAnswer())
-            .pendingTask(convertPendingTask(result.getPendingTask()))
-            .executionHistory(convertHistory(result.getExecutionHistory()))
-            .totalSteps(result.getTotalSteps())
-            .build();
-        
-        return Result.success(vo);
-    }
-    
-    /**
-     * 获取待确认任务列表
-     */
-    @GetMapping("/pending-tasks")
-    public Result<List<PendingTaskVO>> listPendingTasks(
-        @RequestParam String doctorId
-    ) {
-        List<PendingTask> tasks = pendingTaskService.listPendingByDoctor(doctorId);
-        
-        List<PendingTaskVO> vos = tasks.stream()
-            .map(this::convertPendingTaskVO)
-            .collect(Collectors.toList());
-        
-        return Result.success(vos);
-    }
-    
-    /**
-     * 审批待确认任务
-     */
-    @PostMapping("/pending-tasks/{taskId}/approve")
-    public Result<AgentExecutionVO> approveTask(
-        @PathVariable Long taskId,
-        @RequestBody TaskApprovalRequest request
-    ) {
-        log.info("医生审批任务: taskId={}, approved={}", taskId, request.isApproved());
-        
-        PendingTask task = pendingTaskService.getById(taskId);
-        if (task == null) {
-            return Result.error("任务不存在");
-        }
-        
-        if (!request.isApproved()) {
-            // 拒绝：标记任务为已拒绝，Agent终止
-            pendingTaskService.reject(taskId, request.getComment());
-            return Result.error("任务已被拒绝");
-        }
-        
-        // 批准：执行任务并恢复Agent
-        pendingTaskService.approve(taskId, request.getComment());
-        
-        // 恢复Agent执行
-        AgentResult result = agentEngine.resume(task.getAgentSessionId(), taskId);
-        
-        AgentExecutionVO vo = AgentExecutionVO.builder()
-            .sessionId(task.getAgentSessionId())
-            .status(result.getStatus())
-            .finalAnswer(result.getFinalAnswer())
-            .executionHistory(convertHistory(result.getExecutionHistory()))
-            .totalSteps(result.getTotalSteps())
-            .build();
-        
-        return Result.success(vo);
-    }
-    
-    /**
-     * 获取Agent执行历史
-     */
-    @GetMapping("/sessions/{sessionId}")
-    public Result<AgentSessionVO> getSession(@PathVariable String sessionId) {
-        AgentSession session = sessionService.getById(sessionId);
-        if (session == null) {
-            return Result.error("会话不存在");
-        }
-        
-        AgentSessionVO vo = AgentSessionVO.builder()
-            .sessionId(session.getId())
-            .customerId(session.getCustomerId())
-            .goal(session.getGoal())
-            .status(session.getStatus())
-            .executionHistory(JSON.parseArray(session.getHistoryJson(), Step.class))
-            .currentStep(session.getCurrentStep())
-            .createdAt(session.getCreatedAt())
-            .completedAt(session.getCompletedAt())
-            .build();
-        
-        return Result.success(vo);
-    }
-    
-    private PendingTaskVO convertPendingTask(PendingTask task) {
-        if (task == null) return null;
-        
-        return PendingTaskVO.builder()
-            .taskId(task.getId())
-            .customerId(task.getCustomerId())
-            .toolName(task.getToolName())
-            .toolDescription(task.getToolDescription())
-            .input(JSON.parseObject(task.getInput(), Map.class))
-            .reason(task.getReason())
-            .createdAt(task.getCreatedAt().toString())
-            .expireAt(task.getExpireAt().toString())
-            .build();
-    }
-    
-    private List<StepVO> convertHistory(List<Step> history) {
-        return history.stream()
-            .map(step -> StepVO.builder()
-                .type(step.getType())
-                .content(step.getContent())
-                .toolName(step.getAction() != null ? step.getAction().getToolName() : null)
-                .toolInput(step.getAction() != null ? step.getAction().getInput() : null)
-                .timestamp(step.getTimestamp().toString())
-                .build())
-            .collect(Collectors.toList());
-    }
-    
-    private PendingTaskVO convertPendingTaskVO(PendingTask task) {
-        return PendingTaskVO.builder()
-            .taskId(task.getId())
-            .customerId(task.getCustomerId())
-            .customerName(getCustomerName(task.getCustomerId()))
-            .toolName(task.getToolName())
-            .toolDescription(task.getToolDescription())
-            .input(JSON.parseObject(task.getInput(), Map.class))
-            .reason(task.getReason())
-            .createdAt(task.getCreatedAt().toString())
-            .expireAt(task.getExpireAt().toString())
-            .build();
-    }
-    
-    private String getCustomerName(String customerId) {
-        // 查询患者姓名
-        return "患者" + customerId;
-    }
-}
-```
+## 七、Controller、DTO 与错误契约
 
+Controller 只解析认证、校验 DTO 和调用 application 用例。创建入口返回 202 和持久化资源 ID；查询返回 200；审批决定与动作完成有不同响应字段。统一 API 见 [[医生助手Agent开发方案#七、API 与前端交互]]。
 
-## 八、Service层实现
+校验必须真实生效：Spring 入口启用参数验证，嵌套对象、字符串长度、集合数量和枚举均有边界。请求 body 中不含 doctorId，任何 run、turn、approval 查询都经 tenant/actor 资源授权。错误返回 `errorCode / retryable / traceId`，不返回原始模型输出或 SQL 异常正文。
 
-### 8.1 AgentSessionService
+同一 run 不同事件的查询按 `(eventSeq)` 游标；按创建时间列任务时，使用 `(createdAt, id)` 复合游标并按两者排序。原“按随机 UUID 过滤但按时间排序”会漏页。limit 有正整数上限，不能拼接未经校验的 SQL。
 
-```java
-@Service
-public class AgentSessionService {
-    
-    @Autowired
-    private AgentSessionMapper sessionMapper;
-    
-    /**
-     * 创建Agent会话
-     */
-    public AgentSession createSession(String customerId, String doctorId, String goal) {
-        AgentSession session = new AgentSession();
-        session.setId(UUID.randomUUID().toString());
-        session.setCustomerId(customerId);
-        session.setDoctorId(doctorId);
-        session.setGoal(goal);
-        session.setStatus(SessionStatus.RUNNING);
-        session.setCurrentStep(0);
-        session.setCreatedAt(LocalDateTime.now());
-        session.setUpdatedAt(LocalDateTime.now());
-        
-        sessionMapper.insert(session);
-        return session;
-    }
-    
-    /**
-     * 更新会话状态
-     */
-    public void updateSession(String sessionId, List<Step> history, int currentStep) {
-        AgentSession session = new AgentSession();
-        session.setId(sessionId);
-        session.setHistoryJson(JSON.toJSONString(history));
-        session.setCurrentStep(currentStep);
-        session.setUpdatedAt(LocalDateTime.now());
-        
-        sessionMapper.updateById(session);
-    }
-    
-    /**
-     * 暂停会话（等待人工确认）
-     */
-    public void pauseSession(String sessionId, List<Step> history) {
-        AgentSession session = new AgentSession();
-        session.setId(sessionId);
-        session.setStatus(SessionStatus.PAUSED);
-        session.setHistoryJson(JSON.toJSONString(history));
-        session.setUpdatedAt(LocalDateTime.now());
-        
-        sessionMapper.updateById(session);
-    }
-    
-    /**
-     * 完成会话
-     */
-    public void completeSession(String sessionId, List<Step> history) {
-        AgentSession session = new AgentSession();
-        session.setId(sessionId);
-        session.setStatus(SessionStatus.COMPLETED);
-        session.setHistoryJson(JSON.toJSONString(history));
-        session.setCompletedAt(LocalDateTime.now());
-        session.setUpdatedAt(LocalDateTime.now());
-        
-        sessionMapper.updateById(session);
-    }
-    
-    /**
-     * 会话失败
-     */
-    public void failSession(String sessionId, String errorMessage) {
-        AgentSession session = new AgentSession();
-        session.setId(sessionId);
-        session.setStatus(SessionStatus.FAILED);
-        session.setUpdatedAt(LocalDateTime.now());
-        
-        sessionMapper.updateById(session);
-    }
-    
-    /**
-     * 获取会话
-     */
-    public AgentSession getById(String sessionId) {
-        return sessionMapper.selectById(sessionId);
-    }
-}
-```
+## 八、模型客户端、配置与并发
 
-### 8.2 PendingTaskService
+模型客户端从配置获取 provider、model、版本、最大输出及允许工具能力；实际 usage 与供应商请求 ID 进入受控账本。协议字段映射、工具结果配对、截断、限流、超时、缺失响应体和取消均要做适配测试。连接等待、连接、读取和总调用截止时间均受任务剩余预算约束。
 
-```java
-@Service
-public class PendingTaskService {
-    
-    @Autowired
-    private PendingTaskMapper taskMapper;
-    
-    /**
-     * 保存待确认任务
-     */
-    public void save(PendingTask task) {
-        taskMapper.insert(task);
-    }
-    
-    /**
-     * 获取医生的待确认任务列表
-     */
-    public List<PendingTask> listPendingByDoctor(String doctorId) {
-        return taskMapper.selectList(
-            new LambdaQueryWrapper<PendingTask>()
-                .eq(PendingTask::getDoctorId, doctorId)
-                .eq(PendingTask::getStatus, TaskStatus.PENDING)
-                .orderByDesc(PendingTask::getCreatedAt)
-        );
-    }
-    
-    /**
-     * 批准任务
-     */
-    public void approve(Long taskId, String comment) {
-        PendingTask task = new PendingTask();
-        task.setId(taskId);
-        task.setStatus(TaskStatus.APPROVED);
-        task.setReviewComment(comment);
-        task.setReviewedAt(LocalDateTime.now());
-        
-        taskMapper.updateById(task);
-    }
-    
-    /**
-     * 拒绝任务
-     */
-    public void reject(Long taskId, String comment) {
-        PendingTask task = new PendingTask();
-        task.setId(taskId);
-        task.setStatus(TaskStatus.REJECTED);
-        task.setReviewComment(comment);
-        task.setReviewedAt(LocalDateTime.now());
-        
-        taskMapper.updateById(task);
-    }
-    
-    /**
-     * 获取任务
-     */
-    public PendingTask getById(Long taskId) {
-        return taskMapper.selectById(taskId);
-    }
-}
-```
-
-
-## 九、Claude API客户端实现
-
-```java
-@Slf4j
-@Component
-public class ClaudeApiClient {
-    
-    @Value("${claude.api.key}")
-    private String apiKey;
-    
-    @Value("${claude.api.base-url}")
-    private String baseUrl;
-    
-    private final OkHttpClient httpClient;
-    private final ObjectMapper objectMapper;
-    
-    public ClaudeApiClient() {
-        this.httpClient = new OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
-            .build();
-        this.objectMapper = new ObjectMapper();
-    }
-    
-    /**
-     * 调用Claude API（ReAct模式）
-     */
-    public ClaudeResponse chat(String systemPrompt, List<Message> messages) {
-        try {
-            // 构建请求体
-            Map<String, Object> requestBody = new HashMap<>();
-            requestBody.put("model", "claude-opus-4-7");
-            requestBody.put("max_tokens", 4096);
-            requestBody.put("system", systemPrompt);
-            requestBody.put("messages", messages.stream()
-                .map(msg -> Map.of("role", msg.getRole(), "content", msg.getContent()))
-                .collect(Collectors.toList()));
-            
-            // 发送请求
-            Request request = new Request.Builder()
-                .url(baseUrl + "/v1/messages")
-                .header("x-api-key", apiKey)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .post(RequestBody.create(
-                    objectMapper.writeValueAsString(requestBody),
-                    MediaType.parse("application/json")
-                ))
-                .build();
-            
-            try (Response response = httpClient.newCall(request).execute()) {
-                if (!response.isSuccessful()) {
-                    throw new RuntimeException("Claude API调用失败: " + response.code());
-                }
-                
-                String responseBody = response.body().string();
-                return objectMapper.readValue(responseBody, ClaudeResponse.class);
-            }
-            
-        } catch (Exception e) {
-            log.error("Claude API调用异常", e);
-            throw new RuntimeException("AI服务异常", e);
-        }
-    }
-}
-
-@Data
-public class ClaudeResponse {
-    private String id;
-    private String type;
-    private String role;
-    private List<ContentBlock> content;
-    private String model;
-    private String stopReason;
-    private Usage usage;
-}
-
-@Data
-public class ContentBlock {
-    private String type;
-    private String text;
-}
-
-@Data
-public class Usage {
-    private int inputTokens;
-    private int outputTokens;
-}
-```
-
-## 十、配置类
-
-```java
-@Configuration
-public class AgentConfig {
-    
-    @Bean("agentExecutor")
-    public ThreadPoolTaskExecutor agentExecutor() {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(8);
-        executor.setMaxPoolSize(16);
-        executor.setQueueCapacity(1000);
-        executor.setThreadNamePrefix("agent-");
-        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
-        executor.setWaitForTasksToCompleteOnShutdown(true);
-        executor.setAwaitTerminationSeconds(60);
-        executor.initialize();
-        return executor;
-    }
-}
-```
-
-## 十一、配置文件
-
-### application.yml
+下面仅为**应用自定义配置结构示意**，数值是本地实验起点，须由正式工程的配置类绑定、校验并测试；不是 Spring 原生属性，也不证明部署成功。
 
 ```yaml
-# Claude API配置
-claude:
-  api:
-    key: ${CLAUDE_API_KEY}
-    base-url: https://api.anthropic.com
-    model: claude-opus-4-7
-    max-tokens: 4096
-
-# Agent配置
-agent:
-  max-steps: 15
-  session-timeout: 3600  # 会话超时时间（秒）
-  task-expire-hours: 24  # 待确认任务过期时间（小时）
-
-# 线程池配置
-agent:
-  executor:
-    core-pool-size: 8
-    max-pool-size: 16
-    queue-capacity: 1000
-
-# Redis配置
-spring:
-  redis:
-    host: localhost
-    port: 6379
-    database: 0
-
-# MySQL配置
-spring:
-  datasource:
-    url: jdbc:mysql://localhost:3306/health_management?useUnicode=true&characterEncoding=utf8
-    username: root
-    password: ${MYSQL_PASSWORD}
+ai:
+  model:
+    provider: ${AI_PROVIDER}
+    name: ${AI_MODEL}
+    credential-ref: ${AI_CREDENTIAL_REF}
+  run:
+    max-decisions: 8
+    active-timeout-seconds: 60
+    approval-expire-hours: 24
+  worker:
+    max-concurrency: 4
+    lease-seconds: 30
+    max-attempts: 3
+  features:
+    patient-chat: true
+    clinician-readonly: true
+    external-actions: false
+    cross-patient-search: false
 ```
 
+30 秒租约不意味任务一定 30 秒完成：执行中需受控续租，过期结果不得直接提交。配置的最大尝试次数适用于允许重试的 job；UNKNOWN 动作不套自动重试。密钥由部署注入解析，不进入文档、Prompt 或普通日志。
 
-## 十二、VO对象定义
+在线生成和后台提炼分别使用有界配额/执行器。定义线程池 Bean 不会自动让同步 Controller 变异步；编排需明确提交到 worker。并行只读查询通过 ToolGateway，按 callId 聚合，设置整体截止时间与部分失败策略；同名工具的两次调用不能用工具名作 Map 键。首期串行执行，测得必要性后再并行。
 
-```java
-// ========== 请求VO ==========
+## 九、可运行状态实验与验证边界
 
-@Data
-public class AgentExecuteRequest {
-    @NotBlank
-    private String customerId;
-    
-    @NotBlank
-    private String doctorId;
-    
-    @NotBlank
-    private String goal;
-}
+本目录的 [统一状态契约实验](./实验/统一状态契约实验.py) 使用 Python 标准库测试隔离的状态规则，不需要模型、数据库或患者数据。在仓库根目录执行：
 
-@Data
-public class TaskApprovalRequest {
-    private boolean approved;
-    private String comment;
-}
-
-// ========== 响应VO ==========
-
-@Data
-@Builder
-public class AgentExecutionVO {
-    private String sessionId;
-    private ResultStatus status;
-    private String finalAnswer;
-    private PendingTaskVO pendingTask;
-    private List<StepVO> executionHistory;
-    private Integer totalSteps;
-}
-
-@Data
-@Builder
-public class StepVO {
-    private StepType type;
-    private String content;
-    private String toolName;
-    private Map<String, Object> toolInput;
-    private String timestamp;
-}
-
-@Data
-@Builder
-public class PendingTaskVO {
-    private Long taskId;
-    private String customerId;
-    private String customerName;
-    private String toolName;
-    private String toolDescription;
-    private Map<String, Object> input;
-    private String reason;
-    private String createdAt;
-    private String expireAt;
-}
-
-@Data
-@Builder
-public class AgentSessionVO {
-    private String sessionId;
-    private String customerId;
-    private String goal;
-    private SessionStatus status;
-    private List<Step> executionHistory;
-    private Integer currentStep;
-    private LocalDateTime createdAt;
-    private LocalDateTime completedAt;
-}
+```bash
+python3 '07-项目复盘与方案/智能体重管理/医生助手Agent/实验/统一状态契约实验.py'
 ```
 
-## 十三、枚举定义
+实验验证请求同键异参、授权目标固定、审批版本与有效期、重复批准、外部结果不明查证、取消、旧 worker 和摘要旧版本拒绝。它也保留原文本解析器误判的最小反例，说明结构化协议改造的原因。
 
-```java
-public enum ResultStatus {
-    SUCCESS,           // 成功完成
-    PENDING_APPROVAL,  // 等待审批
-    ERROR,             // 执行错误
-    MAX_STEPS          // 达到最大步数
-}
-
-public enum StepType {
-    THOUGHT,      // 简短行动说明；不是内部思维链
-    ACTION,       // 行动
-    OBSERVATION   // 观察
-}
-
-public enum SessionStatus {
-    RUNNING,    // 运行中
-    PAUSED,     // 暂停（等待审批）
-    COMPLETED,  // 已完成
-    FAILED      // 失败
-}
-
-public enum TaskStatus {
-    PENDING,   // 待审批
-    APPROVED,  // 已批准
-    REJECTED   // 已拒绝
-}
-```
-
-## 十四、异常定义
-
-```java
-public class AgentException extends RuntimeException {
-    public AgentException(String message) {
-        super(message);
-    }
-    
-    public AgentException(String message, Throwable cause) {
-        super(message, cause);
-    }
-}
-```
-
-## 十五、关键实现要点
-
-### 15.1 ReAct循环的核心逻辑
-
-**关键点：**
-1. **System Prompt设计**：明确告诉Claude使用ReAct格式
-2. **响应解析**：解析行动说明、工具名和参数；Observation 由工具执行器产生
-3. **状态管理**：提供执行历史保存示例；恢复循环仍需补齐并验证
-4. **错误处理**：处理解析失败、工具执行失败等异常
-
-### 15.2 风险控制机制
-
-**关键点：**
-1. **工具分级**：LOW/MEDIUM/HIGH三级风险
-2. **执行策略**：根据风险等级决定是否需要确认
-3. **待确认任务**：高风险操作创建任务，暂停Agent
-4. **审计日志**：记录所有中高风险操作
-
-### 15.3 会话管理（设计要求，未全部实现）
-
-**关键点：**
-1. **状态持久化**：将执行历史保存到数据库
-2. **暂停/恢复**：支持人工确认后继续执行
-3. **超时处理**：会话超时自动失败
-4. **并发控制**：同一患者同时只能有一个活跃会话
-
-### 15.4 性能优化（候选措施，未证明接入主循环）
-
-**关键点：**
-1. **并发执行**：独立工具可以并发调用
-2. **缓存策略**：常见查询结果缓存
-3. **连接池**：复用HTTP连接
-4. **异步处理**：长时间操作异步执行
-
----
-
-**本文提供以下示例材料，仍需补齐依赖、业务实现和验证：**
-- ReAct Agent 主循环及未完成的恢复接口示例
-- 工具系统实现
-- 风险控制机制
-- Controller/Service层
-- 配置和VO定义
-
-**下一步：** 查看[测试部署监控篇](./医生助手Agent开发方案-测试部署监控.md)
-
----
-
-**最后更新：** 2026-10-29  
-**文档版本：** v2.1（概念与能力状态校订）
+实验未模拟 MySQL 隔离级别、HTTP 实际发送、RabbitMQ、Redis、Milvus或临床质量；实际集成必须按 [[医生助手Agent开发方案-测试部署监控]] 的故障窗口执行。方法片段、状态模型与完整业务应用分别记录验证结果，不互相替代。

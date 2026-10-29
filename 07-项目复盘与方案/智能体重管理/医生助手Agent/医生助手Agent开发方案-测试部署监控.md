@@ -1,1479 +1,167 @@
-# 医生助手Agent开发方案 - 测试部署监控篇
+# AI 对话与医生助手：测试、部署与运行
 
-> **材料状态（2026-10-29 复查）**：本文属于设计方案与示例材料，不是上线验收报告。当前知识库未找到本方案对应的可构建 Java 应用及联调记录，不能据此判断外部项目是否已实现。能力状态统一见 [[医生助手Agent开发方案-总览#能力状态与证据边界]]；新增机制属于可选演进，不能视为已经接入。
+> **状态（2026-10-29）**：本篇定义统一系统的验收与运行契约。业务 Java 应用、数据库迁移、中间件联调和部署尚未提供，不宣称达到覆盖率、QPS 或延迟目标。架构基线见 [[医生助手Agent开发方案]]；实现边界见 [[医生助手Agent开发方案-代码实现]]。
 
-> **术语约定**：Function Calling / Tool Calling 是工具调用机制，可用于固定工作流，也可用于 Agent 循环。示例中的 `Thought`、`THOUGHT`、`thinking` 是历史字段名，仅表示面向用户的简短行动说明或证据摘要，不代表模型内部思维链；`Observation` 应由执行系统根据真实工具结果写入，不能由模型编造。
+## 一、验证状态与验收缺口
 
+本轮使用 Python 3.12.9 执行 [统一状态契约实验](./实验/统一状态契约实验.py)，**23 项测试通过**，覆盖请求去重、同键异参、身份范围、草稿/来源变更、重复审批、撤权、过期、取消、未知结果查证、旧租约和摘要乱序；补充验证排队输入隔离、完成回调去重、部分回复和清空后迟到结果；包含原文本解析器的误判反例。它是单进程内存模型，不证明真实数据库并发、实际发送或模型回答质量。
 
-> **文档版本：** v2.1（概念与能力状态校订）  
-> **最后更新：** 2026-10-29  
-> **作者：** 系统架构团队
+已有 [[AI消息后处理异步方案]] 的 5 项实验及 [[Agent（智能体）]] 中的实验有各自范围，不合并成业务集成覆盖率。新系统必须补齐下面的组件、事务、端到端和质量验证。原文缺少 Mock/类型的 Java 片段不再作为“可运行测试”，改成有输入、故障窗口与断言的验收契约。
 
----
+## 二、工程测试：从边界到完整链路
 
-## 目录
+### 2.1 组件契约
 
-1. [测试策略](#一测试策略)
-2. [单元测试](#二单元测试)
-3. [集成测试](#三集成测试)
-4. [Agent测试](#四agent测试)
-5. [部署方案](#五部署方案)
-6. [监控体系](#六监控体系)
-7. [告警规则](#七告警规则)
-8. [性能优化](#八性能优化)
+| 对象 | 输入或故障 | 必须断言 |
+| --- | --- | --- |
+| 认证与目标绑定 | 其他租户、未授权医生、模型伪造 customerId | 拒绝，业务适配器调用次数为 0；拒绝日志无正文 |
+| 工具 Schema | 额外身份字段、非法类型、过大 days/limit、超长文本 | 参数错误，调用账本不标成功，无查询/副作用 |
+| 模型协议 | 参数文本含 Final Answer、未知工具、缺失调用 ID、截断输出 | 不误判完成、不生成伪 Observation；正常结果准确配对 |
+| PromptBuilder | 当前消息重复、否定纠正、相互冲突、预算不足 | 消息只出现一次，保留来源/单位/不确定性，不丢关键条件 |
+| 资料服务 | EMPTY、UNAVAILABLE、部分回查失败 | 返回不同状态与完整性；不把失败说成首次用户 |
+| 缓存 | 同 customerId 不同租户、来源更新、旧负缓存 | 不跨范围命中；符合 minVersion 与新鲜度约束 |
+| 网关与计费 | 限流、超时、缺失 usage、重复响应、取消 | 有界重试；缺失 usage 标未知而不是 0；每次实际尝试记账 |
 
----
+模型桩给出确定响应测试编排，业务接口桩记录调用次数和参数。不要直接调用底层执行器再声称验证了审批拦截。可疑临床样本不作为技术测试期望，使用“整理活动记录”等合成内容验证控制流。
 
-## 验证状态与验收缺口
+### 2.2 数据库与故障集成
 
-本文的 Java 测试、部署文件和告警配置是待执行示例，未附本方案应用的构建或部署结果；覆盖率比例和性能目标不是测试结论。当前可重复运行的仅是独立 Python 教学实验（9 项测试），入口见 [[Agent（智能体）#5.2 最小可运行实验：旧结果、重复回调与草稿版本]]，它不验证本文 Java 服务。
+所有故障只在隔离测试环境注入；用屏障控制顺序，记录初始版本、最终状态、业务行数和资源端 receipt。数据库测试不能用内存模型替代。
 
-对照代码篇后，需先处理以下契约差异再执行这些测试：
+| 编号 | 场景与故障窗口 | 预期结果 |
+| --- | --- | --- |
+| I01 | 两个相同 requestKey 并发创建；另一个请求同键异参 | 只有一个 turn/run；同参返回原 ID，异参409 |
+| I02 | 回复与任务事务提交后、MQ 发布前进程退出 | 回复完整存在；扫描找到任务，最终提炼可恢复 |
+| I03 | 流式已发前缀但模型失败或保存回复失败 | 无 completed；PARTIAL/FAILED，不能建完整回复记忆任务 |
+| I04 | 后处理停机，立即开始下一轮 | 读取未覆盖原文，当前消息一次；水位差可观测 |
+| I05 | 摘要较新任务先提交；旧 worker 后回调 | 旧 CAS 失败，水位不倒退；清空 epoch 后不复活 |
+| I06 | 记忆原文落库、索引失败；删除后旧索引任务返回 | 原文可追踪、索引待同步；已删除或旧版本不进 Prompt |
+| I07 | 草稿审核前修改目标、来源或正文版本 | 审批冲突或失效；副作用次数0 |
+| I08 | 同一审批并发批准、重复批准或批准/拒绝竞态 | 仅一个合法决定；唯一动作任务，不重复产生效果 |
+| I09 | 外部成功、本地账本提交前断线/退出 | UNKNOWN；查证同 actionId 后收口，不能新建动作重发 |
+| I10 | 取消或撤权发生在派发前/后 | 派发前拒绝；派发后保留外部事实，停止后续动作 |
+| I11 | job 租约过期、新 worker 领取、旧 worker 返回 | 旧 token 无法提交；外部副作用另由业务键保护 |
+| I12 | 审批拒绝、过期、资料不足和预算耗尽 | 对应 run 状态同步推进，无永久 RUNNING/WAITING_REVIEW |
+| I13 | SSE/WebSocket 断开并重连 | 根据 eventSeq 去重补读；最终状态与数据库一致 |
+| I14 | Redis 不可用，检索或模型服务超时 | 受限回源、显式降级/失败，数据库不被无界并发压垮 |
+| I15 | 旧/新 worker 混部、schema/payload 版本不兼容 | 不识别任务隔离为人工处理；不自动 ACK 成成功 |
+| I16 | 多条输入排队，前轮生成很慢，排队中清空 | 后轮不提前进入前轮 Prompt；旧 epoch 任务不能发布 |
 
-- 部分样本使用 `customer_id`、`RiskLevel`，代码篇使用 `customerId`、`ToolRiskLevel`；响应 `code` 也有 `200` 与架构篇 `0` 的差异。
-- `draft_prescription` 执行器目前返回 `null`；直接调用执行器再断言非空既不匹配示例，也不能证明审批拦截。应通过受控执行入口，用测试替身断言审批前无业务副作用。
-- 测试中部分辅助方法、Mock 与类型未完整提供；三条日志事件也不等于三轮决策。模型生成了 `Thought` 不能作为推理正确或可追溯的验收依据。
-- 下方个别药物样本仅是历史测试占位，不能作为临床建议或有效业务用例；正式用例应改用经业务审核的脱敏资料和动作参数。
+原设计的“同一患者只能一个活跃会话”改为：同一 groupId 一次只生成一个轮次；多个授权医生可创建独立只读 run。写动作针对真实业务资源校验版本和唯一业务键，不能靠患者级粗锁代替全部一致性约束。
 
-新增机制的验收应覆盖旧目标结果迟到、同一终态回调重复/冲突、同目标新证据导致草稿过期、重复审批、失效审批与外部动作结果不明。测试应断言业务状态和副作用次数，而非只检查生成文本。
+### 2.3 端到端最小闭环
 
-## 一、测试策略
+合成场景：患者记录活动 → 完成回复与后处理 → 医生查询获授权资料 → 生成带来源的报告/回复草稿 → 医生编辑形成新版本 → 审核当前版本 → 前端看到已审核且未发送。此闭环不要求任何真实医疗动作。
 
-### 1.1 测试金字塔
+先用确定性模型桩验证链路，再在隔离环境接真实模型验证协议和质量。动作阶段另选单个非医疗外部测试适配器，验证 I08–I11，不能用“最终文本说已发送”代替外部效果证据。
 
-```
-           /\
-          /  \  E2E测试 (5%)
-         /____\
-        /      \  集成测试 (25%)
-       /________\
-      /          \  单元测试 (70%)
-     /____________\
-```
+## 三、模型质量评测与验收门槛
 
-**测试分层：**
-- **单元测试（70%）**：测试独立组件（工具、解析器、执行器）
-- **集成测试（25%）**：测试组件协作（Agent引擎、API接口）
-- **E2E测试（5%）**：测试完整流程（从医生输入到最终答案）
+评测记录固定 datasetVersion、templateVersion、model/provider、toolVersion、检索代次与规则版本；对照相同数据和预算，不能只展示几条满意回答。起步建议每类至少 10 条合成或已获授权的脱敏样本，共六类：连续追问、纠错/否定、资料缺失、检索失败、医生证据报告、伪造指令与权限越界。该规模只用于试运行，不代表临床充分验证。
 
-### 1.2 测试覆盖率目标
+| 维度 | 计算与判定 |
+| --- | --- |
+| 授权与动作边界 | 硬门槛：评测和故障集中越权访问、未批准动作、重复副作用均为0；发现一例即阻断相关能力 |
+| 来源正确性 | 引用必须属于可见证据集合且版本有效；数字/单位与来源一致；逐条断言加人工核对 |
+| 完整性与不确定性 | 缺失/不可用必须明确，用户自述不升级为确诊或权威记录；冲突保留双方来源 |
+| 工具正确性 | 必需资料是否查询、参数是否正确、有无无关副作用；无需强制唯一工具顺序 |
+| 回答可用性 | 由业务审核者按明确量表评价任务完成、可读性和待确认事项，不以文字相似度代替 |
+| 检索质量 | 用已标注查询比较 Recall@K、误召、权限过滤和无命中；知识库与个人记忆分开统计 |
+| 成本与延迟 | 质量不回退前提下比较 TTFT、完成时间、后台延迟、实际 usage 和失败率 |
 
-| 层级 | 覆盖率目标 | 说明 |
-|------|-----------|------|
-| 核心引擎 | 90%+ | ReActAgentEngine、ToolRegistry |
-| 工具实现 | 85%+ | 所有Tool实现类 |
-| Service层 | 80%+ | 业务逻辑 |
-| Controller层 | 75%+ | API接口 |
+建议首期门槛：所有确定性契约和必需故障用例通过；引用及关键数字错误为0；业务评分和 SLO 阈值在灰度前由产品/审核者签定。尚无真实模型评测结果，因此不能宣称当前方案满足质量门槛。相同样本重复运行记录波动，不用单次成功代表稳定性。
 
----
+## 四、部署依赖与发布流程
 
-## 二、单元测试
+### 4.1 环境与功能开关
 
-### 2.1 工具测试
+开发先用本地数据库与模型/业务接口桩验证事务；集成环境使用与选定部署基线一致的 MySQL、Redis、任务调度，以及启用检索/消息时所需的 Milvus/RabbitMQ。生产版本必须固定镜像摘要、数据库迁移版本、模型适配能力和回滚策略；不使用 `latest` 作为可重复发布依据。
 
-```java
-@SpringBootTest
-public class ToolRegistryTest {
-    
-    @Autowired
-    private ToolRegistry toolRegistry;
-    
-    @Test
-    public void testGetPatientProfileTool() {
-        // 测试获取患者档案工具
-        Tool tool = toolRegistry.getTool("get_patient_profile");
-        
-        assertNotNull(tool);
-        assertEquals("get_patient_profile", tool.getName());
-        assertEquals(RiskLevel.LOW, tool.getRiskLevel());
-        
-        // 测试执行
-        Map<String, Object> input = Map.of("customer_id", "C001");
-        Object output = tool.getExecutor().execute(input);
-        
-        assertNotNull(output);
-        assertTrue(output instanceof PatientProfile);
-    }
-    
-    @Test
-    public void testDraftPrescriptionTool() {
-        // 测试开处方工具（高风险）
-        Tool tool = toolRegistry.getTool("draft_prescription");
-        
-        assertEquals(RiskLevel.HIGH, tool.getRiskLevel());
-        
-        Map<String, Object> input = Map.of(
-            "customer_id", "C001",
-            "medication", "阿司匹林",
-            "dosage", "100mg",
-            "frequency", "每日一次"
-        );
-        
-        Object output = tool.getExecutor().execute(input);
-        assertNotNull(output);
-    }
-    
-    @Test
-    public void testToolValidation() {
-        // 测试工具参数验证
-        Tool tool = toolRegistry.getTool("get_weight_history");
-        
-        // 缺少必需参数
-        assertThrows(IllegalArgumentException.class, () -> {
-            tool.getExecutor().execute(Map.of());
-        });
-        
-        // 参数类型错误
-        assertThrows(IllegalArgumentException.class, () -> {
-            tool.getExecutor().execute(Map.of(
-                "customer_id", "C001",
-                "days", "not_a_number"
-            ));
-        });
-    }
-}
+启动检查包括 schema 版本、必要索引、配置绑定、凭据缺失和功能依赖。禁用检索时允许显式不依赖 Milvus；启用检索时必须检查集合、维度、索引及可查询状态。不能将只含 MySQL/Redis 的 Compose 样本称为完整系统。
+
+最小环境清单还包括：数据库迁移入口、业务最小权限账号、内部网络与管理端点策略、密钥注入、时间基准、任务扫描责任、数据备份与恢复演练。模型提供方/地域、资料保留和审核规则未确定时，不接真实健康资料。
+
+### 4.2 容器、探针和停机
+
+JDK 17 与 Spring Boot 3.x 是候选基线，正式工程固定补丁版本并构建镜像。JVM 堆必须低于容器内存限制，给堆外、线程、代码缓存留空间；原 `-Xmx4g` 搭配 `4Gi` 限制没有这部分余量。健康检查依赖镜像中确实存在的工具，不能假设最小镜像安装了 curl。
+
+liveness 检查进程是否能存活，不将共享数据库或模型短暂故障加入并触发全副本重启；readiness 表达当前入口能否按约定接收任务。Spring Boot 3.5 文档提供独立 liveness/readiness health group；正式应用需验证启用、暴露及路由可达。参考 [Spring Boot 3.5 Actuator](https://docs.spring.io/spring-boot/3.5/reference/actuator/endpoints.html)（2026-10-29 核对），不自动升级为其他主版本配置。
+
+停机顺序：入口摘流 → 停止领取新任务 → 在有限时间内续租并收尾已领取任务 → 保存结果或留下可恢复状态 → 退出。副作用 EXECUTING 超时进入查证，摘要等纯计算任务可重领；等待线程池结束本身不是恢复保证。部署平台的终止宽限要覆盖实际收尾策略。
+
+### 4.3 灰度与回滚
+
+先开放内部合成数据，再开放获授权医生的只读与草稿模式；副作用独立开关，默认关闭。对照控制组的任务成功、质量错误、降级、队列年龄与成本后扩大范围。
+
+数据库采用可兼容的增量迁移，worker 识别 payloadVersion。回滚前停止新派发并核对在途动作；UNKNOWN 不因回滚消失，旧应用必须仍有对应查证责任。缓存可重建，已发送消息与外部业务状态不能随镜像回退撤销。
+
+## 五、指标、日志与审计
+
+### 5.1 统计口径
+
+| 指标设计名 | 定义与标签 |
+| --- | --- |
+| ai_turn_total | 按 turnId 终态计数，result=completed/degraded/failed/cancelled/expired |
+| ai_run_total | 按 runId 终态计数；暂停和重复查询不增加完成数 |
+| ai_model_attempt_total | 每次真实模型请求；provider/model/operation/result 使用受限集合 |
+| ai_tool_call_total | 按实际调用 attempt 计数，工具名来自注册白名单 |
+| ai_run_active_duration_seconds | 活动执行耗时；审批等待另计 |
+| ai_review_wait_seconds | WAITING_REVIEW 到决定/到期的耗时 |
+| ai_job_oldest_pending_age_seconds | 已到执行条件但尚未完成的最老任务年龄，按 jobType |
+| ai_action_unknown | 未查明外部效果的动作数，另记录最老年龄 |
+| ai_context_seq_lag / ai_memory_index_lag_seconds | 摘要覆盖和索引新鲜度，避免只看 MQ 队列长度 |
+| ai_model_tokens_total | 实际输入/输出/缓存用量；缺失 usage 另计未知 |
+
+上述是预期导出名称，必须在选定指标库的实际端点抓取核对。Counter 只在相应事件边界记录一次，不能每次返回 API 就遍历完整历史重计工具次数。审计账本才是精确核对依据，进程内 Counter 不能代替业务账本。
+
+失败率分母为相同窗口内成功与失败终态，等待中、取消和无流量分别展示；供应商故障计入用户端到端失败率。另监测“运行过久但未终结”的任务，避免永远 RUNNING 的任务被失败率漏掉。
+
+### 5.2 直方图与告警示例
+
+下例假设实际已导出经典直方图及 `_bucket`，单位为秒；30 秒仅为演示阈值，需用压测和 SLO 调整。先按 le 聚合副本，再估算 P95，不能将毫秒阈值套给秒指标。依据 [Prometheus 直方图文档](https://prometheus.io/docs/practices/histograms/)。
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le) (rate(ai_run_active_duration_seconds_bucket[5m]))
+) > 30
 ```
 
-### 2.2 解析器测试
+建立告警时分别覆盖：任务年龄超标、UNKNOWN 动作、来源/参数冲突、授权拒绝异常增长、摘要/索引积压、上游限流和无指标。失败率告警增加最小样本量，避免一个请求的偶发失败反复报警。灰度期间低流量可直接对关键失败事件告警，不能依赖百分比掩盖单次严重问题。
 
-```java
-public class ReActResponseParserTest {
-    
-    private ReActResponseParser parser = new ReActResponseParser();
-    
-    @Test
-    public void testParseThoughtAndAction() {
-        String response = """
-            Thought: 我需要先查看患者的基本信息
-            Action: get_patient_profile
-            Action Input: {"customer_id": "C001"}
-            """;
-        
-        ThoughtResult result = parser.parse(response);
-        
-        assertFalse(result.isFinished());
-        assertEquals("我需要先查看患者的基本信息", result.getThinking());
-        assertEquals("get_patient_profile", result.getAction().getToolName());
-        assertEquals("C001", result.getAction().getInput().get("customer_id"));
-    }
-    
-    @Test
-    public void testParseFinalAnswer() {
-        String response = """
-            Thought: 我已经收集了足够的信息，可以给出建议了
-            Final Answer: 患者张三的体重控制良好，建议继续当前方案。
-            """;
-        
-        ThoughtResult result = parser.parse(response);
-        
-        assertTrue(result.isFinished());
-        assertNotNull(result.getFinalAnswer());
-        assertTrue(result.getFinalAnswer().contains("体重控制良好"));
-    }
-    
-    @Test
-    public void testParseInvalidResponse() {
-        String response = "这是一个无效的响应";
-        
-        assertThrows(AgentException.class, () -> {
-            parser.parse(response);
-        });
-    }
-}
-```
+告警带责任队列、处理入口、run/job 的受控查询链接和错误码；通知失败独立重试，不能回滚业务结果。钉钉、邮件、电话是部署时选择的渠道，不因文档列出就认定已接入。
 
-### 2.3 执行器测试
+### 5.3 日志与审计各记什么
 
-```java
-@SpringBootTest
-public class ActionExecutorTest {
-    
-    @Autowired
-    private ActionExecutor executor;
-    
-    @Autowired
-    private PendingTaskService taskService;
-    
-    @Test
-    public void testExecuteLowRiskAction() {
-        // 低风险操作：直接执行
-        ActionDecision action = ActionDecision.builder()
-            .toolName("get_patient_profile")
-            .input(Map.of("customer_id", "C001"))
-            .reason("查看患者基本信息")
-            .build();
-        
-        ActionResult result = executor.execute(action, "C001", "session-001");
-        
-        assertTrue(result.isSuccess());
-        assertFalse(result.needsApproval());
-        assertNotNull(result.getOutput());
-    }
-    
-    @Test
-    public void testExecuteHighRiskAction() {
-        // 高风险操作：创建待确认任务
-        ActionDecision action = ActionDecision.builder()
-            .toolName("draft_prescription")
-            .input(Map.of(
-                "customer_id", "C001",
-                "medication", "阿司匹林",
-                "dosage", "100mg"
-            ))
-            .reason("患者血压偏高，建议用药")
-            .build();
-        
-        ActionResult result = executor.execute(action, "C001", "session-001");
-        
-        assertTrue(result.needsApproval());
-        assertNotNull(result.getTask());
-        assertEquals(TaskStatus.PENDING, result.getTask().getStatus());
-    }
-}
-```
+普通日志记录 traceId、匿名关联 ID、阶段、工具名、状态、耗时、错误码；不记录完整 goal、模型输出、患者资料或工具参数。DEBUG 不是绕过脱敏的理由。
 
----
+受控审计保存主体、用途、资源、来源版本、草稿/参数哈希、审核决定、动作凭据和时间。确需保存正文时使用受限内容存储与保留策略，审计事件引用 contentRef。身份 ID 不作为 Prometheus 标签；跨请求定位由受控 Trace 和审计完成。Thought 仅是简短行动说明，不采集内部思维链。
 
-## 三、集成测试
+## 六、性能与成本优化的边界
 
-### 3.1 Agent引擎测试
+| 原优化主题 | 统一方案与验证方式 |
+| --- | --- |
+| 画像/体重缓存 | 复用 [[用户画像存储设计方案]]，键含租户/患者/用途及查询范围，带版本；禁止普通线上请求用 KEYS 批量删除 |
+| 完整回答缓存 | 首期关闭医生最终草稿缓存；若未来启用，绑定权限范围、全部来源版本、模型与模板，命中不跳过鉴权 |
+| Prompt 缓存 | 只优化供应商计算，不能替代业务结果缓存；按实际接口支持、usage 与账单验证收益 |
+| 工具并行 | 仅独立只读工具，统一 Gateway、callId、截止时间与部分失败；串行基线后比较 |
+| 数据库连接池 | 依据实测等待、事务时长和数据库预算配置，网络模型调用不持有连接 |
+| 索引 | 对领取/待审批/历史查询检查 EXPLAIN；所有权限查询带 tenant_id，不复制不一致的 pending_task 表名 |
+| 历史压缩 | 仅压缩可派生文本，保留当前目标、未完成调用、授权、来源和预算，不能按每3条日志截字符 |
+| 模型路由 | 依据任务类别和固定评测集，不凭“查看”等词决定风险和模型能力；保留可追踪路由版本 |
+| Token 和费用 | 前置预算、实际 usage、后台调用、重试及缓存分别记账；优化收益不能简单相加 |
 
-```java
-@SpringBootTest
-public class ReActAgentEngineTest {
-    
-    @Autowired
-    private ReActAgentEngine engine;
-    
-    @MockBean
-    private ClaudeApiClient claudeClient;
-    
-    @Test
-    public void testSimpleQuery() {
-        // Mock Claude响应
-        mockClaudeResponse(
-            "Thought: 查看患者档案\nAction: get_patient_profile\nAction Input: {\"customer_id\": \"C001\"}",
-            "Thought: 信息已收集\nFinal Answer: 患者基本情况正常"
-        );
-        
-        AgentResult result = engine.execute(
-            "帮我看看患者C001的情况",
-            "C001",
-            "D001"
-        );
-        
-        assertEquals(ResultStatus.SUCCESS, result.getStatus());
-        assertNotNull(result.getFinalAnswer());
-        assertTrue(result.getTotalSteps() <= 15);
-    }
-    
-    @Test
-    public void testHighRiskActionPause() {
-        // Mock Claude响应（包含高风险操作）
-        mockClaudeResponse(
-            "Thought: 需要开处方\nAction: draft_prescription\nAction Input: {\"customer_id\": \"C001\", \"medication\": \"阿司匹林\"}"
-        );
-        
-        AgentResult result = engine.execute(
-            "给患者C001开个降压药",
-            "C001",
-            "D001"
-        );
-        
-        assertEquals(ResultStatus.PENDING_APPROVAL, result.getStatus());
-        assertNotNull(result.getPendingTask());
-    }
-    
-    @Test
-    public void testMaxStepsLimit() {
-        // Mock Claude响应（无限循环）
-        mockClaudeInfiniteLoop();
-        
-        AgentResult result = engine.execute(
-            "分析患者",
-            "C001",
-            "D001"
-        );
-        
-        assertEquals(ResultStatus.MAX_STEPS, result.getStatus());
-        assertEquals(15, result.getTotalSteps());
-    }
-    
-    private void mockClaudeResponse(String... responses) {
-        OngoingStubbing<ClaudeResponse> stub = when(claudeClient.chat(any(), any()));
-        for (String resp : responses) {
-            stub = stub.thenReturn(createMockResponse(resp));
-        }
-    }
-    
-    private ClaudeResponse createMockResponse(String text) {
-        ClaudeResponse response = new ClaudeResponse();
-        ContentBlock block = new ContentBlock();
-        block.setType("text");
-        block.setText(text);
-        response.setContent(List.of(block));
-        return response;
-    }
-}
-```
+性能试验包括冷/暖缓存、长历史、立即追问、并发医生、上游限流与消费者恢复。记录样本量、负载、版本、质量和失败率。完整方法见 [[AI消息数据流性能分析]]，不再沿用无压测依据的固定 QPS/成本承诺。
 
-### 3.2 API接口测试
+## 七、故障处理与人工恢复
 
-```java
-@SpringBootTest
-@AutoConfigureMockMvc
-public class AgentControllerTest {
-    
-    @Autowired
-    private MockMvc mockMvc;
-    
-    @MockBean
-    private ReActAgentEngine engine;
-    
-    @Test
-    public void testExecuteAgent() throws Exception {
-        // Mock Agent执行结果
-        AgentResult mockResult = AgentResult.success(
-            "患者情况良好",
-            List.of(),
-            5
-        );
-        when(engine.execute(any(), any(), any())).thenReturn(mockResult);
-        
-        // 发送请求
-        mockMvc.perform(post("/api/agent/execute")
-                .contentType(MediaType.APPLICATION_JSON)
-                .content("""
-                    {
-                        "customerId": "C001",
-                        "doctorId": "D001",
-                        "goal": "分析患者情况"
-                    }
-                    """))
-            .andExpect(status().isOk())
-            .andExpect(jsonPath("$.code").value(200))
-            .andExpect(jsonPath("$.data.status").value("SUCCESS"))
-            .andExpect(jsonPath("$.data.finalAnswer").value("患者情况良好"));
-    }
-    
-    @Test
-    public void testApprovePendingTask() throws Exception {
-        // Mock待确认任务
-        PendingTask task = new PendingTask();
-        task.setId(1L);
-        task.setAgentSessionId("session-001");
-        task.setStatus(TaskStatus.PENDING);
-        
-        when(pendingTaskService.getById(1L)).thenReturn(task);
-        
-        AgentResult mockResult = AgentResult.success("已执行", List.of(), 7);
-        when(engine.resume(any(), any())).thenReturn(mockResult);
-        
-        // 批准任务
-        mockMvc.perform(post("/api/agent/pending-tasks/1/approve")
-                .contentType(MediaType.APPLICATION_JSON)
-                .content("""
-                    {
-                        "approved": true,
-                        "comment": "同意执行"
-                    }
-                    """))
-            .andExpect(status().isOk())
-            .andExpect(jsonPath("$.code").value(200));
-    }
-}
-```
+| 现象 | 首先核对 | 恢复动作 |
+| --- | --- | --- |
+| 回复有内容但轮次未完成 | turn 终态、数据库事务、completed 事件 | 返回已有状态；不能把前缀补标完整 |
+| 审批后没执行 | 审批绑定、action/job 状态、权限、资料版本 | 已知未执行且仍有效才恢复；旧资料重新审批 |
+| 动作可能已发送 | actionId、外部幂等键、receipt | 先查证，确认未知则人工接手，不重新创建动作 |
+| 摘要或索引落后 | 最老任务、租约、版本冲突、上游限流 | 修复依赖后沿原业务键重试，旧版本任务跳过 |
+| 数据被纠正或删除 | 来源版本、依赖摘要/记忆/报告、缓存/向量清理 | 先权威失效，再重建派生数据；清理任务有完成凭据 |
+| worker 重启后任务不动 | 扫描条件、nextAttemptAt、过期 lease、payloadVersion | 回收允许重算任务，未知动作转查证，超限转 MANUAL |
 
-
----
-
-## 四、Agent测试
-
-### 4.1 ReAct循环测试
-
-```java
-@SpringBootTest
-public class ReActLoopTest {
-    
-    @Autowired
-    private ReActAgentEngine engine;
-    
-    @Test
-    public void testMultiStepReasoning() {
-        // 测试多步推理：查档案 → 查体重 → 查聊天 → 生成建议
-        AgentResult result = engine.execute(
-            "全面分析患者张三的情况",
-            "C001",
-            "D001"
-        );
-        
-        assertEquals(ResultStatus.SUCCESS, result.getStatus());
-        
-        // 验证执行步骤
-        List<Step> history = result.getExecutionHistory();
-        assertTrue(history.size() >= 6); // 至少3轮Thought-Action-Observation
-        
-        // 验证步骤类型交替出现
-        assertEquals(StepType.THOUGHT, history.get(0).getType());
-        assertEquals(StepType.ACTION, history.get(1).getType());
-        assertEquals(StepType.OBSERVATION, history.get(2).getType());
-    }
-    
-    @Test
-    public void testErrorRecovery() {
-        // 测试工具执行失败后的恢复能力
-        // Agent应该能够识别错误并尝试其他方法
-        
-        AgentResult result = engine.execute(
-            "查询不存在的患者XYZ",
-            "XYZ",
-            "D001"
-        );
-        
-        // Agent应该能够处理错误并给出合理回复
-        assertNotNull(result.getFinalAnswer());
-        assertTrue(result.getFinalAnswer().contains("未找到") || 
-                   result.getFinalAnswer().contains("不存在"));
-    }
-    
-    @Test
-    public void testContextRetention() {
-        // 测试上下文保持：Agent应该记住之前的观察结果
-        
-        AgentResult result = engine.execute(
-            "患者体重增加了吗？如果增加了，分析原因",
-            "C001",
-            "D001"
-        );
-        
-        // 验证Agent先查询体重，再基于结果决定是否分析原因
-        List<Step> history = result.getExecutionHistory();
-        
-        boolean hasWeightQuery = history.stream()
-            .anyMatch(step -> step.getType() == StepType.ACTION && 
-                     "get_weight_history".equals(step.getAction().getToolName()));
-        
-        assertTrue(hasWeightQuery);
-    }
-}
-```
-
-### 4.2 工具选择测试
-
-```java
-@SpringBootTest
-public class ToolSelectionTest {
-    
-    @Autowired
-    private ReActAgentEngine engine;
-    
-    @Test
-    public void testRelevantToolSelection() {
-        // 测试Agent是否选择相关工具
-        
-        AgentResult result = engine.execute(
-            "患者最近体重变化如何？",
-            "C001",
-            "D001"
-        );
-        
-        // 应该调用get_weight_history，而不是其他无关工具
-        List<Step> history = result.getExecutionHistory();
-        
-        boolean usedWeightTool = history.stream()
-            .filter(step -> step.getType() == StepType.ACTION)
-            .anyMatch(step -> "get_weight_history".equals(step.getAction().getToolName()));
-        
-        assertTrue(usedWeightTool);
-        
-        // 不应该调用处方相关工具
-        boolean usedPrescriptionTool = history.stream()
-            .filter(step -> step.getType() == StepType.ACTION)
-            .anyMatch(step -> "draft_prescription".equals(step.getAction().getToolName()));
-        
-        assertFalse(usedPrescriptionTool);
-    }
-    
-    @Test
-    public void testMinimalToolUsage() {
-        // 测试Agent是否避免不必要的工具调用
-        
-        AgentResult result = engine.execute(
-            "患者的BMI是多少？",
-            "C001",
-            "D001"
-        );
-        
-        // 只需要查询患者档案即可，不需要其他工具
-        List<Step> actions = result.getExecutionHistory().stream()
-            .filter(step -> step.getType() == StepType.ACTION)
-            .toList();
-        
-        assertTrue(actions.size() <= 2); // 最多2个工具调用
-    }
-}
-```
-
-### 4.3 风险控制测试
-
-```java
-@SpringBootTest
-public class RiskControlTest {
-    
-    @Autowired
-    private ReActAgentEngine engine;
-    
-    @Test
-    public void testHighRiskActionBlocking() {
-        // 测试高风险操作被正确拦截
-        
-        AgentResult result = engine.execute(
-            "给患者开一个降压药处方",
-            "C001",
-            "D001"
-        );
-        
-        assertEquals(ResultStatus.PENDING_APPROVAL, result.getStatus());
-        assertNotNull(result.getPendingTask());
-        assertEquals("draft_prescription", result.getPendingTask().getToolName());
-    }
-    
-    @Test
-    public void testLowRiskActionAutoExecution() {
-        // 测试低风险操作自动执行
-        
-        AgentResult result = engine.execute(
-            "查看患者的基本信息",
-            "C001",
-            "D001"
-        );
-        
-        assertEquals(ResultStatus.SUCCESS, result.getStatus());
-        assertNull(result.getPendingTask());
-    }
-}
-```
-
----
-
-## 五、部署方案
-
-### 5.1 环境配置
-
-#### 开发环境
-```yaml
-环境：本地开发
-配置：
-  - MySQL: 本地实例
-  - Redis: 本地实例
-  - Claude API: 开发密钥（限流较低）
-特点：
-  - 快速迭代
-  - 详细日志
-  - Mock外部依赖
-```
-
-#### 测试环境
-```yaml
-环境：独立测试集群
-配置：
-  - MySQL: 测试数据库（脱敏数据）
-  - Redis: 测试实例
-  - Claude API: 测试密钥
-特点：
-  - 完整集成测试
-  - 性能测试
-  - 压力测试
-```
-
-#### 生产环境
-```yaml
-环境：生产集群
-配置：
-  - MySQL: 主从架构
-  - Redis: 哨兵模式
-  - Claude API: 生产密钥（高限流）
-特点：
-  - 高可用
-  - 监控告警
-  - 灰度发布
-```
-
-### 5.2 Docker部署
-
-#### Dockerfile
-
-```dockerfile
-FROM openjdk:17-jdk-slim
-
-WORKDIR /app
-
-# 复制jar包
-COPY target/doctor-assistant-agent.jar app.jar
-
-# 暴露端口
-EXPOSE 8080
-
-# 健康检查
-HEALTHCHECK --interval=30s --timeout=3s --start-period=60s \
-  CMD curl -f http://localhost:8080/actuator/health || exit 1
-
-# 启动应用
-ENTRYPOINT ["java", \
-  "-Xms2g", \
-  "-Xmx4g", \
-  "-XX:+UseG1GC", \
-  "-XX:MaxGCPauseMillis=200", \
-  "-jar", \
-  "app.jar"]
-```
-
-#### docker-compose.yml
-
-```yaml
-version: '3.8'
-
-services:
-  agent-service:
-    build: .
-    ports:
-      - "8080:8080"
-    environment:
-      - SPRING_PROFILES_ACTIVE=prod
-      - MYSQL_HOST=mysql
-      - REDIS_HOST=redis
-      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
-    depends_on:
-      - mysql
-      - redis
-    restart: unless-stopped
-    
-  mysql:
-    image: mysql:8.0
-    environment:
-      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
-      - MYSQL_DATABASE=health_management
-    volumes:
-      - mysql-data:/var/lib/mysql
-    restart: unless-stopped
-    
-  redis:
-    image: redis:7-alpine
-    volumes:
-      - redis-data:/data
-    restart: unless-stopped
-
-volumes:
-  mysql-data:
-  redis-data:
-```
-
-### 5.3 Kubernetes部署
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: doctor-assistant-agent
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: doctor-assistant-agent
-  template:
-    metadata:
-      labels:
-        app: doctor-assistant-agent
-    spec:
-      containers:
-      - name: agent
-        image: doctor-assistant-agent:latest
-        ports:
-        - containerPort: 8080
-        env:
-        - name: SPRING_PROFILES_ACTIVE
-          value: "prod"
-        - name: CLAUDE_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: claude-secret
-              key: api-key
-        resources:
-          requests:
-            memory: "2Gi"
-            cpu: "1000m"
-          limits:
-            memory: "4Gi"
-            cpu: "2000m"
-        livenessProbe:
-          httpGet:
-            path: /actuator/health
-            port: 8080
-          initialDelaySeconds: 60
-          periodSeconds: 30
-        readinessProbe:
-          httpGet:
-            path: /actuator/health
-            port: 8080
-          initialDelaySeconds: 30
-          periodSeconds: 10
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: doctor-assistant-agent
-spec:
-  selector:
-    app: doctor-assistant-agent
-  ports:
-  - port: 80
-    targetPort: 8080
-  type: LoadBalancer
-```
-
-
----
-
-## 六、监控体系
-
-### 6.1 核心监控指标
-
-#### 业务指标
-
-```java
-@Component
-public class AgentMetrics {
-    
-    private final MeterRegistry registry;
-    
-    // Agent执行次数
-    private final Counter executionCounter;
-    
-    // Agent执行时长
-    private final Timer executionTimer;
-    
-    // Agent成功率
-    private final Counter successCounter;
-    private final Counter failureCounter;
-    
-    // 工具调用次数
-    private final Map<String, Counter> toolCounters;
-    
-    // 待确认任务数
-    private final Gauge pendingTaskGauge;
-    
-    public AgentMetrics(MeterRegistry registry, PendingTaskService taskService) {
-        this.registry = registry;
-        
-        this.executionCounter = Counter.builder("agent.execution.total")
-            .description("Agent总执行次数")
-            .register(registry);
-        
-        this.executionTimer = Timer.builder("agent.execution.duration")
-            .description("Agent执行时长")
-            .register(registry);
-        
-        this.successCounter = Counter.builder("agent.execution.success")
-            .description("Agent成功次数")
-            .register(registry);
-        
-        this.failureCounter = Counter.builder("agent.execution.failure")
-            .description("Agent失败次数")
-            .register(registry);
-        
-        this.toolCounters = new ConcurrentHashMap<>();
-        
-        this.pendingTaskGauge = Gauge.builder("agent.pending.tasks", 
-                taskService, s -> s.countPending())
-            .description("待确认任务数")
-            .register(registry);
-    }
-    
-    public void recordExecution(AgentResult result, long durationMs) {
-        executionCounter.increment();
-        executionTimer.record(durationMs, TimeUnit.MILLISECONDS);
-        
-        if (result.getStatus() == ResultStatus.SUCCESS) {
-            successCounter.increment();
-        } else if (result.getStatus() == ResultStatus.ERROR) {
-            failureCounter.increment();
-        }
-        
-        // 记录工具使用情况
-        result.getExecutionHistory().stream()
-            .filter(step -> step.getType() == StepType.ACTION)
-            .forEach(step -> {
-                String toolName = step.getAction().getToolName();
-                toolCounters.computeIfAbsent(toolName, 
-                    name -> Counter.builder("agent.tool.usage")
-                        .tag("tool", name)
-                        .register(registry))
-                    .increment();
-            });
-    }
-}
-```
-
-#### 系统指标
-
-| 指标类型 | 指标名称 | 说明 |
-|---------|---------|------|
-| **Agent执行** | agent.execution.total | 总执行次数 |
-| | agent.execution.duration | 执行时长（P50/P95/P99） |
-| | agent.execution.success | 成功次数 |
-| | agent.execution.failure | 失败次数 |
-| | agent.execution.steps.avg | 平均步数 |
-| **工具调用** | agent.tool.usage | 各工具调用次数 |
-| | agent.tool.duration | 工具执行时长 |
-| | agent.tool.error | 工具执行错误 |
-| **任务管理** | agent.pending.tasks | 待确认任务数 |
-| | agent.task.approval.rate | 任务批准率 |
-| | agent.task.expire.count | 任务过期数 |
-| **Claude API** | claude.api.calls | API调用次数 |
-| | claude.api.tokens | Token消耗量 |
-| | claude.api.latency | API延迟 |
-| | claude.api.errors | API错误次数 |
-
-### 6.2 日志规范
-
-下列为日志接口示意。上线前必须对患者标识、原始输入输出和行动说明做最小化、脱敏与访问控制；文本日志不等于完整审计账本。`Thought` 只表示简短行动说明，不采集或要求内部思维链。
-
-#### 日志级别
-
-```java
-@Slf4j
-@Service
-public class ReActAgentEngine {
-    
-    public AgentResult execute(String goal, String customerId, String doctorId) {
-        // INFO: 关键业务节点
-        log.info("Agent开始执行: goal={}, customerId={}, doctorId={}", 
-            goal, customerId, doctorId);
-        
-        try {
-            // DEBUG: 详细执行过程
-            log.debug("Agent第{}步: Thought={}", step, thought);
-            
-            // WARN: 异常但可恢复的情况
-            if (step >= MAX_STEPS - 2) {
-                log.warn("Agent接近最大步数限制: step={}/{}", step, MAX_STEPS);
-            }
-            
-            // ERROR: 错误情况
-        } catch (Exception e) {
-            log.error("Agent执行异常: goal={}, error={}", goal, e.getMessage(), e);
-        }
-        
-        // INFO: 执行结果
-        log.info("Agent执行完成: status={}, steps={}, duration={}ms", 
-            result.getStatus(), result.getTotalSteps(), duration);
-        
-        return result;
-    }
-}
-```
-
-#### 结构化日志
-
-```java
-@Component
-public class AgentLogger {
-    
-    public void logAgentExecution(AgentExecutionLog log) {
-        Map<String, Object> logData = Map.of(
-            "event", "agent_execution",
-            "session_id", log.getSessionId(),
-            "customer_id", log.getCustomerId(),
-            "doctor_id", log.getDoctorId(),
-            "goal", log.getGoal(),
-            "status", log.getStatus(),
-            "steps", log.getTotalSteps(),
-            "duration_ms", log.getDurationMs(),
-            "timestamp", log.getCreatedAt()
-        );
-        
-        log.info("Agent执行记录: {}", JSON.toJSONString(logData));
-    }
-    
-    public void logToolExecution(String toolName, Map<String, Object> input, 
-                                 Object output, long durationMs) {
-        Map<String, Object> logData = Map.of(
-            "event", "tool_execution",
-            "tool_name", toolName,
-            "input", input,
-            "output_size", JSON.toJSONString(output).length(),
-            "duration_ms", durationMs,
-            "timestamp", System.currentTimeMillis()
-        );
-        
-        log.info("工具执行记录: {}", JSON.toJSONString(logData));
-    }
-}
-```
-
-### 6.3 链路追踪
-
-```java
-@Configuration
-public class TracingConfig {
-    
-    @Bean
-    public Tracer tracer() {
-        return GlobalTracer.get();
-    }
-}
-
-@Service
-public class ReActAgentEngine {
-    
-    @Autowired
-    private Tracer tracer;
-    
-    public AgentResult execute(String goal, String customerId, String doctorId) {
-        Span span = tracer.buildSpan("agent.execute")
-            .withTag("customer_id", customerId)
-            .withTag("doctor_id", doctorId)
-            .start();
-        
-        try (Scope scope = tracer.activateSpan(span)) {
-            // Agent执行逻辑
-            
-            // 记录每个工具调用
-            Span toolSpan = tracer.buildSpan("tool.execute")
-                .asChildOf(span)
-                .withTag("tool_name", toolName)
-                .start();
-            
-            try {
-                // 工具执行
-            } finally {
-                toolSpan.finish();
-            }
-            
-            span.setTag("status", result.getStatus().name());
-            span.setTag("steps", result.getTotalSteps());
-            
-            return result;
-        } finally {
-            span.finish();
-        }
-    }
-}
-```
-
----
-
-## 七、告警规则
-
-### 7.1 告警配置
-
-```yaml
-# Prometheus告警规则
-groups:
-  - name: agent_alerts
-    interval: 30s
-    rules:
-      # Agent执行失败率过高
-      - alert: AgentHighFailureRate
-        expr: |
-          rate(agent_execution_failure_total[5m]) / 
-          rate(agent_execution_total[5m]) > 0.1
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Agent执行失败率过高"
-          description: "最近5分钟失败率: {{ $value | humanizePercentage }}"
-      
-      # Agent执行时长过长
-      - alert: AgentSlowExecution
-        expr: |
-          histogram_quantile(0.95, 
-            rate(agent_execution_duration_bucket[5m])) > 30000
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Agent执行时长过长"
-          description: "P95延迟: {{ $value }}ms"
-      
-      # 待确认任务堆积
-      - alert: PendingTaskBacklog
-        expr: agent_pending_tasks > 50
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "待确认任务堆积"
-          description: "当前待确认任务数: {{ $value }}"
-      
-      # Claude API错误率过高
-      - alert: ClaudeAPIHighErrorRate
-        expr: |
-          rate(claude_api_errors_total[5m]) / 
-          rate(claude_api_calls_total[5m]) > 0.05
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Claude API错误率过高"
-          description: "最近5分钟错误率: {{ $value | humanizePercentage }}"
-      
-      # Claude API延迟过高
-      - alert: ClaudeAPIHighLatency
-        expr: |
-          histogram_quantile(0.95, 
-            rate(claude_api_latency_bucket[5m])) > 10000
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Claude API延迟过高"
-          description: "P95延迟: {{ $value }}ms"
-```
-
-### 7.2 告警通知
-
-```java
-@Service
-public class AlertService {
-    
-    @Autowired
-    private DingTalkClient dingTalkClient;
-    
-    @Autowired
-    private EmailService emailService;
-    
-    /**
-     * 发送告警通知
-     */
-    public void sendAlert(Alert alert) {
-        String message = formatAlertMessage(alert);
-        
-        // 根据严重程度选择通知方式
-        switch (alert.getSeverity()) {
-            case CRITICAL:
-                // 严重告警：钉钉 + 邮件 + 电话
-                dingTalkClient.sendAlert(message);
-                emailService.sendAlert(message);
-                // phoneService.call(oncallPhone);
-                break;
-                
-            case WARNING:
-                // 警告：钉钉 + 邮件
-                dingTalkClient.sendAlert(message);
-                emailService.sendAlert(message);
-                break;
-                
-            case INFO:
-                // 信息：仅钉钉
-                dingTalkClient.sendInfo(message);
-                break;
-        }
-    }
-    
-    private String formatAlertMessage(Alert alert) {
-        return String.format("""
-            【%s告警】%s
-            
-            描述: %s
-            时间: %s
-            指标值: %s
-            
-            请及时处理！
-            """,
-            alert.getSeverity(),
-            alert.getSummary(),
-            alert.getDescription(),
-            alert.getTimestamp(),
-            alert.getValue()
-        );
-    }
-}
-```
-
-
----
-
-## 八、性能优化
-
-### 8.1 缓存策略
-
-#### 患者数据缓存
-
-```java
-@Service
-public class PatientDataService {
-    
-    @Autowired
-    private RedisTemplate<String, Object> redisTemplate;
-    
-    private static final String CACHE_PREFIX = "patient:";
-    private static final Duration CACHE_TTL = Duration.ofMinutes(10);
-    
-    /**
-     * 获取患者档案（带缓存）
-     */
-    @Cacheable(value = "patient_profile", key = "#customerId")
-    public PatientProfile getProfile(String customerId) {
-        // 从数据库查询
-        return patientMapper.selectById(customerId);
-    }
-    
-    /**
-     * 获取体重历史（带缓存）
-     */
-    public List<WeightRecord> getWeightHistory(String customerId, int days) {
-        String cacheKey = CACHE_PREFIX + "weight:" + customerId + ":" + days;
-        
-        // 尝试从缓存获取
-        List<WeightRecord> cached = (List<WeightRecord>) 
-            redisTemplate.opsForValue().get(cacheKey);
-        
-        if (cached != null) {
-            return cached;
-        }
-        
-        // 从数据库查询
-        List<WeightRecord> records = weightMapper.selectRecent(customerId, days);
-        
-        // 写入缓存
-        redisTemplate.opsForValue().set(cacheKey, records, CACHE_TTL);
-        
-        return records;
-    }
-    
-    /**
-     * 清除患者缓存
-     */
-    @CacheEvict(value = "patient_profile", key = "#customerId")
-    public void evictCache(String customerId) {
-        String pattern = CACHE_PREFIX + "*:" + customerId + ":*";
-        redisTemplate.delete(redisTemplate.keys(pattern));
-    }
-}
-```
-
-#### Claude响应缓存
-
-候选示例只按问题和患者构造键，未体现租户、权限及目标/证据版本，不能直接复用作当前草稿或动作执行依据；缓存命中不等于资料仍有效。
-
-```java
-@Service
-public class ClaudeResponseCache {
-    
-    @Autowired
-    private RedisTemplate<String, String> redisTemplate;
-    
-    private static final Duration CACHE_TTL = Duration.ofHours(1);
-    
-    /**
-     * 缓存Claude响应（用于相同问题）
-     */
-    public String getCachedResponse(String goal, String customerId) {
-        String cacheKey = generateCacheKey(goal, customerId);
-        return redisTemplate.opsForValue().get(cacheKey);
-    }
-    
-    public void cacheResponse(String goal, String customerId, String response) {
-        String cacheKey = generateCacheKey(goal, customerId);
-        redisTemplate.opsForValue().set(cacheKey, response, CACHE_TTL);
-    }
-    
-    private String generateCacheKey(String goal, String customerId) {
-        String normalized = normalizeGoal(goal);
-        String hash = DigestUtils.md5Hex(normalized + ":" + customerId);
-        return "claude:response:" + hash;
-    }
-    
-    private String normalizeGoal(String goal) {
-        // 标准化问题（去除标点、统一大小写等）
-        return goal.toLowerCase()
-            .replaceAll("[\\p{Punct}\\s]+", " ")
-            .trim();
-    }
-}
-```
-
-### 8.2 并发优化
-
-`ParallelToolExecutor` 是独立候选示例，尚未展示接入主循环。它等待 `allOf().join()` 后才返回，属于应用侧并行，不代表模型等待期间仍在推进任务，也不代表支持中途改目标。直接调用工具还绕过了 `ActionExecutor` 的风险分流；实际接入应统一鉴权、审批与幂等，并按调用 ID 收集结果，不能仅用工具名区分同工具的多次请求。
-
-
-#### 工具并发执行
-
-```java
-@Service
-public class ParallelToolExecutor {
-    
-    @Autowired
-    @Qualifier("agentExecutor")
-    private ThreadPoolTaskExecutor executor;
-    
-    /**
-     * 并发执行多个独立工具
-     */
-    public Map<String, Object> executeParallel(List<ActionDecision> actions) {
-        List<CompletableFuture<Pair<String, Object>>> futures = actions.stream()
-            .map(action -> CompletableFuture.supplyAsync(
-                () -> {
-                    Tool tool = toolRegistry.getTool(action.getToolName());
-                    Object result = tool.getExecutor().execute(action.getInput());
-                    return Pair.of(action.getToolName(), result);
-                },
-                executor
-            ))
-            .toList();
-        
-        // 等待所有任务完成
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        
-        // 收集结果
-        return futures.stream()
-            .map(CompletableFuture::join)
-            .collect(Collectors.toMap(Pair::getKey, Pair::getValue));
-    }
-}
-```
-
-#### 数据库连接池优化
-
-```yaml
-spring:
-  datasource:
-    hikari:
-      maximum-pool-size: 20
-      minimum-idle: 5
-      connection-timeout: 30000
-      idle-timeout: 600000
-      max-lifetime: 1800000
-      connection-test-query: SELECT 1
-```
-
-### 8.3 Prompt优化
-
-下方仅保留名称与描述的片段不能作为完整调用契约；若按需加载工具，执行前仍需提供参数 Schema 和副作用说明。精简 Prompt 不应删除权限、当前目标和未完成任务约束。
-
-
-#### 精简System Prompt
-
-```java
-@Component
-public class ReActPromptBuilder {
-    
-    /**
-     * 构建精简的System Prompt
-     */
-    public String buildSystemPrompt(List<Tool> tools) {
-        StringBuilder sb = new StringBuilder();
-        
-        sb.append("你是医生助手Agent，使用ReAct模式工作。\n\n");
-        
-        // 只列出工具名称和简短描述
-        sb.append("可用工具:\n");
-        for (Tool tool : tools) {
-            sb.append(String.format("- %s: %s\n", 
-                tool.getName(), 
-                tool.getDescription()
-            ));
-        }
-        
-        sb.append("\n格式:\n");
-        sb.append("Thought: [简短行动说明，不输出内部思维链]\n");
-        sb.append("Action: [工具名]\n");
-        sb.append("Action Input: {JSON}\n");
-        sb.append("工具执行后由系统提供 Observation，不得自行生成。\n");
-        sb.append("Final Answer: [答案]\n");
-        
-        return sb.toString();
-    }
-}
-```
-
-#### 使用Prompt缓存
-
-```java
-@Service
-public class ClaudeApiClient {
-    
-    /**
-     * 使用Anthropic的Prompt Caching功能
-     */
-    public ClaudeResponse chatWithCache(String systemPrompt, List<Message> messages) {
-        Map<String, Object> requestBody = new HashMap<>();
-        requestBody.put("model", "claude-opus-4-7");
-        requestBody.put("max_tokens", 4096);
-        
-        // 标记System Prompt为可缓存
-        requestBody.put("system", List.of(
-            Map.of(
-                "type", "text",
-                "text", systemPrompt,
-                "cache_control", Map.of("type", "ephemeral")
-            )
-        ));
-        
-        requestBody.put("messages", messages);
-        
-        // 发送请求...
-    }
-}
-```
-
-### 8.4 数据库优化
-
-#### 索引优化
-
-```sql
--- agent_session表索引
-CREATE INDEX idx_customer_status ON agent_session(customer_id, status);
-CREATE INDEX idx_doctor_created ON agent_session(doctor_id, created_at);
-CREATE INDEX idx_status_updated ON agent_session(status, updated_at);
-
--- pending_task表索引
-CREATE INDEX idx_doctor_status ON pending_task(doctor_id, status);
-CREATE INDEX idx_session_status ON pending_task(agent_session_id, status);
-CREATE INDEX idx_expire ON pending_task(expire_at, status);
-
--- agent_execution_log表索引
-CREATE INDEX idx_session ON agent_execution_log(session_id);
-CREATE INDEX idx_customer_created ON agent_execution_log(customer_id, created_at);
-```
-
-#### 分页查询优化
-
-```java
-@Service
-public class AgentSessionService {
-    
-    /**
-     * 分页查询会话历史（使用游标）
-     */
-    public List<AgentSession> listSessions(String doctorId, String cursor, int limit) {
-        return sessionMapper.selectList(
-            new LambdaQueryWrapper<AgentSession>()
-                .eq(AgentSession::getDoctorId, doctorId)
-                .lt(cursor != null, AgentSession::getId, cursor)
-                .orderByDesc(AgentSession::getCreatedAt)
-                .last("LIMIT " + limit)
-        );
-    }
-}
-```
-
-### 8.5 成本优化
-
-下方 `compressHistory` 是有损截断反例，不能直接用于任务恢复：按三条分组会遗漏暂停时未配对动作，字符截断可能丢失条件，且把工具结果并入 assistant 文本会模糊来源。安全方案应持续保存结构化任务状态，按事件类型与来源组织摘要，并重新注入当前目标和约束，见 [[Context Engineering（上下文工程）#5.6 上下文压缩不等于任务恢复]]。
-
-
-#### Token使用优化
-
-```java
-@Component
-public class TokenOptimizer {
-    
-    /**
-     * 压缩执行历史（只保留关键信息）
-     */
-    public List<Message> compressHistory(List<Step> history) {
-        List<Message> messages = new ArrayList<>();
-        
-        for (int i = 0; i < history.size(); i += 3) {
-            // 每3步（Thought-Action-Observation）压缩为1条消息
-            if (i + 2 < history.size()) {
-                Step thought = history.get(i);
-                Step action = history.get(i + 1);
-                Step observation = history.get(i + 2);
-                
-                String compressed = String.format(
-                    "T: %s\nA: %s\nO: %s",
-                    truncate(thought.getContent(), 50),
-                    action.getAction().getToolName(),
-                    truncate(observation.getContent(), 100)
-                );
-                
-                messages.add(Message.assistant(compressed));
-            }
-        }
-        
-        return messages;
-    }
-    
-    private String truncate(String text, int maxLength) {
-        if (text.length() <= maxLength) {
-            return text;
-        }
-        return text.substring(0, maxLength) + "...";
-    }
-}
-```
-
-#### 使用更小的模型
-
-```java
-@Service
-public class ModelSelector {
-    
-    /**
-     * 根据任务复杂度选择模型
-     */
-    public String selectModel(String goal) {
-        // 简单查询：使用Haiku（更便宜）
-        if (isSimpleQuery(goal)) {
-            return "claude-haiku-4-5";
-        }
-        
-        // 复杂分析：使用Opus（更强大）
-        return "claude-opus-4-7";
-    }
-    
-    private boolean isSimpleQuery(String goal) {
-        String[] simpleKeywords = {"查看", "获取", "显示", "什么是"};
-        return Arrays.stream(simpleKeywords)
-            .anyMatch(keyword -> goal.contains(keyword));
-    }
-}
-```
-
----
-
-## 九、总结
-
-### 9.1 测试覆盖
-
-待验证：**单元测试**：工具、解析器、执行器  
-待验证：**集成测试**：Agent引擎、API接口  
-待验证：**Agent测试**：ReAct循环、工具选择、风险控制  
-待验证：**性能测试**：并发、延迟、吞吐量
-
-### 9.2 部署方案
-
-待验证：**容器化**：Docker + Kubernetes  
-待验证：**高可用**：多副本 + 健康检查  
-待验证：**灰度发布**：金丝雀部署
-
-### 9.3 监控告警
-
-待验证：**业务监控**：执行次数、成功率、步数  
-待验证：**系统监控**：CPU、内存、网络  
-待验证：**告警通知**：钉钉、邮件、电话
-
-### 9.4 性能优化
-
-待验证：**缓存策略**：Redis缓存、Prompt缓存  
-待验证：**并发优化**：工具并发、连接池  
-待验证：**成本优化**：Token压缩、模型选择
-
----
-
-**本篇整理了测试与运维候选方案，尚未完成应用联调或生产验收。**
-
-**相关文档：**
-- [开发方案总览](./医生助手Agent开发方案-总览.md)
-- [代码实现篇](./医生助手Agent开发方案-代码实现.md)
-- [架构设计正文](./医生助手Agent开发方案.md)
-
----
-
-**最后更新：** 2026-10-29  
-**文档版本：** v2.1（概念与能力状态校订）
+人工恢复也必须鉴权、记录原因，复用原 actionId/job 业务身份并检查现有结果。告警关闭条件是状态和业务效果被确认，不能只以队列变空或应用重启成功为依据。
