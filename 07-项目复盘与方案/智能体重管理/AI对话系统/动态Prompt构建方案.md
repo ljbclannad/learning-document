@@ -1,655 +1,139 @@
 # 动态Prompt构建方案
 
-## 概述
+本文讲解如何把可信规则、画像、会话摘要、历史证据和当前消息组织成模型输入，并处理来源、优先级、去重与 Token 预算。
 
-本方案展示如何根据用户画像、会话上下文、历史记忆动态生成个性化的AI Prompt，实现真正的"千人千面"对话体验。
+## 1. 动态构建不等于每次重写规则
 
-## 核心实现
+稳定模板与动态数据可以结合。可信规则、输出结构和任务边界适合版本化固定模板；画像、摘要、原文、证据及当前消息按本轮快照注入。`FIXED_TEMPLATE + userMessage` 也可以是一种合理实现：是否足够取决于任务需要，动态字段越多也不必然越好。
+
+本篇不查询数据库、不更新摘要、不发送后处理消息。[[用户画像存储设计方案]] 提供带版本与来源的画像；[[会话上下文设计方案]] 提供摘要及未覆盖原文；[[千问Embedding+Milvus向量搜索集成文档]] 提供带状态的检索结果。业务编排负责取齐这些输入，构建器只做校验、选择、去重、预算分配和消息组织。
+
+## 2. 输入与输出契约
+
+建议接口如下，仅表示职责，不依赖某个 Java SDK：
+
+```text
+buildPrompt(
+  authorizedScope,
+  profileSnapshot,
+  contextSnapshot,
+  uncoveredMessages,
+  retrievalResult,
+  currentMessage,
+  templateVersion,
+  tokenBudget
+) -> PreparedPrompt(messages, evidenceIds, sourceVersions, omittedReasons)
+```
+
+`authorizedScope` 来自上游权限校验；构建器仍需拒绝明显不匹配的租户、患者和会话数据。它不能从 `customerId` 字符串推导调用者有权查看。
+
+`retrievalResult` 至少区分 `FOUND`、`EMPTY`、`UNAVAILABLE`。空结果只是本次条件下没有命中，不证明首次使用；失败则意味着历史暂不可用，不能向用户声称“您没有历史记录”。画像缺失同样区分不存在、未确认和服务故障。
+
+输入必须是本轮冻结的快照。记录 `profileVersion`、`contextVersion`、摘要覆盖位置、记忆 ID/版本与模板版本，方便定位输出依赖；这不等于保存完整敏感 Prompt 到普通日志。
+
+## 3. 七类内容如何组织
+
+| 内容 | 放什么 | 不应混入什么 |
+| --- | --- | --- |
+| 可信任务规则 | 角色、回答边界、引用和缺失信息处理 | 用户提供的“忽略规则”等内容 |
+| 画像 | 当前任务必要的、有来源的字段 | 全量患者资料、未确认推断 |
+| 会话摘要 | 当前话题、待确认问题、已覆盖范围 | 未完成动作的隐含授权 |
+| 近期原文 | 摘要尚未覆盖的消息及必要精确表述 | 与当前消息重复的内容 |
+| 检索证据 | ID、来源时间、状态、相关片段 | 无权限数据、已删除或被替代记录 |
+| 当前请求 | 用户这一轮实际输入 | 由模型猜测的用户意图替代原话 |
+| 输出约束 | 回答格式、引用要求、缺失与冲突说明 | 无依据地保证诊断或行为结果 |
+
+规则与数据按模型接口支持的角色和结构传入。用户消息、模型摘要及检索资料属于数据，即使其中写了“系统指令”也不能提升权限。可以使用明确的数据字段或分隔符帮助识别，但分隔符本身不是安全边界；真实鉴权、参数校验和动作审批在应用执行层完成。
+
+将全量规则和资料拼成一个 user 字符串，会使来源与优先级难以维护；将检索资料直接放入 system 消息，也容易混淆信任级别。统一为“可信规则独立维护，资料明确标识来源”的接口契约，具体消息格式在实际模型客户端验证。
+
+## 4. 一轮资料如何变成输入
+
+以下为手工构造的非临床教学样本，展示状态和来源，不表示实际用户资料或模型输出：
+
+```json
+{
+  "templateVersion": "dialog-v1",
+  "profileVersion": 8,
+  "contextVersion": 12,
+  "coveredThroughSeq": 40,
+  "profile": {"communicationStyle": "简洁", "status": "用户确认"},
+  "context": {"topic": "活动记录", "pendingQuestions": ["日期待确认"]},
+  "uncoveredMessages": [
+    {"id": "m41", "role": "user", "content": "昨天走了5200步"}
+  ],
+  "retrieval": {"status": "EMPTY", "evidence": []},
+  "currentMessage": {"id": "m42", "content": "帮我整理一下记录"}
+}
+```
+
+构建结果应能表达：目前有一条用户自述活动记录，日期仍待确认，本次检索没有命中；可以整理已知内容，不添加新的测量、诊断或“首次用户”标签。若 `retrieval.status` 改为 `UNAVAILABLE`，对历史完整性的说明也必须改变，不能套同一个欢迎模板。
+
+相同版本与相同输入应产生可追踪的组织结果。时间规则使用显式时区和可注入时钟，不直接依赖服务器 `LocalTime.now()`。模板按疾病字符串、BMI 阈值或模型情绪标签触发临床建议的旧样本不再作为默认实现；如业务需要此类规则，应引用经审核、版本化的业务规则，并保留适用条件及人工核对边界。
+
+## 5. 去重、排序与预算
+
+预算应覆盖“可信规则 + 当前请求 + 必要原文 + 摘要 + 画像 + 检索证据 + 预留输出”。不能只限制记忆条数或用 Java 字符长度当作准确 Token 数。
+
+推荐选择顺序是：先保留任务规则和当前请求，再保留消除歧义所需原文，随后按任务需要选择画像和证据；摘要与原文按覆盖位置去重，记忆按 ID/版本去重。冲突信息保留来源与时间，不按拼接顺序默默覆盖。
+
+若输入不足预算而关键事实不能安全省略，应返回需要缩小任务、补充资料或分步处理的状态。截断不能切断否定条件、单位或引用来源。“截前 50 字”是长度处理，不是可靠摘要。
+
+### 5.1 最近三条的定向修正
+
+约定摘要按时间/消息序号升序保存，下列 Java 方法只负责窗口选择，可独立验证。该方法输入一个升序列表，输出保留原顺序的最新窗口：
 
 ```java
-package com.sano.slmc.business.service.ai;
-
-import com.sano.slmc.business.model.ai.*;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-
-import java.text.SimpleDateFormat;
-import java.time.LocalTime;
-import java.util.Date;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
-/**
- * 动态Prompt构建服务
- * 根据用户画像、会话上下文、历史记忆动态生成Prompt
- */
-@Slf4j
-@Service
-public class DynamicPromptBuilder {
-
-    // BMI分类阈值
-    private static final double BMI_OBESE_THRESHOLD = 28.0;
-    private static final double BMI_OVERWEIGHT_THRESHOLD = 24.0;
-    
-    // 时间阈值
-    private static final int NIGHT_START_HOUR = 22;
-    private static final int NIGHT_END_HOUR = 6;
-    
-    // 显示的最近对话数量
-    private static final int MAX_RECENT_SUMMARIES = 3;
-    
-    // 日期格式
-    private static final String DATE_FORMAT = "yyyy-MM-dd HH:mm";
-    
-    // 用户意图常量
-    private static final String INTENT_CONSULTATION = "咨询建议";
-    private static final String INTENT_REPORT_DATA = "报告数据";
-    
-    // 疾病类型常量
-    private static final String DISEASE_DIABETES = "糖尿病";
-    private static final String DISEASE_HYPERTENSION = "高血压";
-
-    /**
-     * 动态构建Prompt
-     * 
-     * @param profile 用户画像
-     * @param context 会话上下文
-     * @param memories 历史记忆列表
-     * @param userMessage 用户当前消息
-     * @return 完整的Prompt字符串
-     */
-    public String buildPrompt(
-            UserProfile profile,
-            SessionContext context,
-            List<Memory> memories,
-            String userMessage) {
-
-        if (profile == null || context == null || userMessage == null) {
-            throw new IllegalArgumentException("必要参数不能为空");
+public class RecentSummaries {
+    public static <T> List<T> latest(List<T> summaries, int limit) {
+        if (limit < 0) {
+            throw new IllegalArgumentException("limit不能为负数");
         }
-
-        StringBuilder prompt = new StringBuilder();
-
-        // ========== 1. 系统角色（固定部分） ==========
-        prompt.append(buildSystemRole());
-
-        // ========== 2. 用户画像（动态：每个用户不同） ==========
-        prompt.append(buildUserProfile(profile));
-
-        // ========== 3. 会话上下文（动态：每次对话不同） ==========
-        prompt.append(buildSessionContext(context));
-
-        // ========== 4. 历史记忆（动态：根据检索结果不同） ==========
-        prompt.append(buildMemories(memories));
-
-        // ========== 5. 业务规则（动态：根据用户情况注入） ==========
-        prompt.append(buildBusinessRules(profile, context));
-
-        // ========== 6. 用户消息（动态：每次不同） ==========
-        prompt.append(buildUserMessage(userMessage));
-
-        // ========== 7. 回复指引（动态：根据场景调整） ==========
-        prompt.append(buildReplyGuidance(context, memories));
-
-        log.debug("动态Prompt构建完成: 长度={}", prompt.length());
-
-        return prompt.toString();
+        if (summaries == null || summaries.isEmpty() || limit == 0) {
+            return Collections.emptyList();
+        }
+        int start = Math.max(0, summaries.size() - limit);
+        return new ArrayList<>(summaries.subList(start, summaries.size()));
     }
 
-    /**
-     * 1. 系统角色（相对固定）
-     */
-    private String buildSystemRole() {
-        return """
-            你是一个专业的健康管理顾问，具备以下能力：
-            - 提供个性化的健康建议
-            - 分析用户的健康数据趋势
-            - 给出科学、专业的指导意见
-            
-            """;
-    }
-
-    /**
-     * 2. 用户画像（动态生成）
-     */
-    private String buildUserProfile(UserProfile profile) {
-        StringBuilder section = new StringBuilder();
-        section.append("## 用户信息\n");
-
-        // 基础信息
-        section.append(String.format("- 年龄：%d岁\n", profile.getAge()));
-        section.append(String.format("- 性别：%s\n", profile.getGender()));
-
-        // 健康状况（动态）
-        if (profile.getChronicDiseases() != null && !profile.getChronicDiseases().isEmpty()) {
-            section.append("- 慢性病：")
-                   .append(String.join("、", profile.getChronicDiseases()))
-                   .append("\n");
+    public static void main(String[] args) {
+        List<Integer> input = List.of(1, 2, 3, 4, 5);
+        if (!latest(input, 3).equals(List.of(3, 4, 5))) {
+            throw new AssertionError("应取最后三条并保持原顺序");
         }
-
-        // 健康目标（动态）
-        if (profile.getHealthGoals() != null && !profile.getHealthGoals().isEmpty()) {
-            section.append("- 健康目标：")
-                   .append(String.join("、", profile.getHealthGoals()))
-                   .append("\n");
+        List<Integer> copy = latest(input, 9);
+        copy.clear();
+        if (input.size() != 5 || !latest(input, 0).isEmpty()
+                || !latest(null, 3).isEmpty()) {
+            throw new AssertionError("边界或防止修改原列表的约束失败");
         }
-
-        // BMI（动态）
-        appendBmiInfo(section, profile.getBmi());
-
-        // 沟通风格偏好（动态）
-        if (profile.getCommunicationStyle() != null) {
-            section.append("- 沟通风格：").append(profile.getCommunicationStyle()).append("\n");
-        }
-
-        section.append("\n");
-        return section.toString();
-    }
-
-    /**
-     * 添加BMI信息及健康提示
-     */
-    private void appendBmiInfo(StringBuilder section, String bmiStr) {
-        if (bmiStr == null || bmiStr.isEmpty()) {
-            return;
-        }
-
         try {
-            double bmi = Double.parseDouble(bmiStr);
-            section.append(String.format("- BMI：%.1f", bmi));
-
-            if (bmi >= BMI_OBESE_THRESHOLD) {
-                section.append("（肥胖，需要重点关注）");
-            } else if (bmi >= BMI_OVERWEIGHT_THRESHOLD) {
-                section.append("（超重，建议控制体重）");
-            }
-            section.append("\n");
-        } catch (NumberFormatException e) {
-            log.warn("BMI格式错误: {}", bmiStr);
+            latest(input, -1);
+            throw new AssertionError("负数限制应被拒绝");
+        } catch (IllegalArgumentException expected) {
+            // 预期拒绝非法输入。
         }
-    }
-
-    /**
-     * 3. 会话上下文（动态生成）
-     */
-    private String buildSessionContext(SessionContext context) {
-        StringBuilder section = new StringBuilder();
-        section.append("## 会话上下文\n");
-
-        // 当前话题
-        if (context.getCurrentTopic() != null) {
-            section.append("- 当前话题：").append(context.getCurrentTopic()).append("\n");
-        }
-
-        // 用户意图
-        if (context.getUserIntent() != null) {
-            section.append("- 用户意图：").append(context.getUserIntent()).append("\n");
-        }
-
-        // 提取的数据
-        if (context.getExtractedData() != null && !context.getExtractedData().isEmpty()) {
-            section.append("- 关键数据：\n");
-            context.getExtractedData().forEach((key, value) ->
-                section.append("  * ").append(key).append(": ").append(value).append("\n")
-            );
-        }
-
-        // 对话阶段
-        if (context.getConversationPhase() != null) {
-            section.append("- 对话阶段：").append(context.getConversationPhase()).append("\n");
-        }
-
-        // 最近对话摘要
-        appendRecentSummaries(section, context.getRecentSummaries());
-
-        section.append("\n");
-        return section.toString();
-    }
-
-    /**
-     * 添加最近对话摘要
-     */
-    private void appendRecentSummaries(StringBuilder section, List<MessageSummary> summaries) {
-        if (summaries == null || summaries.isEmpty()) {
-            return;
-        }
-
-        section.append("- 最近对话：\n");
-        int count = Math.min(MAX_RECENT_SUMMARIES, summaries.size());
-        for (int i = 0; i < count; i++) {
-            MessageSummary summary = summaries.get(i);
-            section.append("  ")
-                   .append("user".equals(summary.getRole()) ? "用户" : "助手")
-                   .append(": ")
-                   .append(summary.getSummary())
-                   .append("\n");
-        }
-    }
-
-    /**
-     * 4. 历史记忆（动态生成）
-     */
-    private String buildMemories(List<Memory> memories) {
-        StringBuilder section = new StringBuilder();
-        section.append("## 历史记忆\n");
-
-        if (memories == null || memories.isEmpty()) {
-            section.append("暂无相关历史记录。\n\n");
-            return section.toString();
-        }
-
-        section.append("以下是与当前对话相关的历史记录：\n");
-
-        SimpleDateFormat sdf = new SimpleDateFormat(DATE_FORMAT);
-
-        for (int i = 0; i < memories.size(); i++) {
-            Memory memory = memories.get(i);
-            section.append(i + 1)
-                   .append(". [")
-                   .append(sdf.format(new Date(memory.getCreateTime())))
-                   .append("] ")
-                   .append(memory.getContent())
-                   .append("\n");
-        }
-
-        section.append("\n");
-        return section.toString();
-    }
-
-    /**
-     * 5. 业务规则（动态注入）
-     */
-    private String buildBusinessRules(UserProfile profile, SessionContext context) {
-        StringBuilder section = new StringBuilder();
-        section.append("## 注意事项\n");
-
-        // 根据慢性病动态添加规则
-        appendDiseaseRules(section, profile.getChronicDiseases());
-
-        // 根据用户意图动态添加规则
-        appendIntentRules(section, context.getUserIntent());
-
-        // 根据时间动态添加规则
-        appendTimeBasedRules(section);
-
-        section.append("\n");
-        return section.toString();
-    }
-
-    /**
-     * 添加疾病相关规则
-     */
-    private void appendDiseaseRules(StringBuilder section, List<String> diseases) {
-        if (diseases == null || diseases.isEmpty()) {
-            return;
-        }
-
-        if (diseases.contains(DISEASE_DIABETES)) {
-            section.append("- 用户有糖尿病，回复时注意：\n");
-            section.append("  * 避免推荐高糖食物\n");
-            section.append("  * 强调血糖监测的重要性\n");
-            section.append("  * 提醒规律服药\n");
-        }
-
-        if (diseases.contains(DISEASE_HYPERTENSION)) {
-            section.append("- 用户有高血压，回复时注意：\n");
-            section.append("  * 避免推荐高盐食物\n");
-            section.append("  * 提醒控制情绪\n");
-            section.append("  * 建议定期测量血压\n");
-        }
-    }
-
-    /**
-     * 添加意图相关规则
-     */
-    private void appendIntentRules(StringBuilder section, String intent) {
-        if (intent == null) {
-            return;
-        }
-
-        if (INTENT_CONSULTATION.equals(intent)) {
-            section.append("- 用户在咨询建议，请：\n");
-            section.append("  * 给出具体可行的方案\n");
-            section.append("  * 说明理由和预期效果\n");
-            section.append("  * 提供注意事项\n");
-        } else if (INTENT_REPORT_DATA.equals(intent)) {
-            section.append("- 用户在报告数据，请：\n");
-            section.append("  * 分析数据是否正常\n");
-            section.append("  * 与历史数据对比\n");
-            section.append("  * 给出改善建议\n");
-        }
-    }
-
-    /**
-     * 添加基于时间的规则
-     */
-    private void appendTimeBasedRules(StringBuilder section) {
-        int hour = LocalTime.now().getHour();
-        if (hour >= NIGHT_START_HOUR || hour < NIGHT_END_HOUR) {
-            section.append("- 当前是深夜时段，提醒用户注意休息\n");
-        }
-    }
-
-    /**
-     * 6. 用户消息（动态）
-     */
-    private String buildUserMessage(String userMessage) {
-        return String.format("## 用户当前消息\n%s\n\n", userMessage);
-    }
-
-    /**
-     * 7. 回复指引（动态调整）
-     */
-    private String buildReplyGuidance(SessionContext context, List<Memory> memories) {
-        StringBuilder guidance = new StringBuilder();
-        guidance.append("## 回复要求\n");
-
-        guidance.append("请根据以上信息，给出专业、个性化的回复。\n");
-
-        // 根据是否有记忆动态调整
-        if (memories == null || memories.isEmpty()) {
-            guidance.append("由于缺少历史记录，如果信息不足，请礼貌地引导用户提供更多细节。\n");
-        } else {
-            guidance.append("请结合历史记录，分析趋势变化，给出针对性建议。\n");
-        }
-
-        // 根据用户情绪动态调整
-        appendSentimentGuidance(guidance, context);
-
-        return guidance.toString();
-    }
-
-    /**
-     * 添加情绪相关指引
-     */
-    private void appendSentimentGuidance(StringBuilder guidance, SessionContext context) {
-        if (context.getAiState() == null) {
-            return;
-        }
-
-        String sentiment = (String) context.getAiState().get("user_sentiment");
-        if ("负面".equals(sentiment)) {
-            guidance.append("用户情绪较为焦虑，请用温和、鼓励的语气回复。\n");
-        }
+        System.out.println("最近摘要窗口验证通过");
     }
 }
 ```
 
+保存为 `RecentSummaries.java`，在 JDK 11+ 执行 `javac RecentSummaries.java` 后运行 `java RecentSummaries`。取前 3 条的反例，在 `[1,2,3,4,5]` 输入下得到 `[1,2,3]`；正确结果为 `[3,4,5]`。
 
+## 6. 构建器与业务编排如何分工
 
----
+`DynamicPromptBuilder` 可以按角色、画像、摘要、记忆、规则、消息和回复指引拆分方法。各方法共享统一的数据模型，字段名、来源和空值处理在接口层约定，避免每个模块各写一套实体。
 
-## 实际效果演示
+`buildPrompt`、`promptService.build` 和 `buildFirstTimeResponse` 若分别维护相同规则，很容易出现模板漂移。应用落地时选一个构建器入口，检索层只返回资料和状态，不拼欢迎词；HTTP/SDK 层只序列化 `PreparedPrompt` 并处理调用。
 
-### 场景1：糖尿病患者的个性化Prompt
+模板参数替换可以复用固定模板，JSON 既可以是接口传输格式，也可以作为模型输入中的结构化资料；二者不冲突。是否可用不能用“动态或写死”判断，要看来源、预算和输出是否符合任务要求。
 
-**输入数据：**
+## 7. 示例运行与边界测试
 
-```java
-UserProfile profileA = UserProfile.builder()
-    .age(45)
-    .gender("男")
-    .chronicDiseases(List.of("糖尿病"))
-    .healthGoals(List.of("控制血糖"))
-    .build();
+在 JDK 17.0.11 下运行第 5.1 节示例，可观察最新窗口、超长窗口、空输入、零上限、负上限及副本隔离的行为；将代码改为取前 N 条后，相同用例会失败。这个对照实验说明：测试应检查“最近”这一语义，而不只是返回条数。
 
-SessionContext contextA = SessionContext.builder()
-    .currentTopic("血糖管理")
-    .extractedData(Map.of("血糖值", "7.2"))
-    .build();
-
-List<Memory> memoriesA = List.of(
-    new Memory("2024-05-10: 空腹血糖7.2"),
-    new Memory("2024-05-08: 运动量减少")
-);
-
-String promptA = buildPrompt(profileA, contextA, memoriesA, "我最近血糖怎么样？");
-```
-
-**生成的Prompt A：**
-
-```
-你是一个专业的健康管理顾问...
-
-## 用户信息
-- 年龄：45岁
-- 性别：男
-- 慢性病：糖尿病
-- 健康目标：控制血糖
-
-## 会话上下文
-- 当前话题：血糖管理
-- 关键数据：
-  * 血糖值: 7.2
-
-## 历史记忆
-1. [2024-05-10 00:00] 空腹血糖7.2
-2. [2024-05-08 00:00] 运动量减少
-
-## 注意事项
-- 用户有糖尿病，回复时注意：
-  * 避免推荐高糖食物
-  * 强调血糖监测的重要性
-  * 提醒规律服药
-
-## 用户当前消息
-我最近血糖怎么样？
-
-## 回复要求
-请根据以上信息，给出专业、个性化的回复。
-请结合历史记录，分析趋势变化，给出针对性建议。
-```
-
----
-
-### 场景2：高血压患者的个性化Prompt
-
-**输入数据：**
-
-```java
-UserProfile profileB = UserProfile.builder()
-    .age(52)
-    .gender("女")
-    .chronicDiseases(List.of("高血压"))
-    .healthGoals(List.of("降低血压"))
-    .build();
-
-SessionContext contextB = SessionContext.builder()
-    .currentTopic("血压管理")
-    .extractedData(Map.of("血压", "150/95"))
-    .build();
-
-List<Memory> memoriesB = List.of(
-    new Memory("2024-05-12: 血压150/95，偏高"),
-    new Memory("2024-05-10: 最近工作压力大")
-);
-
-String promptB = buildPrompt(profileB, contextB, memoriesB, "我的血压还是高怎么办？");
-```
-
-**生成的Prompt B：**
-
-```
-你是一个专业的健康管理顾问...
-
-## 用户信息
-- 年龄：52岁
-- 性别：女
-- 慢性病：高血压
-- 健康目标：降低血压
-
-## 会话上下文
-- 当前话题：血压管理
-- 关键数据：
-  * 血压: 150/95
-
-## 历史记忆
-1. [2024-05-12 00:00] 血压150/95，偏高
-2. [2024-05-10 00:00] 最近工作压力大
-
-## 注意事项
-- 用户有高血压，回复时注意：
-  * 避免推荐高盐食物
-  * 提醒控制情绪
-  * 建议定期测量血压
-
-## 用户当前消息
-我的血压还是高怎么办？
-
-## 回复要求
-请根据以上信息，给出专业、个性化的回复。
-请结合历史记录，分析趋势变化，给出针对性建议。
-```
-
----
-
-## 动态变化的维度
-
-Prompt会根据以下因素实时动态变化：
-
-| 维度 | 变化因素 | 示例 |
-|------|---------|------|
-| **用户维度** | 年龄、性别、疾病、目标 | 糖尿病患者 vs 高血压患者 |
-| **时间维度** | 对话历史、数据趋势 | 第1次对话 vs 第10次对话 |
-| **内容维度** | 用户意图、话题、数据 | 咨询建议 vs 报告数据 |
-| **情境维度** | 时段、情绪、紧急程度 | 深夜 vs 白天 |
-| **记忆维度** | 相关记忆数量和内容 | 有5条记忆 vs 无记忆 |
-
----
-
-## API调用集成
-
-### 与AI服务集成
-
-```java
-@Service
-public class AiChatService {
-    
-    @Autowired
-    private DynamicPromptBuilder promptBuilder;
-    
-    /**
-     * 调用AI API
-     */
-    public String chat(Long userId, String message) {
-        // 1. 获取用户数据
-        UserProfile profile = userService.getProfile(userId);
-        SessionContext context = sessionService.getContext(userId);
-        List<Memory> memories = memoryService.retrieve(userId, message);
-        
-        // 2. 动态构建Prompt
-        String dynamicPrompt = promptBuilder.buildPrompt(
-            profile, context, memories, message
-        );
-        
-        // 3. 转为API格式
-        Map<String, Object> request = Map.of(
-            "model", "qwen-turbo",
-            "input", Map.of(
-                "messages", List.of(
-                    Map.of("role", "system", "content", "你是健康顾问"),
-                    Map.of("role", "user", "content", dynamicPrompt)
-                )
-            ),
-            "parameters", Map.of(
-                "temperature", 0.7,
-                "max_tokens", 2000
-            )
-        );
-        
-        // 4. 发送请求
-        String json = JSON.toJSONString(request);
-        String response = httpClient.post(apiUrl, json);
-        
-        return parseResponse(response);
-    }
-}
-```
-
-### 关键点说明
-
-- ✅ **Prompt内容是动态生成的**：每次调用都根据实际数据构建
-- ✅ **JSON只是API调用格式**：不是Prompt本身，只是传输格式
-- ✅ **完全个性化**：不同用户、不同场景生成不同的Prompt
-
----
-
-## 核心总结
-
-### 动态生成的本质
-
-```java
-// ✅ 正确：动态生成
-String prompt = buildPrompt(
-    getProfile(customerId),      // 每个用户不同
-    getContext(groupId),          // 每次对话不同
-    retrieveMemories(message),    // 根据消息检索不同
-    userMessage                   // 每次输入不同
-);
-
-// ❌ 错误：写死模板
-String prompt = FIXED_TEMPLATE + userMessage;
-```
-
-### 动态化的价值
-
-**不同用户的个性化：**
-- 用户A（糖尿病） → Prompt A（血糖相关规则）
-- 用户B（高血压） → Prompt B（血压相关规则）
-- 用户C（新用户） → Prompt C（引导提供信息）
-
-**同一用户的演进：**
-- 第1次对话 → Prompt 1（无历史记忆）
-- 第2次对话 → Prompt 2（有1条记忆）
-- 第10次对话 → Prompt 10（有9条记忆）
-
-### 核心问答
-
-| 问题 | 答案 |
-|------|------|
-| Prompt是否动态？ | ✅ 是，每次都根据实际数据生成 |
-| 是否写死？ | ❌ 不是，完全个性化 |
-| JSON的作用？ | 只是API调用格式，不是Prompt本身 |
-
----
-
-## 最佳实践
-
-### 1. 参数校验
-
-```java
-if (profile == null || context == null || userMessage == null) {
-    throw new IllegalArgumentException("必要参数不能为空");
-}
-```
-
-### 2. 常量提取
-
-```java
-private static final double BMI_OBESE_THRESHOLD = 28.0;
-private static final String DISEASE_DIABETES = "糖尿病";
-```
-
-### 3. 方法拆分
-
-将复杂逻辑拆分为多个小方法，提高可维护性和可测试性。
-
-### 4. 异常处理
-
-```java
-try {
-    double bmi = Double.parseDouble(bmiStr);
-    // 处理逻辑
-} catch (NumberFormatException e) {
-    log.warn("BMI格式错误: {}", bmiStr);
-}
-```
-
-### 5. 日志记录
-
-```java
-log.debug("动态Prompt构建完成: 长度={}", prompt.length());
-```
-
----
-
-**结论**：Prompt是完全动态生成的，根据用户画像、会话上下文、历史记忆实时变化，实现真正的个性化对话体验。
+落地后至少覆盖：资料归属不匹配时拒绝；EMPTY 与 UNAVAILABLE 生成不同状态说明；当前消息重复时去重；升序摘要取最新窗口；超预算不截断关键条件；资料中出现伪造指令时不改变执行权限；冲突数据保留来源；日志不包含未经脱敏的正文。

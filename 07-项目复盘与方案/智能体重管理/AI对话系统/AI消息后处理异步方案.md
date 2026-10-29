@@ -1,1358 +1,204 @@
 # AI消息后处理异步方案
 
-## 一、方案概述
+本文以记忆提取和摘要更新为例，讲解异步任务的持久化、交付、幂等与故障恢复，并通过单进程实验说明“抢占任务”与“完成任务”的区别。
 
-### 1.1 背景
+## 1. 为什么异步，异步到哪里
 
-在AI消息数据流中，步骤7（保存新记忆）和步骤8（更新会话上下文）是后处理操作，不影响当前回复的返回。为了提升响应速度和用户体验，我们将这两个步骤改为异步处理。
+回复完成后，提取记忆和更新摘要通常可以离开前台等待路径，但会影响下一轮能看到的资料。前台读取摘要水位并补齐近期原文，见 [[会话上下文设计方案]]；向量可检索的状态见 [[千问Embedding+Milvus向量搜索集成文档]]；收益如何测量见 [[AI消息数据流性能分析]]。
 
-**原始流程：**
-```
-步骤6：调用AI生成回复
-   ↓ (同步等待)
-步骤7：保存新记忆（MySQL + Milvus + Redis索引）
-   ↓ (同步等待)
-步骤8：更新会话上下文（Redis + DeepSeek处理）
-   ↓
-返回给用户
+本文只负责让同一轮后处理能够被恢复、重试和追踪，不重复记忆保存实现、摘要实体或完整 `AiChatService`。记忆内容与摘要更新通过各自服务完成，任务调度只关心输入身份、步骤状态和恢复条件。
+
+```text
+前台：生成回复 → 同事务保存回复与后处理任务 → 返回
+后台：发布任务提示 → 消费或定时扫描任务 → 分步处理 → 持久化完成状态
 ```
 
-**优化后流程：**
-```
-步骤6：调用AI生成回复
-   ↓ (立即返回)
-返回给用户
-   ↓ (异步MQ)
-步骤7 + 步骤8：并行处理
-```
+“调用 `send` 后返回”和“回复已返回后再异步发送”不是同一个时序。可靠基线应先保留任务事实；仅在发送失败回调中 TODO 补写数据库，进程退出时仍可能永久丢失任务。通用 Outbox 原理见 [[RabbitMQ与Outbox可靠消息方案]]。
 
-### 1.2 为什么选择RabbitMQ而不是线程池？
+线程池可以执行工作，但内存队列没有进程退出后的恢复保证；持久化任务表配合线程池也是可选方案。MQ 提供缓冲、分发及确认能力，代价是多一个系统和重复投递窗口，不能仅凭“用了 RabbitMQ”断言最终执行成功。
 
-| 对比项 | 线程池 | RabbitMQ |
-|--------|--------|----------|
-| 持久化 | ❌ 服务重启丢失 | ✅ 消息持久化到磁盘 |
-| 重试机制 | ❌ 需要自己实现 | ✅ 自动重试 + 死信队列 |
-| 监控 | ❌ 需要自己实现 | ✅ 管理界面 + 监控指标 |
-| 削峰填谷 | ❌ 线程池满了就阻塞 | ✅ 队列缓冲 |
-| 分布式 | ❌ 单机 | ✅ 多实例消费 |
+## 2. 任务身份、状态和子步骤
 
-### 1.3 方案目标
+任务表可以通过以下字段和约束表达执行契约：
 
-1. **响应速度提升**：步骤6完成后立即返回，减少用户等待时间
-2. **可靠性保证**：消息持久化 + 手动ACK，确保步骤7、8最终执行成功
-3. **失败重试**：自动重试 + 死信队列，处理异常情况
-4. **并行处理**：步骤7和8在消费者中并行执行
-5. **监控告警**：队列堆积、消费失败率监控
+| 字段/约束 | 用途 |
+| --- | --- |
+| `taskId` | 创建后固定，重发和人工重试沿用 |
+| `tenantId, groupId, turnId, taskType` 唯一约束 | 同一轮同类逻辑任务只创建一次 |
+| `payloadVersion, payloadHash, sourceMessageIds` | 识别同 ID 不同参数；使用已持久化来源而非无约束正文 |
+| `status` | PENDING、PROCESSING、RETRY_WAIT、SUCCEEDED、MANUAL |
+| `attempt, leaseUntil, nextAttemptAt` | 领取次数、失联回收、退避时间 |
+| `memoryStatus, contextStatus` | 子步骤独立记录，部分完成不需要全部重做 |
+| `lastError, createdAt, completedAt` | 恢复与运维证据，错误中避免包含敏感原文 |
 
----
+`traceId` 用于关联一次执行，不能每次重发生成新 UUID 后又作为业务幂等键。RabbitMQ `deliveryTag` 只在对应 channel 范围用于确认，不能作跨投递业务身份。
 
-## 二、MQ架构设计
+同一 taskId 的相同参数重投可继续或返回已有结果；同一 taskId 的不同参数必须拒绝为冲突。更新目标、修正资料应产生明确的新版本或新任务，不能悄悄复用旧任务身份。
 
-### 2.1 交换机和队列设计
+## 3. 执行前去重为什么会丢任务
 
-```
-                    ┌─────────────────────┐
-                    │  ai.postprocess     │
-                    │  (Topic Exchange)   │
-                    └──────────┬──────────┘
-                               │
-                ┌──────────────┴──────────────┐
-                │                             │
-                │ routing key:                │
-                │ ai.postprocess.task         │
-                │                             │
-                ↓                             ↓
-    ┌───────────────────────┐     ┌──────────────────────┐
-    │ ai.postprocess.queue  │     │ ai.postprocess.queue │
-    │ (工作队列)             │────→│ .dlq (死信队列)       │
-    └───────────────────────┘     └──────────────────────┘
-            │
-            │ 消费者
-            ↓
-    ┌───────────────────────┐
-    │ 并行执行：             │
-    │ - 保存新记忆(步骤7)    │
-    │ - 更新上下文(步骤8)    │
-    └───────────────────────┘
+考虑一种常见错误：消费者在执行业务前执行 `SETNX(idempotentKey, 1, 10分钟)`，并把 Key 存在解释为已处理：
+
+```text
+第一次投递：SETNX 成功 → 记忆处理失败 → NACK 重入队
+第二次投递：Key 仍存在 → 直接 ACK → 两个子步骤可能都没完成
 ```
 
-### 2.2 队列属性配置
+把 TTL 延长不能修复这个窗口；缩短则会让还在运行的任务被重复执行。抢占标记与完成凭据必须分开。即便成功后再写 Redis，也仍有“业务成功、标记前宕机”的窗口，所以最终防重必须靠持久化任务与业务幂等，而非一个布尔缓存。
 
-| 属性 | 值 | 说明 |
-|------|-----|------|
-| durable | true | 队列持久化，服务重启不丢失 |
-| exclusive | false | 非独占队列，多消费者可消费 |
-| autoDelete | false | 不自动删除 |
-| x-message-ttl | 600000 | 消息TTL 10分钟 |
-| x-dead-letter-exchange | ai.postprocess.dlx | 死信交换机 |
-| x-dead-letter-routing-key | ai.postprocess.dlq | 死信路由键 |
-| x-max-length | 10000 | 队列最大长度 |
+可实施的基线是：短事务领取任务并生成 attempt token；执行子步骤；每个子步骤以稳定业务键进行幂等提交；所有必需步骤完成后提交 SUCCEEDED。任务已在处理中时，先确认租约与持久化恢复责任，不能把它当成成功。
 
----
+### 3.1 部分成功、超时与重复执行
 
-## 三、RabbitMQ配置代码
+记忆成功、摘要失败时，仅重试缺失步骤；记忆服务还需用 `taskId + step` 对应的业务身份防重。只记录两个布尔状态而没有业务幂等，仍挡不住“外部成功但本地状态未提交”。
 
-### 3.1 Maven依赖
+`CompletableFuture.allOf(...).get(30, SECONDS)` 超时只表示等待方不再等，不证明两个任务已停止。重投时旧任务可能继续；资源写入必须核对版本/业务身份，终态提交必须核对 attempt token。若不能给外部系统附加幂等身份或查证结果，进入“结果不明、需查证”，不能一律盲重试。
 
-```xml
-<dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-amqp</artifactId>
-</dependency>
-```
+默认使用可恢复的顺序步骤更容易定义边界；确需并行时，使用有界专用执行器，并单独记录子步骤完成情况。不要将阻塞模型调用无界提交到公共线程池。
 
-### 3.2 application.yml配置
+### 3.2 串行与有序不同
+
+分布式锁只能让同一时刻少一些执行者，不能保证先来的消息先取得锁。按会话分片仍需处理重投和缺口。摘要必须按连续来源位置与版本条件提交；记忆可以按独立 ID 写入，但不能以完成时间覆盖来源时间。不能用“加一把 30 秒锁”就声称消息有序。
+
+## 4. 发送、确认与恢复责任
+
+Publisher confirm 表示 broker 侧的发布确认，consumer ACK 表示消费者侧的投递确认，二者不等于业务完成。不可路由的 mandatory 消息会先 return 再 confirm，只有 confirm ack 不能证明路由成功。依据 [RabbitMQ confirms 说明](https://www.rabbitmq.com/docs/confirms)（2026-10-29 核对）。
+
+推荐把 MQ 消息作为持久化任务的唤醒信号：消息体只携带 taskId 及受控版本信息，消费者从任务表读取权威状态。定义以下 ACK 契约：
+
+- SUCCEEDED：确认投递，重复投递无需重复副作用。
+- 可重试失败：先持久化 RETRY_WAIT 与下一次执行时间，再确认当前投递；定时扫描必须能够独立唤醒任务。
+- 另一 attempt 正在处理：只有任务表和租约回收能保证恢复时，才可确认这个重复唤醒；这不表示任务成功。
+- 无法读取/提交任务状态：不能当作完成，交给有界重试或持久化故障收集；避免立即反复 requeue 形成热循环。
+- 永久非法消息或参数冲突：先保存可追溯的异常记录，再按策略拒绝或确认，避免毒消息无限占用消费者。
+
+如果不采用任务表兜底，而把 MQ 当唯一任务存储，上述“持久化 RETRY_WAIT 后 ACK”的方案就不能照搬，必须有可靠的重试转发与确认交接。
+
+### 4.1 Spring 与 broker 的确认模式不要混淆
+
+RabbitMQ 的自动确认与 Spring AMQP `AcknowledgeMode.AUTO` 不是同一概念。Spring AUTO 通常由容器根据监听器执行结果决定确认；NONE 才对应不等待业务确认。MANUAL 允许应用决定 ACK 时点，但不自动保证数据库提交或外部动作成功。见 [Spring AMQP 容器配置](https://docs.spring.io/spring-amqp/reference/amqp/containerAttributes.html)。
+
+如果监听器捕获异常后自行 NACK 并正常返回，容器重试拦截器未必还能看到异常；不能同时宣称注解、YAML 重试和手工 requeue 都在按同一个次数工作。重试选择一个明确的责任方。
+
+## 5. 配置只保证明确的那一层
+
+下面是属性位置示意，不是完整部署配置。应用需固定 Spring Boot/AMQP 与 RabbitMQ 版本，并检验实际绑定。`publisher-confirm-type` 与 `publisher-returns` 属于 `spring.rabbitmq`，不在 `template` 下。参考 [Spring Boot 属性说明](https://docs.spring.io/spring-boot/appendix/application-properties/index.html)。
 
 ```yaml
 spring:
   rabbitmq:
-    host: localhost
-    port: 5672
-    username: guest
-    password: guest
-    virtual-host: /
-    # 消息确认模式：手动ACK
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
     listener:
       simple:
         acknowledge-mode: manual
-        # 预取数量：每次从队列取1条消息
-        prefetch: 1
-        # 重试配置
-        retry:
-          enabled: true
-          initial-interval: 3000    # 首次重试间隔3秒
-          max-attempts: 3           # 最多重试3次
-          multiplier: 2             # 重试间隔倍数
-          max-interval: 10000       # 最大重试间隔10秒
-    # 消息持久化
-    template:
-      mandatory: true
-      # 发送确认
-      publisher-confirm-type: correlated
-      publisher-returns: true
-```
-
-### 3.3 队列和交换机配置类
-
-```java
-package com.example.config;
-
-import org.springframework.amqp.core.*;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-
-import java.util.HashMap;
-import java.util.Map;
-
-@Configuration
-public class AiPostProcessQueueConfig {
-
-    // 交换机名称
-    public static final String EXCHANGE = "ai.postprocess";
-    public static final String DLX_EXCHANGE = "ai.postprocess.dlx";
-    
-    // 队列名称
-    public static final String QUEUE = "ai.postprocess.queue";
-    public static final String DLQ = "ai.postprocess.queue.dlq";
-    
-    // 路由键
-    public static final String ROUTING_KEY = "ai.postprocess.task";
-    public static final String DLQ_ROUTING_KEY = "ai.postprocess.dlq";
-
-    /**
-     * 主交换机（Topic类型）
-     */
-    @Bean
-    public TopicExchange aiPostProcessExchange() {
-        return ExchangeBuilder
-                .topicExchange(EXCHANGE)
-                .durable(true)  // 持久化
-                .build();
-    }
-
-    /**
-     * 死信交换机
-     */
-    @Bean
-    public DirectExchange aiPostProcessDlxExchange() {
-        return ExchangeBuilder
-                .directExchange(DLX_EXCHANGE)
-                .durable(true)
-                .build();
-    }
-
-    /**
-     * 工作队列（带死信配置）
-     */
-    @Bean
-    public Queue aiPostProcessQueue() {
-        Map<String, Object> args = new HashMap<>();
-        // 消息TTL：10分钟
-        args.put("x-message-ttl", 600000);
-        // 死信交换机
-        args.put("x-dead-letter-exchange", DLX_EXCHANGE);
-        args.put("x-dead-letter-routing-key", DLQ_ROUTING_KEY);
-        // 队列最大长度
-        args.put("x-max-length", 10000);
-        
-        return QueueBuilder
-                .durable(QUEUE)
-                .withArguments(args)
-                .build();
-    }
-
-    /**
-     * 死信队列
-     */
-    @Bean
-    public Queue aiPostProcessDlq() {
-        return QueueBuilder
-                .durable(DLQ)
-                .build();
-    }
-
-    /**
-     * 绑定工作队列到主交换机
-     */
-    @Bean
-    public Binding aiPostProcessBinding() {
-        return BindingBuilder
-                .bind(aiPostProcessQueue())
-                .to(aiPostProcessExchange())
-                .with(ROUTING_KEY);
-    }
-
-    /**
-     * 绑定死信队列到死信交换机
-     */
-    @Bean
-    public Binding aiPostProcessDlqBinding() {
-        return BindingBuilder
-                .bind(aiPostProcessDlq())
-                .to(aiPostProcessDlxExchange())
-                .with(DLQ_ROUTING_KEY);
-    }
-}
-```
-
----
-
-## 四、消息模型设计
-
-### 4.1 消息体定义
-
-```java
-package com.example.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-import java.io.Serializable;
-
-/**
- * AI后处理任务消息
- */
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class AiPostProcessTask implements Serializable {
-    
-    private static final long serialVersionUID = 1L;
-    
-    /**
-     * 用户ID
-     */
-    private String userId;
-    
-    /**
-     * 会话ID
-     */
-    private String conversationId;
-    
-    /**
-     * 用户消息
-     */
-    private String userMessage;
-    
-    /**
-     * AI回复
-     */
-    private String aiResponse;
-    
-    /**
-     * 消息时间戳
-     */
-    private Long timestamp;
-    
-    /**
-     * 业务追踪ID
-     */
-    private String traceId;
-}
-```
-
----
-
-## 五、生产者实现（发送消息）
-
-### 5.1 消息发送服务
-
-```java
-package com.example.service;
-
-import com.example.config.AiPostProcessQueueConfig;
-import com.example.dto.AiPostProcessTask;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.amqp.core.Message;
-import org.springframework.amqp.core.MessageDeliveryMode;
-import org.springframework.amqp.core.MessageProperties;
-import org.springframework.amqp.rabbit.connection.CorrelationData;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Service;
-
-import javax.annotation.PostConstruct;
-import java.util.UUID;
-
-@Slf4j
-@Service
-public class AiPostProcessProducer {
-
-    @Autowired
-    private RabbitTemplate rabbitTemplate;
-
-    @Autowired
-    private ObjectMapper objectMapper;
-
-    /**
-     * 配置发送确认回调
-     */
-    @PostConstruct
-    public void init() {
-        // 消息发送到交换机的确认回调
-        rabbitTemplate.setConfirmCallback((correlationData, ack, cause) -> {
-            if (ack) {
-                log.info("消息发送成功，correlationId: {}", correlationData.getId());
-            } else {
-                log.error("消息发送失败，correlationId: {}, 原因: {}", 
-                    correlationData.getId(), cause);
-                // TODO: 记录到数据库，人工介入或定时补偿
-            }
-        });
-
-        // 消息从交换机路由到队列失败的回调
-        rabbitTemplate.setReturnsCallback(returned -> {
-            log.error("消息路由失败，exchange: {}, routingKey: {}, 原因: {}", 
-                returned.getExchange(), 
-                returned.getRoutingKey(), 
-                returned.getReplyText());
-            // TODO: 记录到数据库，人工介入或定时补偿
-        });
-    }
-
-    /**
-     * 发送AI后处理任务
-     */
-    public void sendPostProcessTask(String userId, String conversationId, 
-                                     String userMessage, String aiResponse) {
-        try {
-            // 构建消息体
-            AiPostProcessTask task = AiPostProcessTask.builder()
-                    .userId(userId)
-                    .conversationId(conversationId)
-                    .userMessage(userMessage)
-                    .aiResponse(aiResponse)
-                    .timestamp(System.currentTimeMillis())
-                    .traceId(UUID.randomUUID().toString())
-                    .build();
-
-            // 序列化消息
-            String messageBody = objectMapper.writeValueAsString(task);
-
-            // 设置消息属性
-            MessageProperties properties = new MessageProperties();
-            properties.setContentType("application/json");
-            properties.setContentEncoding("UTF-8");
-            // 消息持久化（关键！）
-            properties.setDeliveryMode(MessageDeliveryMode.PERSISTENT);
-            // 设置消息ID（用于幂等性）
-            properties.setMessageId(task.getTraceId());
-            // 设置优先级（可选）
-            properties.setPriority(5);
-
-            Message message = new Message(messageBody.getBytes(), properties);
-
-            // 发送消息（带确认）
-            CorrelationData correlationData = new CorrelationData(task.getTraceId());
-            rabbitTemplate.send(
-                    AiPostProcessQueueConfig.EXCHANGE,
-                    AiPostProcessQueueConfig.ROUTING_KEY,
-                    message,
-                    correlationData
-            );
-
-            log.info("发送AI后处理任务，userId: {}, traceId: {}", userId, task.getTraceId());
-
-        } catch (Exception e) {
-            log.error("发送AI后处理任务失败，userId: {}", userId, e);
-            // TODO: 降级方案 - 同步执行或记录到数据库补偿
-        }
-    }
-}
-```
-
-### 5.2 在AI服务中调用
-
-```java
-package com.example.service;
-
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Service;
-
-@Service
-public class AiChatService {
-
-    @Autowired
-    private AiPostProcessProducer postProcessProducer;
-
-    /**
-     * AI对话处理
-     */
-    public String chat(String userId, String conversationId, String message) {
-        // 步骤1-6：同步执行
-        String aiResponse = executeSteps1To6(userId, conversationId, message);
-
-        // 立即返回给用户
-        // 步骤7、8：异步MQ处理
-        postProcessProducer.sendPostProcessTask(userId, conversationId, message, aiResponse);
-
-        return aiResponse;
-    }
-
-    /**
-     * 执行步骤1-6（同步）
-     */
-    private String executeSteps1To6(String userId, String conversationId, String message) {
-        // 1. 获取用户画像（Redis缓存）
-        // 2. 获取会话上下文（Redis）
-        // 3. 生成查询向量（Embedding）
-        // 4. 检索相关记忆（Milvus）
-        // 5. 组装Prompt
-        // 6. 调用AI生成回复
-        return "AI回复内容";
-    }
-}
-```
-
----
-
-## 六、消费者实现（处理消息）
-
-### 6.1 消费者服务
-
-```java
-package com.example.consumer;
-
-import com.example.config.AiPostProcessQueueConfig;
-import com.example.dto.AiPostProcessTask;
-import com.example.service.AiMemoryService;
-import com.example.service.AiSessionContextService;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.rabbitmq.client.Channel;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.amqp.core.Message;
-import org.springframework.amqp.rabbit.annotation.RabbitListener;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.stereotype.Component;
-
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
-
-@Slf4j
-@Component
-public class AiPostProcessConsumer {
-
-    @Autowired
-    private ObjectMapper objectMapper;
-
-    @Autowired
-    private AiMemoryService memoryService;
-
-    @Autowired
-    private AiSessionContextService sessionContextService;
-
-    @Autowired
-    private StringRedisTemplate redisTemplate;
-
-    /**
-     * 消费AI后处理任务
-     * 
-     * @param message RabbitMQ消息
-     * @param channel 通道（用于手动ACK）
-     */
-    @RabbitListener(queues = AiPostProcessQueueConfig.QUEUE)
-    public void handlePostProcessTask(Message message, Channel channel) {
-        long deliveryTag = message.getMessageProperties().getDeliveryTag();
-        String messageId = message.getMessageProperties().getMessageId();
-        
-        try {
-            // 1. 解析消息
-            String body = new String(message.getBody());
-            AiPostProcessTask task = objectMapper.readValue(body, AiPostProcessTask.class);
-            
-            log.info("开始处理AI后处理任务，userId: {}, traceId: {}", 
-                task.getUserId(), task.getTraceId());
-
-            // 2. 幂等性检查（防止重复消费）
-            String idempotentKey = "ai:postprocess:idempotent:" + messageId;
-            Boolean isProcessed = redisTemplate.opsForValue()
-                    .setIfAbsent(idempotentKey, "1", 10, TimeUnit.MINUTES);
-            
-            if (Boolean.FALSE.equals(isProcessed)) {
-                log.warn("消息已处理过，跳过。messageId: {}", messageId);
-                // 手动ACK（确认消息）
-                channel.basicAck(deliveryTag, false);
-                return;
-            }
-
-            // 3. 并行执行步骤7和步骤8
-            CompletableFuture<Void> step7 = CompletableFuture.runAsync(() -> {
-                // 步骤7：保存新记忆（MySQL + Milvus + Redis索引）
-                memoryService.saveMemory(
-                    task.getUserId(), 
-                    task.getConversationId(),
-                    task.getUserMessage(), 
-                    task.getAiResponse()
-                );
-                log.info("步骤7完成：保存新记忆，userId: {}", task.getUserId());
-            });
-
-            CompletableFuture<Void> step8 = CompletableFuture.runAsync(() -> {
-                // 步骤8：更新会话上下文（Redis + DeepSeek处理）
-                sessionContextService.updateContext(
-                    task.getUserId(),
-                    task.getConversationId(),
-                    task.getUserMessage(),
-                    task.getAiResponse()
-                );
-                log.info("步骤8完成：更新会话上下文，userId: {}", task.getUserId());
-            });
-
-            // 等待两个步骤都完成（最多30秒）
-            CompletableFuture.allOf(step7, step8).get(30, TimeUnit.SECONDS);
-
-            log.info("AI后处理任务完成，userId: {}, traceId: {}", 
-                task.getUserId(), task.getTraceId());
-
-            // 4. 手动ACK（确认消息）
-            channel.basicAck(deliveryTag, false);
-
-        } catch (Exception e) {
-            log.error("处理AI后处理任务失败，deliveryTag: {}, messageId: {}", 
-                deliveryTag, messageId, e);
-
-            try {
-                // 获取重试次数
-                Integer retryCount = (Integer) message.getMessageProperties()
-                        .getHeaders().get("x-retry-count");
-                if (retryCount == null) {
-                    retryCount = 0;
-                }
-
-                // 最多重试3次
-                if (retryCount < 3) {
-                    log.info("消息重新入队，重试次数: {}", retryCount + 1);
-                    // NACK并重新入队（requeue = true）
-                    channel.basicNack(deliveryTag, false, true);
-                } else {
-                    log.error("消息重试次数超限，进入死信队列。messageId: {}", messageId);
-                    // NACK但不重新入队（requeue = false），消息进入死信队列
-                    channel.basicNack(deliveryTag, false, false);
-                }
-            } catch (Exception ackException) {
-                log.error("ACK/NACK失败", ackException);
-            }
-        }
-    }
-}
-```
-
-### 6.2 步骤7：保存新记忆服务
-
-```java
-package com.example.service;
-
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-@Slf4j
-@Service
-public class AiMemoryService {
-
-    @Autowired
-    private ChatHistoryMapper chatHistoryMapper;
-
-    @Autowired
-    private MilvusService milvusService;
-
-    @Autowired
-    private StringRedisTemplate redisTemplate;
-
-    /**
-     * 保存新记忆（步骤7）
-     */
-    @Transactional(rollbackFor = Exception.class)
-    public void saveMemory(String userId, String conversationId, 
-                           String userMessage, String aiResponse) {
-        try {
-            // 1. 保存到MySQL
-            ChatHistory history = new ChatHistory();
-            history.setUserId(userId);
-            history.setConversationId(conversationId);
-            history.setUserMessage(userMessage);
-            history.setAiResponse(aiResponse);
-            history.setCreateTime(new Date());
-            chatHistoryMapper.insert(history);
-
-            // 2. 生成向量并保存到Milvus
-            String content = userMessage + " " + aiResponse;
-            float[] vector = milvusService.generateEmbedding(content);
-            milvusService.insertVector(history.getId(), userId, vector, content);
-
-            // 3. 更新Redis索引
-            String indexKey = "ai:memory:index:" + userId;
-            redisTemplate.opsForZSet().add(indexKey, 
-                String.valueOf(history.getId()), 
-                System.currentTimeMillis());
-
-            log.info("保存新记忆成功，userId: {}, historyId: {}", userId, history.getId());
-
-        } catch (Exception e) {
-            log.error("保存新记忆失败，userId: {}", userId, e);
-            throw new RuntimeException("保存新记忆失败", e);
-        }
-    }
-}
-```
-
-### 6.3 步骤8：更新会话上下文服务
-
-```java
-package com.example.service;
-
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.stereotype.Service;
-
-import java.util.concurrent.TimeUnit;
-
-@Slf4j
-@Service
-public class AiSessionContextService {
-
-    @Autowired
-    private StringRedisTemplate redisTemplate;
-
-    @Autowired
-    private DeepSeekService deepSeekService;
-
-    /**
-     * 更新会话上下文（步骤8）
-     */
-    public void updateContext(String userId, String conversationId,
-                              String userMessage, String aiResponse) {
-        try {
-            // 1. 获取当前上下文
-            String contextKey = "ai:session:context:" + conversationId;
-            String currentContext = redisTemplate.opsForValue().get(contextKey);
-
-            // 2. 使用DeepSeek处理用户意图
-            String intent = deepSeekService.extractIntent(userMessage, aiResponse);
-
-            // 3. 构建新的上下文
-            SessionContext newContext = SessionContext.builder()
-                    .userId(userId)
-                    .conversationId(conversationId)
-                    .intent(intent)
-                    .lastMessage(userMessage)
-                    .lastResponse(aiResponse)
-                    .updateTime(System.currentTimeMillis())
-                    .build();
-
-            // 4. 保存到Redis（1小时过期）
-            String contextJson = objectMapper.writeValueAsString(newContext);
-            redisTemplate.opsForValue().set(contextKey, contextJson, 1, TimeUnit.HOURS);
-
-            log.info("更新会话上下文成功，userId: {}, conversationId: {}", 
-                userId, conversationId);
-
-        } catch (Exception e) {
-            log.error("更新会话上下文失败，userId: {}", userId, e);
-            throw new RuntimeException("更新会话上下文失败", e);
-        }
-    }
-}
-```
-
----
-
-## 七、消息确认机制详解
-
-### 7.1 为什么需要手动ACK？
-
-**自动ACK的问题：**
-- 消息一旦被消费者接收，立即从队列删除
-- 如果消费者处理失败（异常、宕机），消息永久丢失
-- 无法保证消息被正确处理
-
-**手动ACK的优势：**
-- 消费者处理成功后才确认，RabbitMQ才删除消息
-- 处理失败可以NACK重新入队或进入死信队列
-- 保证消息至少被处理一次（At Least Once）
-
-### 7.2 三种确认方式
-
-```java
-// 1. basicAck - 确认消息（消息从队列删除）
-channel.basicAck(deliveryTag, false);
-// 参数说明：
-// - deliveryTag: 消息的唯一标识
-// - multiple: false表示只确认当前消息，true表示确认deliveryTag之前的所有消息
-
-// 2. basicNack - 拒绝消息（可选择是否重新入队）
-channel.basicNack(deliveryTag, false, true);
-// 参数说明：
-// - deliveryTag: 消息的唯一标识
-// - multiple: 是否批量拒绝
-// - requeue: true重新入队，false进入死信队列
-
-// 3. basicReject - 拒绝单条消息（不支持批量）
-channel.basicReject(deliveryTag, false);
-// 参数说明：
-// - deliveryTag: 消息的唯一标识
-// - requeue: true重新入队，false进入死信队列
-```
-
-### 7.3 消费者ACK流程图
-
-```
-消息到达消费者
-    ↓
-解析消息体
-    ↓
-幂等性检查 ──→ 已处理 ──→ basicAck（确认）
-    ↓ 未处理
-执行业务逻辑（步骤7 + 步骤8）
-    ↓
-    ├─→ 成功 ──→ basicAck（确认）
-    │
-    └─→ 失败 ──→ 检查重试次数
-                    ├─→ < 3次 ──→ basicNack(requeue=true) 重新入队
-                    └─→ >= 3次 ──→ basicNack(requeue=false) 进入死信队列
-```
-
-### 7.4 重试策略配置
-
-```java
-/**
- * 重试策略配置
- */
-@Configuration
-public class RabbitRetryConfig {
-
-    @Bean
-    public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
-            ConnectionFactory connectionFactory) {
-        
-        SimpleRabbitListenerContainerFactory factory = 
-            new SimpleRabbitListenerContainerFactory();
-        factory.setConnectionFactory(connectionFactory);
-        
-        // 手动ACK
-        factory.setAcknowledgeMode(AcknowledgeMode.MANUAL);
-        
-        // 预取数量：每次从队列取1条消息
-        factory.setPrefetchCount(1);
-        
-        // 并发消费者数量
-        factory.setConcurrentConsumers(3);
-        factory.setMaxConcurrentConsumers(10);
-        
-        return factory;
-    }
-}
-```
-
----
-
-## 八、消息持久化机制详解
-
-### 8.1 三层持久化保障
-
-RabbitMQ的消息持久化需要三个层面都配置：
-
-```
-1. 交换机持久化 (durable = true)
-   ↓
-2. 队列持久化 (durable = true)
-   ↓
-3. 消息持久化 (deliveryMode = PERSISTENT)
-```
-
-**只有三者都配置，消息才能在RabbitMQ重启后恢复！**
-
-### 8.2 持久化配置详解
-
-#### 8.2.1 交换机持久化
-
-```java
-@Bean
-public TopicExchange aiPostProcessExchange() {
-    return ExchangeBuilder
-            .topicExchange(EXCHANGE)
-            .durable(true)  // 交换机持久化
-            .build();
-}
-```
-
-#### 8.2.2 队列持久化
-
-```java
-@Bean
-public Queue aiPostProcessQueue() {
-    return QueueBuilder
-            .durable(QUEUE)  // 队列持久化
-            .build();
-}
-```
-
-#### 8.2.3 消息持久化
-
-```java
-// 方式1：通过MessageProperties设置
-MessageProperties properties = new MessageProperties();
-properties.setDeliveryMode(MessageDeliveryMode.PERSISTENT);  // 消息持久化
-Message message = new Message(body.getBytes(), properties);
-
-// 方式2：使用RabbitTemplate的convertAndSend（默认持久化）
-rabbitTemplate.convertAndSend(exchange, routingKey, message, msg -> {
-    msg.getMessageProperties().setDeliveryMode(MessageDeliveryMode.PERSISTENT);
-    return msg;
-});
-```
-
-### 8.3 持久化的性能影响
-
-| 配置 | TPS | 延迟 | 可靠性 |
-|------|-----|------|--------|
-| 全部非持久化 | 10000+ | <1ms | ❌ 重启丢失 |
-| 仅队列持久化 | 8000+ | 1-2ms | ❌ 消息丢失 |
-| 全部持久化 | 5000+ | 2-5ms | ✅ 完全可靠 |
-
-**权衡建议：**
-- 核心业务（订单、支付）：必须全部持久化
-- 非核心业务（日志、统计）：可以不持久化，提升性能
-- 我们的AI后处理任务：建议全部持久化（保证数据一致性）
-
-### 8.4 持久化验证
-
-```bash
-# 1. 查看队列是否持久化
-rabbitmqctl list_queues name durable
-
-# 2. 查看交换机是否持久化
-rabbitmqctl list_exchanges name durable
-
-# 3. 模拟RabbitMQ重启
-docker restart rabbitmq
-# 检查队列和消息是否还在
-```
-
----
-
-## 九、死信队列处理
-
-### 9.1 什么情况下消息进入死信队列？
-
-1. **消息被拒绝**（basicNack/basicReject）且 requeue=false
-2. **消息TTL过期**（x-message-ttl）
-3. **队列达到最大长度**（x-max-length）
-
-### 9.2 死信队列消费者
-
-```java
-package com.example.consumer;
-
-import com.example.config.AiPostProcessQueueConfig;
-import com.example.dto.AiPostProcessTask;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.rabbitmq.client.Channel;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.amqp.core.Message;
-import org.springframework.amqp.rabbit.annotation.RabbitListener;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Component;
-
-@Slf4j
-@Component
-public class AiPostProcessDlqConsumer {
-
-    @Autowired
-    private ObjectMapper objectMapper;
-
-    @Autowired
-    private AlarmService alarmService;
-
-    /**
-     * 消费死信队列消息（人工介入）
-     */
-    @RabbitListener(queues = AiPostProcessQueueConfig.DLQ)
-    public void handleDeadLetter(Message message, Channel channel) {
-        long deliveryTag = message.getMessageProperties().getDeliveryTag();
-        
-        try {
-            String body = new String(message.getBody());
-            AiPostProcessTask task = objectMapper.readValue(body, AiPostProcessTask.class);
-            
-            log.error("死信队列消息，userId: {}, traceId: {}, 原因: {}", 
-                task.getUserId(), 
-                task.getTraceId(),
-                message.getMessageProperties().getHeaders().get("x-first-death-reason"));
-
-            // 1. 记录到数据库（人工处理表）
-            saveToManualProcessTable(task, message);
-
-            // 2. 发送告警（钉钉、邮件、短信）
-            alarmService.sendAlarm(
-                "AI后处理任务失败",
-                String.format("userId: %s, traceId: %s", task.getUserId(), task.getTraceId())
-            );
-
-            // 3. 确认消息
-            channel.basicAck(deliveryTag, false);
-
-        } catch (Exception e) {
-            log.error("处理死信队列消息失败", e);
-            try {
-                channel.basicNack(deliveryTag, false, false);
-            } catch (Exception ackException) {
-                log.error("NACK失败", ackException);
-            }
-        }
-    }
-
-    /**
-     * 保存到人工处理表
-     */
-    private void saveToManualProcessTable(AiPostProcessTask task, Message message) {
-        // TODO: 保存到数据库，供人工排查和重试
-    }
-}
-```
-
-### 9.3 死信队列补偿任务
-
-```java
-package com.example.task;
-
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.stereotype.Component;
-
-@Slf4j
-@Component
-public class DeadLetterCompensateTask {
-
-    @Autowired
-    private ManualProcessMapper manualProcessMapper;
-
-    @Autowired
-    private AiPostProcessProducer postProcessProducer;
-
-    /**
-     * 每小时扫描一次人工处理表，重试失败的任务
-     */
-    @Scheduled(cron = "0 0 * * * ?")
-    public void compensateDeadLetters() {
-        log.info("开始扫描死信队列补偿任务");
-
-        // 查询待重试的任务（状态=待处理，创建时间>1小时）
-        List<ManualProcess> tasks = manualProcessMapper.selectPendingTasks();
-
-        for (ManualProcess task : tasks) {
-            try {
-                // 重新发送到MQ
-                postProcessProducer.sendPostProcessTask(
-                    task.getUserId(),
-                    task.getConversationId(),
-                    task.getUserMessage(),
-                    task.getAiResponse()
-                );
-
-                // 更新状态为已重试
-                manualProcessMapper.updateStatus(task.getId(), "RETRIED");
-
-                log.info("死信任务重试成功，taskId: {}", task.getId());
-
-            } catch (Exception e) {
-                log.error("死信任务重试失败，taskId: {}", task.getId(), e);
-            }
-        }
-    }
-}
-```
-
----
-
-## 十、监控和告警
-
-### 10.1 关键监控指标
-
-| 指标 | 说明 | 告警阈值 |
-|------|------|----------|
-| 队列消息堆积数 | 队列中待消费的消息数量 | > 1000 |
-| 消费速率 | 每秒消费的消息数 | < 10 |
-| 消费失败率 | 消费失败的消息占比 | > 5% |
-| 死信队列消息数 | 死信队列中的消息数量 | > 10 |
-| 消费者数量 | 当前活跃的消费者数量 | < 1 |
-| 消息平均处理时间 | 单条消息的平均处理时长 | > 30s |
-
-### 10.2 RabbitMQ管理界面监控
-
-```bash
-# 访问管理界面
-http://localhost:15672
-
-# 默认账号密码
-username: guest
-password: guest
-
-# 关键页面：
-# 1. Queues - 查看队列消息堆积、消费速率
-# 2. Connections - 查看连接数、通道数
-# 3. Exchanges - 查看交换机消息流量
-```
-
-### 10.3 自定义监控指标
-
-```java
-package com.example.monitor;
-
-import io.micrometer.core.instrument.Counter;
-import io.micrometer.core.instrument.MeterRegistry;
-import io.micrometer.core.instrument.Timer;
-import org.springframework.stereotype.Component;
-
-@Component
-public class AiPostProcessMetrics {
-
-    private final Counter successCounter;
-    private final Counter failureCounter;
-    private final Timer processTimer;
-
-    public AiPostProcessMetrics(MeterRegistry registry) {
-        this.successCounter = Counter.builder("ai.postprocess.success")
-                .description("AI后处理成功次数")
-                .tag("type", "postprocess")
-                .register(registry);
-
-        this.failureCounter = Counter.builder("ai.postprocess.failure")
-                .description("AI后处理失败次数")
-                .tag("type", "postprocess")
-                .register(registry);
-
-        this.processTimer = Timer.builder("ai.postprocess.duration")
-                .description("AI后处理耗时")
-                .tag("type", "postprocess")
-                .register(registry);
-    }
-
-    public void recordSuccess() {
-        successCounter.increment();
-    }
-
-    public void recordFailure() {
-        failureCounter.increment();
-    }
-
-    public Timer.Sample startTimer() {
-        return Timer.start();
-    }
-
-    public void recordDuration(Timer.Sample sample) {
-        sample.stop(processTimer);
-    }
-}
-```
-
-### 10.4 在消费者中使用监控
-
-```java
-@RabbitListener(queues = AiPostProcessQueueConfig.QUEUE)
-public void handlePostProcessTask(Message message, Channel channel) {
-    Timer.Sample sample = metrics.startTimer();
-    
-    try {
-        // 业务逻辑
-        // ...
-        
-        metrics.recordSuccess();
-        channel.basicAck(deliveryTag, false);
-        
-    } catch (Exception e) {
-        metrics.recordFailure();
-        channel.basicNack(deliveryTag, false, true);
-    } finally {
-        metrics.recordDuration(sample);
-    }
-}
-```
-
-### 10.5 告警规则配置（Prometheus + Grafana）
-
-```yaml
-# prometheus.yml
-groups:
-  - name: ai_postprocess_alerts
-    rules:
-      # 队列堆积告警
-      - alert: QueueBacklog
-        expr: rabbitmq_queue_messages{queue="ai.postprocess.queue"} > 1000
-        for: 5m
-        annotations:
-          summary: "AI后处理队列堆积"
-          description: "队列消息数: {{ $value }}"
-
-      # 消费失败率告警
-      - alert: HighFailureRate
-        expr: rate(ai_postprocess_failure_total[5m]) / rate(ai_postprocess_success_total[5m]) > 0.05
-        for: 5m
-        annotations:
-          summary: "AI后处理失败率过高"
-          description: "失败率: {{ $value }}"
-
-      # 死信队列告警
-      - alert: DeadLetterQueue
-        expr: rabbitmq_queue_messages{queue="ai.postprocess.queue.dlq"} > 10
-        for: 1m
-        annotations:
-          summary: "死信队列有消息"
-          description: "死信消息数: {{ $value }}"
-```
-
----
-
-## 十一、性能优化建议
-
-### 11.1 消费者并发配置
-
-```yaml
-spring:
-  rabbitmq:
-    listener:
-      simple:
-        # 并发消费者数量
-        concurrency: 3
-        # 最大并发消费者数量
-        max-concurrency: 10
-        # 预取数量（每个消费者一次取多少条消息）
         prefetch: 1
 ```
 
-**调优建议：**
-- 如果消息处理很快（<100ms），可以增加prefetch到5-10
-- 如果消息处理较慢（>1s），保持prefetch=1，避免消息堆积在消费者内存
-- 根据CPU核心数调整并发数：concurrency = CPU核心数 * 2
+交换机 `ai.postprocess`、工作队列 `ai.postprocess.queue`、DLX `ai.postprocess.dlx`、DLQ `ai.postprocess.queue.dlq` 可沿用为候选命名。交换机持久化保存路由实体，队列与消息持久化处理不同层次；这些设置不能代替 confirm、队列类型选择、恢复测试及业务幂等。
 
-### 11.2 批量处理优化
+`x-message-ttl=600000`、`x-max-length=10000` 是有损策略的触发条件，不能一边限制过期/长度一边保证“消息零丢失”。队列达到最大长度时默认行为是丢弃或死信队头消息，不是默认拒绝新消息；拒绝发布需要显式设置相应 overflow 策略并处理结果。见 [RabbitMQ 队列长度限制](https://www.rabbitmq.com/docs/maxlength)。任务表兜底时，还要测量最老任务年龄，避免队列看似正常而任务永久积压。
 
-如果步骤7和步骤8支持批量操作，可以改为批量消费：
+`basicNack(requeue=true)` 不会替应用递增自定义 `x-retry-count`。若每次收到的 header 都是 0，就永远达不到“三次后死信”；因此，重入队本身不构成有次数上限的重试。本文以任务表中的 attempt 和 nextAttemptAt 作为业务重试依据，退避上限、抖动与总时限由业务约束决定。
 
-```java
-@RabbitListener(queues = AiPostProcessQueueConfig.QUEUE)
-public void handlePostProcessTaskBatch(List<Message> messages, Channel channel) {
-    List<AiPostProcessTask> tasks = new ArrayList<>();
-    
-    for (Message message : messages) {
-        // 解析消息
-        tasks.add(parseMessage(message));
-    }
-    
-    // 批量保存记忆
-    memoryService.batchSaveMemory(tasks);
-    
-    // 批量更新上下文
-    sessionContextService.batchUpdateContext(tasks);
-    
-    // 批量ACK
-    for (Message message : messages) {
-        channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
-    }
-}
+设置消息 priority 但没有匹配队列类型/配置不能证明优先级生效。发送和解析统一 UTF-8；压缩需要实际替换消息 body、设置双方理解的编码头并限制解压大小，不是只设置 `contentEncoding=gzip`。批量监听还需相应容器配置与逐项恢复，不能只把方法参数改成 `List<Message>`。
+
+## 6. 死信、补偿和停机恢复
+
+DLQ 是异常投递的收集位置，不是业务成功终态。转入人工处理表必须真实落库成功，才能确认死信；人工处理表写入失败或仅作空操作后就 ACK，会让异常任务失去恢复入口。DLQ 消费失败再 `reject(requeue=false)`，如果没有下一层持久化恢复策略，可能丢弃消息。
+
+人工重试使用原 taskId、原参数摘要和新的 attempt，先查已有副作用与当前资料版本；不能生成新 UUID 绕过去重。对于已撤销授权、原文被删除或摘要 epoch 已变化的任务，应取消/跳过并记录原因，不照旧重放。
+
+补偿扫描覆盖 PENDING、到期 RETRY_WAIT 和租约过期 PROCESSING；领取采用数据库条件更新，只允许当前合法状态推进。失败次数达到上限直接转 MANUAL，不能停留在扫描条件永远选不到的 PENDING。告警失败不应导致业务状态回滚成未知，告警自身可以独立重试。
+
+部署演练需要覆盖消息/任务版本兼容、暂停新投递、在途领取回收及回滚后的扫描责任。停机恢复实验应在隔离环境中进行，观察重启后哪些状态会自动继续、哪些需要重新领取。
+
+## 7. 监控与容量评估
+
+业务完成率以 taskId 为单位，投递/尝试次数另计；否则一次任务失败两次后成功会被误当成三个不同业务请求。关注最老未完成任务年龄、子步骤失败、租约回收、冲突参数、重复效果抑制、人工待处理，以及摘要/索引新鲜度。
+
+失败率使用 `失败 / (成功 + 失败)`，不是 `失败 / 成功`。无请求时单独处理，不把无分母当零故障。并发数受上游配额、数据库连接池、任务耗时和顺序约束影响，不能固定用 `CPU核数 × 2`；prefetch 和批大小也应按实际负载测试。
+
+异步化的性能收益取决于关键路径、流量峰值与恢复时限。系统可恢复需要：任务不被错误终结、重试可推进、结果可查证，且人工恢复责任明确。
+
+## 8. 可运行教学实验：抢占不是完成
+
+将下面代码保存为 `postprocess_state_lab.py`，使用 Python 3.10+ 执行 `python3 postprocess_state_lab.py`。实验用单进程内存集合模拟“幂等效果与完成凭据原子记录”；**不模拟数据库事务、RabbitMQ、租约或外部网络结果不明**。学习时先观察状态转换，再思考真实事务、租约与外部副作用如何满足同样的约束。
+
+```python
+import unittest
+
+
+class TaskModel:
+    def __init__(self):
+        self.payloads = {}
+        self.effects = set()
+        self.done = set()
+
+    def deliver(self, task_id, payload, fail_after_memory=False):
+        if task_id in self.payloads and self.payloads[task_id] != payload:
+            raise ValueError("同一任务身份的参数冲突")
+        self.payloads[task_id] = payload
+        if task_id in self.done:
+            return "ACK"
+        # 集合操作代表资源端幂等效果，真实系统须有对应事务/唯一约束。
+        self.effects.add((task_id, "memory"))
+        if fail_after_memory:
+            return "RETRY_WAIT"
+        self.effects.add((task_id, "context"))
+        self.done.add(task_id)
+        return "ACK"
+
+
+class StateTests(unittest.TestCase):
+    def test_old_premark_loses_work(self):
+        claimed = set()
+        effects = []
+
+        def old_deliver():
+            if "t1" in claimed:
+                return "ACK"
+            claimed.add("t1")
+            # 模拟业务在第一次实际写入前失败。
+            return "NACK"
+
+        self.assertEqual(old_deliver(), "NACK")
+        self.assertEqual(old_deliver(), "ACK")
+        self.assertEqual(effects, [])  # 复现错误：已确认但业务没有执行。
+
+    def test_partial_failure_then_retry(self):
+        model = TaskModel()
+        self.assertEqual(model.deliver("t1", "v1", True), "RETRY_WAIT")
+        self.assertNotIn("t1", model.done)
+        self.assertEqual(model.deliver("t1", "v1"), "ACK")
+        self.assertEqual(model.effects, {("t1", "memory"), ("t1", "context")})
+
+    def test_duplicate_after_ack_lost(self):
+        model = TaskModel()
+        model.deliver("t1", "v1")
+        before = model.effects.copy()
+        self.assertEqual(model.deliver("t1", "v1"), "ACK")
+        self.assertEqual(model.effects, before)
+
+    def test_payload_conflict(self):
+        model = TaskModel()
+        model.deliver("t1", "v1")
+        with self.assertRaises(ValueError):
+            model.deliver("t1", "v2")
+        self.assertEqual(len(model.effects), 2)
+
+    def test_new_task_is_not_duplicate(self):
+        model = TaskModel()
+        model.deliver("t1", "v1")
+        model.deliver("t2", "v1")
+        self.assertEqual(len(model.effects), 4)
+        self.assertEqual(model.done, {"t1", "t2"})
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
 ```
 
-### 11.3 消息压缩
-
-如果消息体较大（>1KB），可以启用压缩：
-
-```java
-// 发送时压缩
-byte[] compressed = compress(messageBody);
-message.getMessageProperties().setContentEncoding("gzip");
-
-// 消费时解压
-if ("gzip".equals(message.getMessageProperties().getContentEncoding())) {
-    body = decompress(message.getBody());
-}
-```
-
----
-
-## 十二、常见问题和解决方案
-
-### 12.1 消息丢失问题
-
-**问题：** 消息发送后，RabbitMQ宕机，消息丢失
-
-**解决方案：**
-1. 开启消息持久化（deliveryMode = PERSISTENT）
-2. 开启发送确认（publisher-confirm）
-3. 开启事务（性能较差，不推荐）
-
-### 12.2 消息重复消费问题
-
-**问题：** 消费者处理成功但ACK失败，消息被重复消费
-
-**解决方案：**
-1. 幂等性设计（使用messageId + Redis去重）
-2. 数据库唯一索引（防止重复插入）
-3. 业务层面幂等（检查是否已处理）
-
-### 12.3 消息顺序问题
-
-**问题：** 同一用户的消息需要按顺序处理
-
-**解决方案：**
-1. 使用单个消费者（性能差）
-2. 按userId分片到不同队列
-3. 使用分布式锁（同一用户的消息串行处理）
-
-```java
-// 方案3：分布式锁
-String lockKey = "ai:postprocess:lock:" + task.getUserId();
-RLock lock = redisson.getLock(lockKey);
-
-try {
-    lock.lock(30, TimeUnit.SECONDS);
-    // 处理消息
-} finally {
-    lock.unlock();
-}
-```
-
-### 12.4 队列堆积问题
-
-**问题：** 消费速度跟不上生产速度，队列堆积
-
-**解决方案：**
-1. 增加消费者数量（水平扩展）
-2. 优化消费者处理逻辑（减少耗时）
-3. 使用批量处理
-4. 设置队列最大长度（x-max-length），超出后拒绝新消息
-
----
-
-## 十三、面试要点总结
-
-### 13.1 核心亮点
-
-1. **异步解耦**：步骤6完成后立即返回，响应速度提升50%+
-2. **可靠性保障**：三层持久化 + 手动ACK + 死信队列，消息零丢失
-3. **并行处理**：步骤7和步骤8在消费者中并行执行，提升吞吐量
-4. **失败重试**：自动重试3次 + 死信队列 + 人工补偿，保证最终一致性
-5. **幂等性设计**：使用messageId + Redis去重，防止重复消费
-
-### 13.2 面试问答
-
-**Q1：为什么用RabbitMQ而不是线程池？**
-- 持久化：服务重启不丢失
-- 重试机制：自动重试 + 死信队列
-- 监控：管理界面 + 指标监控
-- 削峰填谷：队列缓冲高峰流量
-
-**Q2：如何保证消息不丢失？**
-- 交换机持久化（durable=true）
-- 队列持久化（durable=true）
-- 消息持久化（deliveryMode=PERSISTENT）
-- 手动ACK（处理成功才确认）
-- 发送确认（publisher-confirm）
-
-**Q3：如何保证消息不重复消费？**
-- 幂等性设计：messageId + Redis去重
-- 数据库唯一索引
-- 业务层面检查（是否已处理）
-
-**Q4：消息处理失败怎么办？**
-- 重试3次（basicNack + requeue=true）
-- 进入死信队列（basicNack + requeue=false）
-- 人工补偿任务（定时扫描死信队列）
-
-**Q5：如何监控队列健康状态？**
-- 队列消息堆积数
-- 消费速率和失败率
-- 死信队列消息数
-- 消费者数量和处理时长
-- Prometheus + Grafana告警
-
----
-
-## 十四、完整代码仓库结构
-
-```
-src/main/java/com/example/
-├── config/
-│   ├── AiPostProcessQueueConfig.java      # 队列配置
-│   └── RabbitRetryConfig.java             # 重试配置
-├── dto/
-│   └── AiPostProcessTask.java             # 消息体
-├── service/
-│   ├── AiChatService.java                 # AI对话服务
-│   ├── AiPostProcessProducer.java         # 消息生产者
-│   ├── AiMemoryService.java               # 步骤7：保存记忆
-│   └── AiSessionContextService.java       # 步骤8：更新上下文
-├── consumer/
-│   ├── AiPostProcessConsumer.java         # 消息消费者
-│   └── AiPostProcessDlqConsumer.java      # 死信队列消费者
-├── task/
-│   └── DeadLetterCompensateTask.java      # 死信补偿任务
-└── monitor/
-    └── AiPostProcessMetrics.java          # 监控指标
-```
-
----
-
-## 十五、总结
-
-本方案通过RabbitMQ实现了AI消息后处理的异步化，核心优势：
-
-1. **性能提升**：响应速度提升50%+，用户体验更好
-2. **可靠性高**：三层持久化 + 手动ACK，消息零丢失
-3. **容错能力强**：自动重试 + 死信队列 + 人工补偿
-4. **可监控**：完善的监控指标和告警机制
-5. **可扩展**：水平扩展消费者，轻松应对流量增长
-
-**适用场景：**
-- 核心业务的异步处理（订单、支付、通知）
-- 需要保证消息可靠性的场景
-- 需要失败重试和补偿的场景
-- 需要监控和告警的生产环境
-
+**运行结果**：在 Python 3.12.9 下运行，5 项测试全部通过。其中旧方案测试确认复现“失败后重投被 ACK，但效果为空”的错误，其余验证内存模型的部分完成恢复、重复投递、参数冲突与新任务区分。真实服务仍需注入“任务提交后发布前宕机、外部成功后状态提交失败、重复/冲突消息、租约到期旧 worker 返回、DLQ 落库失败、停机后重新扫描”等故障，断言业务状态和副作用次数，不能只看日志或队列变空。
