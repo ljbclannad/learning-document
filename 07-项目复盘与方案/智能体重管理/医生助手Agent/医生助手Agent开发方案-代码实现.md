@@ -1,5 +1,23 @@
 # 医生助手ReAct Agent开发方案 - 代码实现篇
 
+> **材料状态（2026-10-29 复查）**：本文属于设计方案与示例材料，不是上线验收报告。当前知识库未找到本方案对应的可构建 Java 应用及联调记录，不能据此判断外部项目是否已实现。能力状态统一见 [[医生助手Agent开发方案-总览#能力状态与证据边界]]；新增机制属于可选演进，不能视为已经接入。
+
+> **术语约定**：Function Calling / Tool Calling 是工具调用机制，可用于固定工作流，也可用于 Agent 循环。示例中的 `Thought`、`THOUGHT`、`thinking` 是历史字段名，仅表示面向用户的简短行动说明或证据摘要，不代表模型内部思维链；`Observation` 应由执行系统根据真实工具结果写入，不能由模型编造。
+
+
+## 示例范围与待补齐项
+
+本文是分模块设计代码，不是可以直接编译运行的完整工程。仅确认片段出现了相关逻辑，不能据此标为业务已实现：
+
+- `registerTools` 展示 5 个注册项；13 个是设计清单。`sendReminder` 未调用发送服务，`draftPrescription` 返回 `null`。
+- `continueExecution` 循环体被省略，且以 `history.size()` 当步数会混淆事件数与决策轮次；`resume` 还重复追加 Observation。审批恢复尚不完整。
+- `AgentResult` 缺少调用处使用的若干成员/工厂方法，`pendingTaskService`、`TextBlock` 等依赖或类型未完整给出；本次不宣称 Java 构建通过。
+- `inputSchema` 是描述性 Map，执行器没有展示标准 Schema 校验、患者/租户绑定和主体鉴权。`doctorId` 等请求参数不能代替认证身份。
+- 审批只有状态更新示意，缺少过期、归属、条件转换、执行幂等和结果不明时查证。`APPROVED` 不能等同于动作已成功。
+- 配置、超时和并发约束尚未完整接入引擎；类名或配置项存在不代表已生效。原 `application.yml` 还重复定义顶层 `agent`，落地前需合并并校验实际绑定。
+
+新增机制统一按 [[医生助手Agent开发方案#十、可选演进方向与验收条件]] 评估，本文不伪装为已经接入动态发现、模型侧异步或托管运行时。
+
 ## 一、核心数据模型
 
 ### 1.1 Agent执行相关
@@ -407,9 +425,9 @@ public class ReActPromptBuilder {
             
             ## 工作模式：ReAct (Reasoning + Acting)
             
-            你需要按照以下格式进行思考和行动：
+            请使用以下教学文本协议输出简短行动说明和工具请求；不要输出内部逐步思维过程：
             
-            Thought: [你对当前情况的分析和下一步计划]
+            Thought: [一句话说明下一步动作及已有证据，不输出内部思维链]
             Action: [你决定调用的工具]
             Action Input: [工具的输入参数，JSON格式]
             
@@ -419,7 +437,7 @@ public class ReActPromptBuilder {
             你可以重复多次 Thought -> Action -> Observation 循环，直到你有足够信息完成任务。
             
             当你准备好给出最终答案时，使用：
-            Thought: [最终分析]
+            Thought: [简短完成说明]
             Final Answer: [你的完整回答]
             
             ## 可用工具
@@ -432,7 +450,7 @@ public class ReActPromptBuilder {
             2. **有的放矢**：只调用真正需要的工具，不要盲目查询所有数据
             3. **关注异常**：重点关注风险信号（体重异常、负面情绪、长期未打卡）
             4. **医疗谨慎**：涉及诊断和处方时，必须基于充分证据
-            5. **解释推理**：在Thought中清晰说明你的推理过程
+            5. **行动说明**：Thought仅提供简短动作依据；Observation由执行系统写入，不得伪造
             
             ## 示例
             
@@ -1391,7 +1409,7 @@ public enum ResultStatus {
 }
 
 public enum StepType {
-    THOUGHT,      // 思考
+    THOUGHT,      // 简短行动说明；不是内部思维链
     ACTION,       // 行动
     OBSERVATION   // 观察
 }
@@ -1430,8 +1448,8 @@ public class AgentException extends RuntimeException {
 
 **关键点：**
 1. **System Prompt设计**：明确告诉Claude使用ReAct格式
-2. **响应解析**：准确提取Thought、Action、Observation
-3. **状态管理**：保存完整的执行历史，支持暂停/恢复
+2. **响应解析**：解析行动说明、工具名和参数；Observation 由工具执行器产生
+3. **状态管理**：提供执行历史保存示例；恢复循环仍需补齐并验证
 4. **错误处理**：处理解析失败、工具执行失败等异常
 
 ### 15.2 风险控制机制
@@ -1442,7 +1460,7 @@ public class AgentException extends RuntimeException {
 3. **待确认任务**：高风险操作创建任务，暂停Agent
 4. **审计日志**：记录所有中高风险操作
 
-### 15.3 会话管理
+### 15.3 会话管理（设计要求，未全部实现）
 
 **关键点：**
 1. **状态持久化**：将执行历史保存到数据库
@@ -1450,7 +1468,7 @@ public class AgentException extends RuntimeException {
 3. **超时处理**：会话超时自动失败
 4. **并发控制**：同一患者同时只能有一个活跃会话
 
-### 15.4 性能优化
+### 15.4 性能优化（候选措施，未证明接入主循环）
 
 **关键点：**
 1. **并发执行**：独立工具可以并发调用
@@ -1460,8 +1478,8 @@ public class AgentException extends RuntimeException {
 
 ---
 
-**代码实现篇完成，包含：**
-- 完整的ReAct Agent核心代码
+**本文提供以下示例材料，仍需补齐依赖、业务实现和验证：**
+- ReAct Agent 主循环及未完成的恢复接口示例
 - 工具系统实现
 - 风险控制机制
 - Controller/Service层
@@ -1471,5 +1489,5 @@ public class AgentException extends RuntimeException {
 
 ---
 
-**最后更新：** 2026-05-18  
-**文档版本：** v2.0 (ReAct Agent版本)
+**最后更新：** 2026-10-29  
+**文档版本：** v2.1（概念与能力状态校订）
