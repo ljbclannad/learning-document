@@ -1,4 +1,4 @@
-# RabbitMQ + Outbox模式生产级实现方案
+# RabbitMQ 与 Outbox 可靠消息方案
 
 ## 一、方案概述
 
