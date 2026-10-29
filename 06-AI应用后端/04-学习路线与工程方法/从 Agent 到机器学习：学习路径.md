@@ -115,7 +115,7 @@ Embedding 将文本、图片或其他对象映射为固定维度的向量，使�
 
 不必一开始推导所有矩阵公式，但要形成正确直觉：
 
-- Tokenizer 把文本映射成 token ID；详情见 [[06-AI应用后端/机器学习/LLM|LLM]]。
+- Tokenizer 把文本映射成 token ID；详情见 [[06-AI应用后端/01-模型基础/LLM|LLM]]。
 - Embedding 将 token ID 映射为向量，位置编码提供序列位置信息。
 - Self-attention 允许每个 token 根据其他 token 的表示聚合信息；多头注意力学习不同的关联模式。
 - Transformer 层反复进行注意力、前馈网络、残差连接与归一化，最终得到用于预测下一个 token 的表示。
@@ -199,4 +199,4 @@ Embedding 将文本、图片或其他对象映射为固定维度的向量，使�
 
 - [[Agent（智能体）|Agent（智能体）]]：任务型 Agent 的状态、工具边界、安全与评测。
 - [[RAG|RAG]]：知识库构建、检索、重排与生成。
-- [[06-AI应用后端/机器学习/LLM|LLM]]：Tokenization、Transformer 与大模型基础。
+- [[06-AI应用后端/01-模型基础/LLM|LLM]]：Tokenization、Transformer 与大模型基础。
