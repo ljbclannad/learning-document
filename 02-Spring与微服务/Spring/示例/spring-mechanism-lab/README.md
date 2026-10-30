@@ -51,3 +51,5 @@ mvn -f '02-Spring与微服务/Spring/示例/spring-mechanism-lab/pom.xml' -Dtest
 - 固定版本用于重现机制，不是依赖安全维护或生产升级建议。
 
 关联正文：[[02-Spring与微服务/Spring/Spring核心原理|核心原理]] · [[02-Spring与微服务/Spring/SpringBoot|Boot]] · [[02-Spring与微服务/Spring/SpringMVC|MVC]]。
+
+所有实验入口见 [[00-索引与面试/Java后端技术大纲#10. 配套实验入口]]。

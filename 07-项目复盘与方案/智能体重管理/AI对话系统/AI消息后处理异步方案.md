@@ -125,80 +125,12 @@ DLQ 是异常投递的收集位置，不是业务成功终态。转入人工处�
 
 ## 8. 可运行教学实验：抢占不是完成
 
-将下面代码保存为 `postprocess_state_lab.py`，使用 Python 3.10+ 执行 `python3 postprocess_state_lab.py`。实验用单进程内存集合模拟“幂等效果与完成凭据原子记录”；**不模拟数据库事务、RabbitMQ、租约或外部网络结果不明**。学习时先观察状态转换，再思考真实事务、租约与外部副作用如何满足同样的约束。
+配套脚本使用 Python 3.10+ 标准库运行。实验用单进程内存集合模拟“幂等效果与完成凭据原子记录”；**不模拟数据库事务、RabbitMQ、租约或外部网络结果不明**。学习时先观察状态转换，再思考真实事务、租约与外部副作用如何满足同样的约束。
 
-```python
-import unittest
+完整源码见 [后处理状态实验](./实验/后处理状态实验.py)；环境、副作用与运行说明见 [配套实验说明](./实验/README.md)。在仓库根目录执行：
 
-
-class TaskModel:
-    def __init__(self):
-        self.payloads = {}
-        self.effects = set()
-        self.done = set()
-
-    def deliver(self, task_id, payload, fail_after_memory=False):
-        if task_id in self.payloads and self.payloads[task_id] != payload:
-            raise ValueError("同一任务身份的参数冲突")
-        self.payloads[task_id] = payload
-        if task_id in self.done:
-            return "ACK"
-        # 集合操作代表资源端幂等效果，真实系统须有对应事务/唯一约束。
-        self.effects.add((task_id, "memory"))
-        if fail_after_memory:
-            return "RETRY_WAIT"
-        self.effects.add((task_id, "context"))
-        self.done.add(task_id)
-        return "ACK"
-
-
-class StateTests(unittest.TestCase):
-    def test_old_premark_loses_work(self):
-        claimed = set()
-        effects = []
-
-        def old_deliver():
-            if "t1" in claimed:
-                return "ACK"
-            claimed.add("t1")
-            # 模拟业务在第一次实际写入前失败。
-            return "NACK"
-
-        self.assertEqual(old_deliver(), "NACK")
-        self.assertEqual(old_deliver(), "ACK")
-        self.assertEqual(effects, [])  # 复现错误：已确认但业务没有执行。
-
-    def test_partial_failure_then_retry(self):
-        model = TaskModel()
-        self.assertEqual(model.deliver("t1", "v1", True), "RETRY_WAIT")
-        self.assertNotIn("t1", model.done)
-        self.assertEqual(model.deliver("t1", "v1"), "ACK")
-        self.assertEqual(model.effects, {("t1", "memory"), ("t1", "context")})
-
-    def test_duplicate_after_ack_lost(self):
-        model = TaskModel()
-        model.deliver("t1", "v1")
-        before = model.effects.copy()
-        self.assertEqual(model.deliver("t1", "v1"), "ACK")
-        self.assertEqual(model.effects, before)
-
-    def test_payload_conflict(self):
-        model = TaskModel()
-        model.deliver("t1", "v1")
-        with self.assertRaises(ValueError):
-            model.deliver("t1", "v2")
-        self.assertEqual(len(model.effects), 2)
-
-    def test_new_task_is_not_duplicate(self):
-        model = TaskModel()
-        model.deliver("t1", "v1")
-        model.deliver("t2", "v1")
-        self.assertEqual(len(model.effects), 4)
-        self.assertEqual(model.done, {"t1", "t2"})
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+```sh
+python3 '07-项目复盘与方案/智能体重管理/AI对话系统/实验/后处理状态实验.py'
 ```
 
 **运行结果**：在 Python 3.12.9 下运行，5 项测试全部通过。其中旧方案测试确认复现“失败后重投被 ACK，但效果为空”的错误，其余验证内存模型的部分完成恢复、重复投递、参数冲突与新任务区分。真实服务仍需注入“任务提交后发布前宕机、外部成功后状态提交失败、重复/冲突消息、租约到期旧 worker 返回、DLQ 落库失败、停机后重新扫描”等故障，断言业务状态和副作用次数，不能只看日志或队列变空。
