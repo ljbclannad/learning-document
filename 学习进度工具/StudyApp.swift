@@ -32,6 +32,8 @@ struct Snapshot: Codable {
         root = UserDefaults.standard.string(forKey: "planRoot") ?? (Bundle.main.object(forInfoDictionaryKey: "StudyPlanRoot") as? String ?? "")
         load()
         if CommandLine.arguments.contains("--check") {
+            do { try ImageAttachments.check() }
+            catch { print("图片检查失败：\(error)"); exit(1) }
             if let snapshot {
                 // 验证实际计划的展示文案，且不改动传给存储层的原始值。
                 let labels = snapshot.weeks.flatMap { w in [w.title] + w.days.flatMap { d in [d.title] + d.tasks.map(\.text) } }
@@ -78,6 +80,47 @@ struct Snapshot: Codable {
         }
         return try JSONDecoder().decode(Snapshot.self, from: data)
     }
+    func checkEvidencePreview() {
+        precondition(EvidenceRenderer.blocks("~~~sql\nSELECT 1;\n~~~") == [.code("sql", "SELECT 1;")])
+        precondition(EvidenceRenderer.blocks("```\na\n\n    b") == [.code("", "a\n\n    b")])
+        precondition(EvidenceRenderer.blocks("````md\n```\n````") == [.code("md", "```")])
+        precondition(EvidenceRenderer.blocks("```java\r\n    run();\r\n```\r\n后文") == [.code("java", "    run();"), .prose("后文")])
+        precondition(EvidenceRenderer.blocks("```java\na\n```\n```sql\nb\n```") == [.code("java", "a"), .code("sql", "b")])
+        guard draft != nil else { print(message); exit(1) }
+        if CommandLine.arguments.contains("--from-document") {
+            select(0, 0, confirm: false)
+        } else {
+            draft!.records["代码、图、实验或问答证据"] = "示例说明\n\n```java\nif (ready) {\n    run();\n}\n```\n\n验证完成"
+        }
+        let expectedCodes = EvidenceRenderer.blocks(draft!.records["代码、图、实验或问答证据"] ?? "").compactMap { block -> String? in
+            if case .code(_, let code) = block, !code.isEmpty { return code }
+            return nil
+        }
+        let host = NSHostingView(rootView: ContentView(model: self).editor("代码、图、实验或问答证据", weekly: false))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 650, height: 420), styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        func textViews(_ view: NSView) -> [NSTextView] {
+            (view as? NSTextView).map { [$0] } ?? view.subviews.flatMap(textViews)
+        }
+        let views = textViews(host)
+        guard let preview = views.first, !expectedCodes.isEmpty,
+              expectedCodes.allSatisfy({ preview.string.contains($0) }), !preview.string.contains("```") else {
+            print("失败：证据模块显示了代码围栏原文，或未保留代码缩进。")
+            exit(1)
+        }
+        for code in expectedCodes {
+        let range = (preview.string as NSString).range(of: code)
+        guard let font = preview.textStorage?.attribute(.font, at: range.location, effectiveRange: nil) as? NSFont,
+              font.fontDescriptor.symbolicTraits.contains(.monoSpace) else {
+            print("失败：代码没有使用等宽字体。")
+            exit(1)
+        }
+        }
+        print("通过：实际证据视图完整展示 \(expectedCodes.count) 个代码块，隐藏围栏、保留缩进，并使用等宽代码字体。")
+        exit(0)
+    }
     func mayDiscard() -> Bool {
         if !dirty { return true }
         let alert = NSAlert()
@@ -106,6 +149,19 @@ struct Snapshot: Codable {
         week = w; day = d; draft = snapshot.weeks[w].days[d]; review = snapshot.weeks[w].review
         hours = draft!.hours.map { String(format: "%g", $0) } ?? ""
         dirty = false
+    }
+    func adjacentDay(_ offset: Int) -> (week: Int, day: Int)? {
+        guard let snapshot else { return nil }
+        let positions = snapshot.weeks.enumerated().flatMap { w, value in
+            value.days.indices.map { (week: w, day: $0) }
+        }
+        guard let current = positions.firstIndex(where: { $0.week == week && $0.day == day }),
+              positions.indices.contains(current + offset) else { return nil }
+        return positions[current + offset]
+    }
+    func moveDay(_ offset: Int) {
+        guard let target = adjacentDay(offset) else { return }
+        select(target.week, target.day)
     }
     func change(_ action: (inout StudyDay) -> Void) {
         guard var value = draft else { return }; action(&value); draft = value; dirty = true
@@ -159,6 +215,7 @@ struct Snapshot: Codable {
 struct ContentView: View {
     @ObservedObject var model: StudyModel
     @AppStorage("compactWorkspace") private var compactWorkspace = true
+    @AppStorage("sidebarVisible") private var sidebarVisible = true
     let accent = Color(red: 0.15, green: 0.42, blue: 0.32)
     func field(_ key: WritableKeyPath<StudyDay, String>) -> Binding<String> {
         Binding(get: { model.draft?[keyPath: key] ?? "" }, set: { value in model.change { $0[keyPath: key] = value } })
@@ -171,9 +228,18 @@ struct ContentView: View {
     }
     var body: some View {
         HSplitView {
-            sidebar
+            if sidebarVisible { sidebar }
             detail
         }.frame(minWidth: 930, minHeight: 700).textFieldStyle(.roundedBorder)
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button { sidebarVisible.toggle() } label: {
+                    Label(sidebarVisible ? "隐藏侧边栏" : "显示侧边栏", systemImage: "sidebar.left")
+                }
+                .keyboardShortcut("s", modifiers: [.command, .control])
+                .help(sidebarVisible ? "隐藏侧边栏（⌃⌘S）" : "显示侧边栏（⌃⌘S）")
+            }
+        }
     }
     private var sidebar: some View {
 VStack(alignment: .leading, spacing: 18) {
@@ -220,20 +286,32 @@ VStack(spacing: 0) {
                                 }
                             }
                             dayFields(d, s)
-                            tasksView(d)
+                            GroupBox {
+                                editor("我的解释或答案要点", weekly: false).padding(12)
+                            }
                             if !compactWorkspace {
-                            GroupBox("实践笔记") {
+                            GroupBox("学习记录") {
                                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading, spacing: 18) {
-                                    ForEach(s.recordLabels, id: \.self) { label in editor(label, weekly: false) }
+                                    ForEach(s.recordLabels.filter { $0 != "代码、图、实验或问答证据" && $0 != "我的解释或答案要点" }, id: \.self) { label in editor(label, weekly: false) }
                                 }.padding(12)
                             }
+                            } else {
+                                Label("关闭侧栏的简洁视图，可编辑其余实践笔记与周总结。", systemImage: "text.book.closed").font(.caption).foregroundStyle(.secondary)
+                            }
+                            if !compactWorkspace {
+                            GroupBox("实践笔记") {
+                                VStack(alignment: .leading, spacing: 18) {
+                                editor("代码、图、实验或问答证据", weekly: false)
+                                }.padding(12)
+                            }
+                            }
+                            tasksView(d)
+                            if !compactWorkspace {
                             DisclosureGroup("本周复盘") {
                                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 18) {
                                     ForEach(s.reviewLabels, id: \.self) { label in editor(label, weekly: true) }
                                 }.padding(.top, 12)
                             }
-                            } else {
-                                Label("关闭侧栏的简洁视图，可编辑实践笔记与周总结。", systemImage: "text.book.closed").font(.caption).foregroundStyle(.secondary)
                             }
                             DisclosureGroup("本周阅读入口") {
                                 VStack(alignment: .leading, spacing: 8) {
@@ -256,6 +334,21 @@ VStack(spacing: 0) {
                         Text(model.message).font(.caption).foregroundStyle(model.error ? .red : .secondary).textSelection(.enabled)
                     }
                     Spacer()
+                            HStack {
+                                Button { model.moveDay(-1) } label: {
+                                    Label("前一天", systemImage: "chevron.left")
+                                }
+                                .disabled(model.adjacentDay(-1) == nil)
+                                .help("前一天（⌘⌥←），支持跨周切换")
+                                Button { model.moveDay(1) } label: {
+                                    HStack(spacing: 5) {
+                                        Text("后一天")
+                                        Image(systemName: "chevron.right")
+                                    }
+                                }
+                                .disabled(model.adjacentDay(1) == nil)
+                                .help("后一天（⌘⌥→），支持跨周切换")
+                            }.buttonStyle(.bordered)
                     Button("重新加载") { if model.mayDiscard() { model.load() } }
                     Button("保存到文档") { model.save() }.buttonStyle(.borderedProminent).tint(accent).keyboardShortcut("s").disabled(model.draft == nil)
                 }.padding(18)
@@ -297,7 +390,13 @@ GroupBox("今日安排") {
     func editor(_ label: String, weekly: Bool) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(Presentation.text(label)).font(.callout).foregroundStyle(.secondary)
+            if label == "代码、图、实验或问答证据" && !weekly {
+                EvidenceEditor(source: note(label, weekly: weekly), root: model.root)
+            } else if label == "我的解释或答案要点" && !weekly {
+                ReflectionNotesEditor(source: note(label), root: model.root)
+            } else {
             TextEditor(text: note(label, weekly: weekly)).font(.body).frame(height: 95).padding(5).background(Color(nsColor: .textBackgroundColor)).clipShape(RoundedRectangle(cornerRadius: 6)).overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.2)))
+            }
         }
     }
     static let dateFormat: DateFormatter = {
@@ -307,6 +406,13 @@ GroupBox("今日安排") {
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var model: StudyModel?
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--check-markdown") { NotesMarkdown.check() }
+        if CommandLine.arguments.contains("--check-evidence") {
+            let testModel = StudyModel()
+            testModel.checkEvidencePreview()
+        }
+    }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply { model?.mayDiscard() == false ? .terminateCancel : .terminateNow }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func windowShouldClose(_ sender: NSWindow) -> Bool { model?.mayDiscard() ?? true }
@@ -326,6 +432,14 @@ GroupBox("今日安排") {
         }.defaultSize(width: 1150, height: 840)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            CommandMenu("学习日") {
+                Button("前一天") { model.moveDay(-1) }
+                    .keyboardShortcut(.leftArrow, modifiers: [.command, .option])
+                    .disabled(model.adjacentDay(-1) == nil)
+                Button("后一天") { model.moveDay(1) }
+                    .keyboardShortcut(.rightArrow, modifiers: [.command, .option])
+                    .disabled(model.adjacentDay(1) == nil)
+            }
             CommandGroup(after: .saveItem) { Button("选择学习计划文件夹…") { model.chooseFolder() } }
         }
     }

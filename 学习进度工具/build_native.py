@@ -22,11 +22,18 @@ empty = build / 'empty.modulemap'
 empty.write_text('// 本次构建忽略重复的旧模块定义。\n')
 overlay = build / 'overlay.json'
 overlay.write_text(json.dumps({'version': 0, 'roots': [{'type': 'file', 'name': '/Library/Developer/CommandLineTools/usr/include/swift/module.modulemap', 'external-contents': str(empty)}]}))
-subprocess.run(["xcrun", "swiftc", "-parse-as-library", "-target", "arm64-apple-macosx14.0", '-vfsoverlay', str(overlay), '-Xcc', '-ivfsoverlay', '-Xcc', str(overlay), "-O", str(root / "StudyApp.swift"), str(root / "Presentation.swift"), "-o", str(contents / "MacOS/StudyProgress"), "-framework", "SwiftUI", "-framework", "AppKit"], check=True)
+subprocess.run(["xcrun", "swiftc", "-parse-as-library", "-target", "arm64-apple-macosx14.0", '-vfsoverlay', str(overlay), '-Xcc', '-ivfsoverlay', '-Xcc', str(overlay), "-O", str(root / "StudyApp.swift"), str(root / "Presentation.swift"), str(root / "EvidenceView.swift"), str(root / "ImageAttachments.swift"), str(root / "MarkdownNotes.swift"), "-o", str(contents / "MacOS/StudyProgress"), "-framework", "SwiftUI", "-framework", "AppKit"], check=True)
 for name in ["native_bridge.py", "server.py"]:
     shutil.copy2(root / name, contents / "Resources" / name)
+iconset = build / 'StudyIcon.iconset'
+iconset.mkdir(exist_ok=True)
+icon_drawer = build / 'draw-icon'
+subprocess.run(['xcrun', 'swiftc', '-vfsoverlay', str(overlay), '-Xcc', '-ivfsoverlay', '-Xcc', str(overlay), str(root / 'Assets/DrawIcon.swift'), '-o', str(icon_drawer), '-framework', 'AppKit'], check=True)
+subprocess.run([str(icon_drawer), str(iconset)], check=True)
+subprocess.run(['iconutil', '-c', 'icns', str(iconset), '-o', str(contents / 'Resources/StudyIcon.icns')], check=True)
 info = dict(CFBundleName="研习手记", CFBundleDisplayName="研习手记", CFBundleIdentifier="local.learning.study-progress", CFBundleVersion="2", CFBundleShortVersionString="1.1", CFBundlePackageType="APPL", CFBundleExecutable="StudyProgress", NSHighResolutionCapable=True, LSMinimumSystemVersion="14.0", StudyPlanRoot=str(root.parent / "00-索引与面试/AI应用后端三个月复习"))
 with (contents / "Info.plist").open("wb") as file:
+    info['CFBundleIconFile'] = 'StudyIcon'
     plistlib.dump(info, file)
 subprocess.run(["codesign", "--force", "--sign", "-", str(app)], check=True)
 subprocess.run([str(contents / 'MacOS/StudyProgress'), '--check'], check=True)

@@ -20,7 +20,7 @@ STATUSES = ["未开始", "学习中", "待复习", "已完成"]
 LEVELS = ["未评估", "需提示", "可独立解释", "可动手验证", "可应对追问"]
 RECORDS = ["实际完成内容", "我的解释或答案要点", "代码、图、实验或问答证据", "反馈与需要修正的理解", "未解决问题及核实方式", "未完成任务与顺延原因", "下次具体起点", "复测时间与结果"]
 REVIEWS = ["实际完成学习日与总时长", "能独立解释的内容及证据", "仍需提示或实现未核实的内容", "本周错题与复测结果", "项目事实或能力边界的新发现", "下周保留、减少或顺延的任务及原因"]
-DAY_RE = re.compile(r"^## 第 ([1-5]) 天 ([^\n]+)\n(.*?)(?=^## |\Z)", re.M | re.S)
+DAY_RE = re.compile(r"^## 第 ([1-5]) 天 ([^\n]+)\n(.*?)(?=^## (?:第 [1-5] 天 |周复盘(?:\n|$))|\Z)", re.M | re.S)
 META_RE = re.compile(r"实际日期：(.*?)。实际时长：(.*?)。状态：(.*?)。掌握程度：(.*?)。")
 
 
@@ -32,23 +32,105 @@ def empty(value):
     return "" if value.strip() in ("待填写", "待记录。", "待记录", "尚未开始") else value
 
 
-def field_pattern(label):
-    return re.compile(r"^- " + re.escape(label) + r"：(.*(?:\n[ \t]+[^\n]*)*)", re.M)
+FIELD_RE = re.compile(r"^- (" + "|".join(map(re.escape, RECORDS + REVIEWS)) + r")：")
+
+
+HEADING_RE = re.compile(r"^#### (" + "|".join(map(re.escape, RECORDS + REVIEWS)) + r")[ \t]*(?:\n|$)")
+
+
+def fence_state(line, active):
+    content = line.rstrip('\r\n')
+    header = FIELD_RE.match(content)
+    if header and active is None:
+        content = content[header.end():]
+    marker = re.match(r'^\s*(`{3,}|~{3,})(.*)$', content)
+    if not marker:
+        return active
+    run, rest = marker.groups()
+    if active:
+        return None if run[0] == active[0] and len(run) >= active[1] and not rest.strip() else active
+    if run[0] == '`' and '`' in rest:
+        return None
+    return run[0], len(run)
+
+
+def field_span(text, label):
+    """按已知字段边界取值，围栏内的字段名和标题不视为文档结构。"""
+    offset = 0
+    start = value_start = None
+    heading_mode = False
+    active = None
+    for line in text.splitlines(keepends=True):
+        header = (HEADING_RE.match(line) or FIELD_RE.match(line)) if active is None else None
+        boundary = active is None and (
+            header is not None or re.match(r'^## (?:第 [1-5] 天 |周复盘)', line)
+            or line.startswith('完成判定以当日验收和实际记录为依据；'))
+        if start is not None and boundary:
+            end = offset
+            break
+        if header and header.group(1) == label:
+            start, value_start = offset, offset + header.end()
+            heading_mode = HEADING_RE.match(line) is not None
+            if heading_mode and text[value_start:value_start + 1] == "\n":
+                value_start += 1
+        active = fence_state(line, active)
+        offset += len(line)
+    else:
+        end = len(text)
+    if start is None:
+        raise ValueError(f"找不到记录字段：{label}；请检查文档格式。")
+    # 分隔空行属于文档结构，缩进空行属于应用保存的字段正文。
+    while end > value_start and text[end - 1] in '\r\n':
+        end -= 1
+    return start, value_start, end
+
+
+def day_matches(text):
+    masked, active = [], None
+    for line in text.splitlines(keepends=True):
+        next_active = fence_state(line, active)
+        masked.append(re.sub(r'[^\r\n]', ' ', line) if active is not None else line)
+        active = next_active
+    return list(DAY_RE.finditer(''.join(masked)))
+
+
+def split_review(text):
+    offset, active = 0, None
+    for line in text.splitlines(keepends=True):
+        if active is None and line == '## 周复盘\n':
+            return text[:offset], text[offset + len(line):]
+        active = fence_state(line, active)
+        offset += len(line)
+    return [text]
 
 
 def read_field(text, label):
-    match = field_pattern(label).search(text)
-    if not match:
-        raise ValueError(f"找不到记录字段：{label}；请检查文档格式。")
-    return empty(re.sub(r"\n  ", "\n", match.group(1)))
+    field_start, start, end = field_span(text, label)
+    value = text[start:end]
+    lines = value.split('\n')
+    # 仅对整段都使用应用的两空格续行格式时解码，不能破坏顶格代码的缩进。
+    if not HEADING_RE.match(text[field_start:]) and len(lines) > 1 and all(not line or line.startswith('  ') for line in lines[1:]):
+        value = '\n'.join([lines[0]] + [line[2:] if line.startswith('  ') else line for line in lines[1:]])
+    return empty(value)
 
 
 def write_field(text, label, value):
-    rendered = value.replace("\n", "\n  ") if value else "待记录。"
-    text, count = field_pattern(label).subn(lambda _: f"- {label}：{rendered}", text, count=1)
-    if count != 1:
-        raise ValueError(f"找不到记录字段：{label}")
-    return text
+    # 正文不额外缩进；首尾空行作为标题间隔统一处理，内部 Markdown 原样保存。
+    rendered = value.strip('\n') if value else "待记录。"
+    start, _, end = field_span(text, label)
+    suffix = text[end:].lstrip('\n')
+    return text[:start] + f"#### {label}\n\n{rendered}\n\n" + suffix
+
+
+def validate_body(value):
+    active = None
+    for line in value.splitlines(keepends=True):
+        if active is None and (HEADING_RE.match(line) or FIELD_RE.match(line) or re.match(r'^## (?:第 [1-5] 天 |周复盘(?:\n|$))', line)
+                               or line.startswith('完成判定以当日验收和实际记录为依据；')):
+            raise ValueError("正文包含计划保留标题，请使用其他标题，或将示例放入代码围栏。")
+        active = fence_state(line, active)
+    if active:
+        raise ValueError("记录中的代码围栏尚未闭合，请补全结束围栏后保存。")
 
 
 def hours_value(value):
@@ -62,20 +144,21 @@ def hours_value(value):
 
 def parse_week(path, text):
     days = []
-    for match in DAY_RE.finditer(text):
-        meta = META_RE.search(match.group(3))
+    for match in day_matches(text):
+        body = text[match.start(3):match.end(3)]
+        meta = META_RE.search(body)
         if not meta:
             raise ValueError(f"{path.name} 第 {match.group(1)} 天的状态行格式已改变。")
         actual_date, hours, status, level = meta.groups()
         if status not in STATUSES or level not in LEVELS:
             raise ValueError(f"{path.name} 包含不支持的状态或掌握程度，请先核对文档。")
-        tasks = re.findall(r"^- \[([ xX])\] (.+)$", match.group(3), re.M)
+        tasks = re.findall(r"^- \[([ xX])\] (.+)$", body.split('### 学习记录', 1)[0], re.M)
         days.append(dict(number=int(match.group(1)), title=match.group(2), date=empty(actual_date), hours=hours_value(hours), status=status, level=level,
                          tasks=[dict(done=t[0].lower() == "x", text=t[1]) for t in tasks],
-                         records={label: read_field(match.group(3), label) for label in RECORDS}))
+                         records={label: read_field(body, label) for label in RECORDS}))
     if [d["number"] for d in days] != [1, 2, 3, 4, 5]:
         raise ValueError(f"{path.name} 必须包含第 1～5 天，且不能重复。")
-    review = text.split("## 周复盘\n", 1)
+    review = split_review(text)
     if len(review) != 2:
         raise ValueError(f"{path.name} 缺少周复盘。")
     refs = text.split("## 阅读入口\n", 1)[-1].split("## 本周五天安排", 1)[0]
@@ -162,16 +245,20 @@ class Store:
                     raise ValueError("学习记录字段不完整。")
                 if any(not isinstance(v, str) or len(v) > 20000 or "\r" in v or "\x00" in v for v in data[key].values()):
                     raise ValueError("记录必须为文本，单项不超过 20000 字符。")
-            match = list(DAY_RE.finditer(original))[number - 1]
-            block = match.group(0)
+                for value in data[key].values():
+                    validate_body(value)
+            match = day_matches(original)[number - 1]
+            block = original[match.start():match.end()]
             meta = f"实际日期：{actual_date or '待填写'}。实际时长：{format(hours, 'g') + ' 小时' if hours is not None else '待填写'}。状态：{data['status']}。掌握程度：{data['level']}。"
             block = META_RE.sub(lambda _: meta, block, count=1)
             checked = iter(checks)
-            block = re.sub(r"^- \[[ xX]\] ", lambda _: "- [x] " if next(checked) else "- [ ] ", block, flags=re.M)
+            tasks, notes = block.split('### 学习记录', 1)
+            tasks = re.sub(r"^- \[[ xX]\] ", lambda _: "- [x] " if next(checked) else "- [ ] ", tasks, flags=re.M)
+            block = tasks + '### 学习记录' + notes
             for label in RECORDS:
                 block = write_field(block, label, data["records"][label])
             changed = original[:match.start()] + block + original[match.end():]
-            before_review, review = changed.split("## 周复盘\n", 1)
+            before_review, review = split_review(changed)
             for label in REVIEWS:
                 review = write_field(review, label, data["review"][label])
             changed = before_review + "## 周复盘\n" + review
