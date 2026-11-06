@@ -28,8 +28,8 @@ struct Snapshot: Codable {
     @Published var error = false
     let root: String
 
-    init() {
-        root = UserDefaults.standard.string(forKey: "planRoot") ?? (Bundle.main.object(forInfoDictionaryKey: "StudyPlanRoot") as? String ?? "")
+    init(rootOverride: String? = nil) {
+        root = rootOverride ?? UserDefaults.standard.string(forKey: "planRoot") ?? (Bundle.main.object(forInfoDictionaryKey: "StudyPlanRoot") as? String ?? "")
         load()
         if CommandLine.arguments.contains("--check") {
             do { try ImageAttachments.check() }
@@ -119,6 +119,75 @@ struct Snapshot: Codable {
         }
         }
         print("通过：实际证据视图完整展示 \(expectedCodes.count) 个代码块，隐藏围栏、保留缩进，并使用等宽代码字体。")
+        exit(0)
+    }
+    func checkFollowUpEditor() {
+        let manager = FileManager.default
+        let temporary = manager.temporaryDirectory.appendingPathComponent("study-follow-up-" + UUID().uuidString)
+        do {
+            try manager.createDirectory(at: temporary, withIntermediateDirectories: true)
+            defer { try? manager.removeItem(at: temporary) }
+            let original = URL(fileURLWithPath: root)
+            let files = try manager.contentsOfDirectory(at: original, includingPropertiesForKeys: nil).filter { $0.pathExtension == "md" }
+            let originals = try files.map { ($0, try Data(contentsOf: $0)) }
+            for file in files { try manager.copyItem(at: file, to: temporary.appendingPathComponent(file.lastPathComponent)) }
+            // 仅在临时副本加入两类历史内容，验证真实旧格式读取。
+            let fixture = Process()
+            fixture.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            fixture.arguments = ["-c", """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from server import write_field, field_span, has_field, FOLLOW_UP
+root = Path(sys.argv[2])
+p = sorted(root.glob('第[0-9][0-9]周-*.md'))[0]
+s = p.read_text()
+if has_field(s, FOLLOW_UP):
+    a, _, b = field_span(s, FOLLOW_UP)
+    s = s[:a] + s[b:]
+for label, value in [('未解决问题及核实方式', 'UI测试：核实线程状态'), ('未完成任务与顺延原因', 'UI测试：实验未完成，明日继续')]:
+    s = write_field(s, label, value)
+p.write_text(s)
+""", Bundle.main.resourceURL!.path, temporary.path]
+            try fixture.run(); fixture.waitUntilExit()
+            precondition(fixture.terminationStatus == 0)
+            let test = StudyModel(rootOverride: temporary.path)
+            test.select(0, 0, confirm: false)
+            let label = "待跟进问题与任务"
+            let expected = "**未解决问题及核实方式**\n\nUI测试：核实线程状态\n\n**未完成任务与顺延原因**\n\nUI测试：实验未完成，明日继续"
+            precondition(test.draft?.records[label] == expected)
+            precondition(test.snapshot!.recordLabels.count == 6)
+            precondition(!test.snapshot!.recordLabels.contains("反馈与需要修正的理解"))
+            let host = NSHostingView(rootView: ContentView(model: test).editor(label, weekly: false))
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 650, height: 220), styleMask: [.titled], backing: .buffered, defer: false)
+            window.contentView = host
+            host.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+            func textViews(_ view: NSView) -> [NSTextView] {
+                (view as? NSTextView).map { [$0] } ?? view.subviews.flatMap(textViews)
+            }
+            let editor = textViews(host).first!
+            precondition(editor.isEditable && editor.string == expected)
+            let updated = "待核实：线程状态，查阅实验结果\n未完成：补充实验，明日继续"
+            editor.selectAll(nil)
+            editor.insertText(updated, replacementRange: NSRange(location: 0, length: (editor.string as NSString).length))
+            RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+            precondition(test.dirty && test.draft?.records[label] == updated)
+            test.save()
+            precondition(!test.error && !test.dirty, test.message)
+            let reopened = StudyModel(rootOverride: temporary.path)
+            reopened.select(0, 0, confirm: false)
+            precondition(reopened.draft?.records[label] == updated)
+            let reopenedHost = NSHostingView(rootView: ContentView(model: reopened).editor(label, weekly: false))
+            window.contentView = reopenedHost
+            reopenedHost.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+            precondition(textViews(reopenedHost).first?.string == updated)
+            let saved = try String(contentsOf: temporary.appendingPathComponent(reopened.snapshot!.weeks[0].id), encoding: .utf8)
+            precondition(saved.contains("UI测试：核实线程状态") && saved.contains("UI测试：实验未完成，明日继续"))
+            for (file, bytes) in originals { let current = try Data(contentsOf: file); precondition(current == bytes) }
+            print("通过：真实 NSTextView 展示旧字段合并内容、输入绑定、保存、重新创建模型和视图后显示一致；历史字段保留，真实文档逐字节未变。")
+        } catch { print("字段原生检查失败：\(error)"); exit(1) }
         exit(0)
     }
     func mayDiscard() -> Bool {
@@ -390,6 +459,9 @@ GroupBox("今日安排") {
     func editor(_ label: String, weekly: Bool) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(Presentation.text(label)).font(.callout).foregroundStyle(.secondary)
+            if label == "待跟进问题与任务" && !weekly {
+                Text("记录待核实的问题、核实方式，以及未完成任务、顺延原因和下一步安排。").font(.caption).foregroundStyle(.secondary)
+            }
             if label == "代码、图、实验或问答证据" && !weekly {
                 EvidenceEditor(source: note(label, weekly: weekly), root: model.root)
             } else if label == "我的解释或答案要点" && !weekly {
@@ -407,6 +479,7 @@ GroupBox("今日安排") {
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var model: StudyModel?
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--check-follow-up") { StudyModel().checkFollowUpEditor() }
         if CommandLine.arguments.contains("--check-markdown") { NotesMarkdown.check() }
         if CommandLine.arguments.contains("--check-evidence") {
             let testModel = StudyModel()

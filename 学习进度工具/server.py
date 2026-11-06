@@ -19,6 +19,12 @@ DEFAULT_ROOT = APP.parent / "00-索引与面试/AI应用后端三个月复习"
 STATUSES = ["未开始", "学习中", "待复习", "已完成"]
 LEVELS = ["未评估", "需提示", "可独立解释", "可动手验证", "可应对追问"]
 RECORDS = ["实际完成内容", "我的解释或答案要点", "代码、图、实验或问答证据", "反馈与需要修正的理解", "未解决问题及核实方式", "未完成任务与顺延原因", "下次具体起点", "复测时间与结果"]
+FOLLOW_UP = "待跟进问题与任务"
+LEGACY_FOLLOW_UP = ["未解决问题及核实方式", "未完成任务与顺延原因"]
+EDITABLE_RECORDS = [label for label in RECORDS if label not in ["反馈与需要修正的理解"] + LEGACY_FOLLOW_UP]
+EDITABLE_RECORDS.insert(3, FOLLOW_UP)
+# 旧字段继续作为解析边界；保存时不覆盖历史原文。
+ALL_RECORDS = RECORDS + [FOLLOW_UP]
 REVIEWS = ["实际完成学习日与总时长", "能独立解释的内容及证据", "仍需提示或实现未核实的内容", "本周错题与复测结果", "项目事实或能力边界的新发现", "下周保留、减少或顺延的任务及原因"]
 DAY_RE = re.compile(r"^## 第 ([1-5]) 天 ([^\n]+)\n(.*?)(?=^## (?:第 [1-5] 天 |周复盘(?:\n|$))|\Z)", re.M | re.S)
 META_RE = re.compile(r"实际日期：(.*?)。实际时长：(.*?)。状态：(.*?)。掌握程度：(.*?)。")
@@ -32,10 +38,10 @@ def empty(value):
     return "" if value.strip() in ("待填写", "待记录。", "待记录", "尚未开始") else value
 
 
-FIELD_RE = re.compile(r"^- (" + "|".join(map(re.escape, RECORDS + REVIEWS)) + r")：")
+FIELD_RE = re.compile(r"^- (" + "|".join(map(re.escape, ALL_RECORDS + REVIEWS)) + r")：")
 
 
-HEADING_RE = re.compile(r"^#### (" + "|".join(map(re.escape, RECORDS + REVIEWS)) + r")[ \t]*(?:\n|$)")
+HEADING_RE = re.compile(r"^#### (" + "|".join(map(re.escape, ALL_RECORDS + REVIEWS)) + r")[ \t]*(?:\n|$)")
 
 
 def fence_state(line, active):
@@ -122,6 +128,37 @@ def write_field(text, label, value):
     return text[:start] + f"#### {label}\n\n{rendered}\n\n" + suffix
 
 
+def has_field(text, label):
+    try:
+        field_span(text, label)
+        return True
+    except ValueError:
+        return False
+
+
+def read_records(text):
+    records = {label: read_field(text, label) for label in EDITABLE_RECORDS if label != FOLLOW_UP}
+    if has_field(text, FOLLOW_UP):
+        # 即使用户清空新字段，也不能再次回填旧内容。
+        records[FOLLOW_UP] = read_field(text, FOLLOW_UP)
+    else:
+        parts = []
+        for label in LEGACY_FOLLOW_UP:
+            value = read_field(text, label) if has_field(text, label) else ""
+            if value.strip():
+                parts.append(f"**{label}**\n\n{value}")
+        records[FOLLOW_UP] = "\n\n".join(parts)
+    return {label: records[label] for label in EDITABLE_RECORDS}
+
+
+def write_record(text, label, value):
+    if label == FOLLOW_UP and not has_field(text, label):
+        # 在既有字段之前插入，旧字段保持原样，避免批量迁移历史记录。
+        start, _, _ = field_span(text, "下次具体起点")
+        text = text[:start] + f"#### {label}\n\n待记录。\n\n" + text[start:]
+    return write_field(text, label, value)
+
+
 def validate_body(value):
     active = None
     for line in value.splitlines(keepends=True):
@@ -155,7 +192,7 @@ def parse_week(path, text):
         tasks = re.findall(r"^- \[([ xX])\] (.+)$", body.split('### 学习记录', 1)[0], re.M)
         days.append(dict(number=int(match.group(1)), title=match.group(2), date=empty(actual_date), hours=hours_value(hours), status=status, level=level,
                          tasks=[dict(done=t[0].lower() == "x", text=t[1]) for t in tasks],
-                         records={label: read_field(body, label) for label in RECORDS}))
+                         records=read_records(body)))
     if [d["number"] for d in days] != [1, 2, 3, 4, 5]:
         raise ValueError(f"{path.name} 必须包含第 1～5 天，且不能重复。")
     review = split_review(text)
@@ -208,7 +245,7 @@ class Store:
         for week in weeks:
             week["summary"] = aggregate(week["days"])
         return dict(revision=self.revision(docs), weeks=weeks, summary=aggregate([d for w in weeks for d in w["days"]]),
-                    statuses=STATUSES, levels=LEVELS, recordLabels=RECORDS, reviewLabels=REVIEWS, root=str(self.root))
+                    statuses=STATUSES, levels=LEVELS, recordLabels=EDITABLE_RECORDS, reviewLabels=REVIEWS, root=str(self.root))
 
     def save(self, data):
         with self.lock:
@@ -240,11 +277,11 @@ class Store:
             checks = data.get("checks")
             if not isinstance(checks, list) or len(checks) != len(day["tasks"]) or any(type(x) is not bool for x in checks):
                 raise ValueError("任务勾选数据不完整。")
-            for key, labels in [("records", RECORDS), ("review", REVIEWS)]:
+            for key, labels in [("records", EDITABLE_RECORDS), ("review", REVIEWS)]:
                 if not isinstance(data.get(key), dict) or set(data[key]) != set(labels):
                     raise ValueError("学习记录字段不完整。")
-                if any(not isinstance(v, str) or len(v) > 20000 or "\r" in v or "\x00" in v for v in data[key].values()):
-                    raise ValueError("记录必须为文本，单项不超过 20000 字符。")
+                if any(not isinstance(v, str) or len(v) > (41000 if key == "records" and label == FOLLOW_UP else 20000) or "\r" in v or "\x00" in v for label, v in data[key].items()):
+                    raise ValueError("记录必须为文本，单项不超过 20000 字符（待跟进问题与任务为 41000 字符）。")
                 for value in data[key].values():
                     validate_body(value)
             match = day_matches(original)[number - 1]
@@ -255,8 +292,8 @@ class Store:
             tasks, notes = block.split('### 学习记录', 1)
             tasks = re.sub(r"^- \[[ xX]\] ", lambda _: "- [x] " if next(checked) else "- [ ] ", tasks, flags=re.M)
             block = tasks + '### 学习记录' + notes
-            for label in RECORDS:
-                block = write_field(block, label, data["records"][label])
+            for label in EDITABLE_RECORDS:
+                block = write_record(block, label, data["records"][label])
             changed = original[:match.start()] + block + original[match.end():]
             before_review, review = split_review(changed)
             for label in REVIEWS:

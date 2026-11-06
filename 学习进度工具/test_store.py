@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from server import Store, Conflict, DEFAULT_ROOT, read_field, write_field, field_span
+from server import Store, Conflict, DEFAULT_ROOT, read_field, write_field, field_span, FOLLOW_UP, LEGACY_FOLLOW_UP, read_records, day_matches
 
 
 class StoreTests(unittest.TestCase):
@@ -30,6 +30,68 @@ class StoreTests(unittest.TestCase):
                     status='学习中', level='可独立解释', date='2026-10-27', hours=4.5,
                     checks=[True] + [False] * (len(d['tasks']) - 1),
                     records=dict(d['records']), review=dict(w['review']))
+
+    def test_follow_up_legacy_merge_preserves_raw_history(self):
+        path = self.root / self.initial['weeks'][0]['id']
+        source = path.read_text()
+        match = day_matches(source)[0]
+        block = source[match.start():match.end()]
+        history = {
+            LEGACY_FOLLOW_UP[0]: '验证线程状态\n\n```java\n    run();\n```',
+            LEGACY_FOLLOW_UP[1]: '- [ ] 补充实验\n时间不足，明日继续',
+            '反馈与需要修正的理解': '保留的历史反馈',
+        }
+        for label, value in history.items():
+            block = write_field(block, label, value)
+        path.write_text(source[:match.start()] + block + source[match.end():])
+        before = path.read_bytes()
+        self.initial = self.store.snapshot()
+        self.assertEqual(path.read_bytes(), before)
+        data = self.payload()
+        for value in list(history.values())[:2]:
+            self.assertIn(value, data['records'][FOLLOW_UP])
+        self.assertNotIn('反馈与需要修正的理解', self.initial['recordLabels'])
+        self.assertFalse(set(LEGACY_FOLLOW_UP) & set(data['records']))
+        result = self.store.save(data)
+        self.assertEqual(result['weeks'][0]['days'][0]['records'], data['records'])
+        saved = path.read_text()
+        for label in history:
+            a, _, b = field_span(block, label)
+            self.assertIn(block[a:b], saved)
+        self.assertEqual((Path(result['backup']) / path.name).read_bytes(), before)
+        # 清空后重开不能复活旧内容；后续编辑仅更新合并字段。
+        data['revision'] = result['revision']
+        data['records'][FOLLOW_UP] = ''
+        result = self.store.save(data)
+        self.assertEqual(Store(self.root).snapshot()['weeks'][0]['days'][0]['records'][FOLLOW_UP], '')
+        data['revision'] = result['revision']
+        data['records'][FOLLOW_UP] = '新的待办与核实方式'
+        self.store.save(data)
+        self.assertEqual(Store(self.root).snapshot()['weeks'][0]['days'][0]['records'][FOLLOW_UP], '新的待办与核实方式')
+        self.assertEqual(path.read_text().count('#### ' + FOLLOW_UP), 1)
+        from migrate_notes import migrate_week
+        converted = migrate_week(path, path.read_text())
+        self.assertEqual(migrate_week(path, converted), converted)
+
+    def test_follow_up_empty_single_and_new_format(self):
+        common = ''.join(f'#### {label}\n\n待记录。\n\n' for label in self.initial['recordLabels'] if label != FOLLOW_UP)
+        self.assertEqual(read_records(common)[FOLLOW_UP], '')
+        for label in LEGACY_FOLLOW_UP:
+            for field in [f'- {label}：待办\n', f'#### {label}\n\n待办\n']:
+                self.assertEqual(read_records(common + field)[FOLLOW_UP], f'**{label}**\n\n待办')
+        self.assertEqual(read_records(common + f'#### {FOLLOW_UP}\n\n新记录\n')[FOLLOW_UP], '新记录')
+
+    def test_follow_up_can_hold_two_maximum_legacy_fields(self):
+        path = self.root / self.initial['weeks'][0]['id']
+        text = path.read_text()
+        for label in LEGACY_FOLLOW_UP:
+            text = write_field(text, label, '字' * 20000)
+        path.write_text(text)
+        self.initial = self.store.snapshot()
+        data = self.payload()
+        self.assertGreater(len(data['records'][FOLLOW_UP]), 40000)
+        self.store.save(data)
+        self.assertEqual(self.store.snapshot()['weeks'][0]['days'][0]['records'][FOLLOW_UP], data['records'][FOLLOW_UP])
 
     def test_save_reload_summary_backup_and_preservation(self):
         data = self.payload()

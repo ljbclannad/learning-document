@@ -8,7 +8,7 @@ import secrets
 
 from server import (DEFAULT_ROOT, RECORDS, REVIEWS, Store, Conflict, day_matches,
                     field_span, read_field, write_field, parse_week, split_review,
-                    HEADING_RE, fence_state, validate_body)
+                    HEADING_RE, fence_state, validate_body, ALL_RECORDS, has_field, read_records)
 
 
 def legacy_body(value):
@@ -51,9 +51,9 @@ def migrate_week(path, source):
     matches = day_matches(source)
     for index in reversed(range(len(matches))):
         match = matches[index]
-        block, values = migrate_section(source[match.start():match.end()], RECORDS)
+        block, values = migrate_section(source[match.start():match.end()], [label for label in ALL_RECORDS if has_field(source[match.start():match.end()], label)])
         result = result[:match.start()] + block + result[match.end():]
-        expected['days'][index]['records'] = values
+        expected['days'][index]['records'] = read_records(block)
     prefix, review = split_review(result)
     review, values = migrate_section(review, REVIEWS)
     result = prefix + '## 周复盘\n' + review
