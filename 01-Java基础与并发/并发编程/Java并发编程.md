@@ -470,6 +470,93 @@ try {
 
 JIT 可在满足条件时消除线程封闭对象的锁，也可能合并部分连续加锁；不是只要代码长得像示例就必然优化。对象头布局和锁实现应固定版本看源码，性能结论以竞争数据与基准验证。
 
+### 5.5 完整案例：双账户转账如何形成并消除死锁
+
+以下是单 JVM 内存教学模型，不访问银行、支付渠道或数据库。两个账户各有一把独占锁，要求余额非负、成功转账前后总额不变，余额的所有读写都遵守同一协议。错误实现按“付款账户 → 收款账户”加锁，反向转账便会产生相反的获取顺序：
+
+| 时点 | 线程 T1：账户 A → B | 线程 T2：账户 B → A |
+| --- | --- | --- |
+| 1 | 取得 A 的锁 | |
+| 2 | | 取得 B 的锁 |
+| 3 | 持有 A，等待 B | |
+| 4 | | 持有 B，等待 A |
+
+等待图为 `T1 → B锁 → T2 → A锁 → T1`。互斥、持有并等待、锁不能由其他线程强行剥夺以及循环等待共同形成死锁。两个线程都没有进入释放第一把锁的 finally，所以“写了 finally”并不能阻止死锁；公平锁也不改变这个跨锁依赖环。
+
+#### 先稳定复现，再验证修复
+
+可在独立实验中让两个平台线程各取第一把 ReentrantLock，用 `CountDownLatch(2)` 确认双方都已持有，再调用第二把锁的 `lockInterruptibly()`。这时用 `ThreadMXBean.findDeadlockedThreads()` 在有限期限内检测，并核对返回 ID 包含这两个实验线程；仅看到双方都经过 Latch，还不能证明第二次获取已经阻塞。
+
+检测完成后中断两个线程，让第二次获取抛 InterruptedException，并在各自 finally 释放第一把锁，最后限时 join 确认退出。实验选择可中断获取是为了安全清理；若反例使用 synchronized 或普通 lock，不能依靠 interrupt 解开等待，也不要在长期运行的应用里故意留下死锁线程。检测器不会替业务解锁。线程栈的判读见[第 19.2 节](#192-用线程栈和业务时间线互相验证)。
+
+#### 统一资源顺序，并把两次等待纳入同一预算
+
+修复方案让所有转账都先取得 ID 小的账户锁，再取得 ID 大的账户锁，转账方向只决定扣谁、加谁，不决定锁顺序。若所有获取都沿严格递增 ID，就无法形成回到较小 ID 的锁等待环。**前提是同一账户使用唯一、稳定的共享对象，且所有相关调用路径遵守同一顺序。** 每次请求重新构造一个同 ID 的 Account 不能协调竞争；身份哈希还可能碰撞，不能不处理冲突就当作严格全序。
+
+下面是完整 JDK 17/21 教学类 `OrderedTransfers.java`。返回 false 只表示本次锁等待预算耗尽，余额未修改；余额不足或溢出则抛异常。超时用于限制等待，消除循环等待依靠的是统一顺序。预算不是整个业务操作的硬实时期限。
+
+```java
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+
+public final class OrderedTransfers {
+    public static final class Account {
+        private final long id;
+        private final ReentrantLock lock = new ReentrantLock();
+        private long balance;
+
+        public Account(long id, long balance) {
+            if (balance < 0) throw new IllegalArgumentException("余额不能为负");
+            this.id = id;
+            this.balance = balance;
+        }
+
+        public long balance() {
+            lock.lock();
+            try { return balance; }
+            finally { lock.unlock(); }
+        }
+    }
+
+    public static boolean transfer(Account from, Account to, long amount,
+                                   long timeoutMillis) throws InterruptedException {
+        if (amount <= 0 || timeoutMillis <= 0 || timeoutMillis > 60_000) {
+            throw new IllegalArgumentException("金额须为正，预算为 1～60000 毫秒");
+        }
+        if (from == to) throw new IllegalArgumentException("不支持同账户转账");
+        if (from.id == to.id) throw new IllegalArgumentException("账户 ID 必须唯一");
+        Account first = from.id < to.id ? from : to;
+        Account second = first == from ? to : from;
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        if (!first.lock.tryLock(timeoutMillis, TimeUnit.MILLISECONDS)) return false;
+        try {
+            long left = deadline - System.nanoTime();
+            if (left <= 0 || !second.lock.tryLock(left, TimeUnit.NANOSECONDS)) return false;
+            try {
+                if (from.balance < amount) throw new IllegalStateException("余额不足");
+                long nextTo = Math.addExact(to.balance, amount);
+                // 所有可能失败的校验先完成，再在两把锁内更新关联状态。
+                from.balance -= amount;
+                to.balance = nextTo;
+                return true;
+            } finally {
+                second.lock.unlock();
+            }
+        } finally {
+            first.lock.unlock();
+        }
+    }
+}
+```
+
+第二把锁超时、中断或校验失败时，外层 finally 仍释放第一把锁；只有获取成功的锁才解锁。收款余额的溢出计算放在扣款前，避免“扣款成功后计算失败”留下半笔转账。这个局部保证不覆盖进程崩溃、持久化或外部副作用；两次分别调用 balance() 也不组成跨账户的一致快照，读总额需同样同时持有两把锁，或在全部转账结束后验证。
+
+调用方可以报告繁忙或在剩余总预算内有限重试，不能无限即时重试。退避应在两把锁都释放后进行；两个线程反复同时尝试、失败再重试，仍可能活锁。临界区内不要调用未知回调或远程接口：回调可能按另一顺序获取第三把锁，破坏原来的全序证明；远程调用还可能长期占住两把锁。
+
+本例的验证包括：受控反向加锁确实形成等待环；修复后两个方向各转账 1000 次，任务结束后余额分别恢复初始值；另一线程持续持有第二把锁时，转账超时返回 false，第三个访问者仍能取得第一把锁，随后释放阻挡者可继续转账。源码式推导证明统一顺序的作用，有限实验验证实现与失败清理，不将一次压测未死锁当作证明。
+
+依据：[ReentrantLock 的可中断获取、超时与释放契约](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/ReentrantLock.html)、[ThreadMXBean 死锁检测](https://docs.oracle.com/en/java/javase/21/docs/api/java.management/java/lang/management/ThreadMXBean.html)。数据库转账另需事务与数据库锁协议，不能直接用本例替代。
+
 ## 6. 条件等待、通知与 LockSupport
 
 ### 6.1 等待的是状态谓词，不是一声通知
@@ -1429,6 +1516,161 @@ Latch 通常在任务 finally 中 countDown，表示该任务不再参与等待�
 
 多个应用实例各有定时器，会分别扫描相同任务。可采用数据库认领、分片调度或带租约的任务所有权，并使用幂等键控制重复副作用。即使调度器保证单次触发，也仍可能因进程崩溃或网络超时需要重试，业务层不能省略幂等。
 
+### 13.4 生产者—消费者：正常排空与失败中止
+
+以“逐项生成报告编号 → 有界队列 → 多个消费者解析”为教学场景。队列容量限制等待的数据项，消费者数量限制并行处理数量；生产者手里的当前项、各消费者已取出的项也占内存，不能只按队列容量计算总在途。元素入队前完成初始化，入队后不再修改；队列的安全交付不保护之后的共享修改。
+
+| 容量或数据暂不满足时 | 插入 | 取出 | 调用方责任 |
+| --- | --- | --- | --- |
+| 立即抛异常 | add | remove | 明确异常如何结束或恢复流程 |
+| 立即返回失败值 | offer | poll | 检查 false/null，不能当成成功 |
+| 可中断地等待 | put | take | 为故障、取消和停机提供退出路径 |
+| 限时等待 | offer(timeout) | poll(timeout) | 处理超时，循环重试不刷新总预算 |
+
+BlockingQueue 不允许 null 元素，也没有统一的 close/shutdown。队列为空可能只是生产暂时慢，不能直接认定生产结束；队列非空也不代表消费者仍然健康。以上契约见 [BlockingQueue API](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/BlockingQueue.html)。
+
+#### 两种结束方式必须分别定义
+
+```text
+正常：生产者不再入队 → 消费者排空已有数据 → 所有处理返回 → 整组成功
+失败：任一参与者异常 / 总超时 / 协调者中断
+    → 协调者取消全部参与者 → 中断队列等待与可中断处理 → 限时确认实际退出
+```
+
+反例一：消费者永久 take，生产者结束后队列空了，它永远等不到下一项。反例二：消费者抛异常退出，生产者继续 put，满队列后也永远等不到容量。若协调者按提交顺序先 get 生产者，就可能连消费者的失败也看不到。应按完成顺序观察参与者，任何失败都进入整组中止流程；“生产者已退出”与“生产成功”分别由结束信号和结果句柄表达。
+
+#### 完整实现：结束信号、限时检查与统一协调者
+
+下面是完整 JDK 17/21 教学类 `BoundedPipeline.java`。只有一个生产者，Source.next 返回 null 表示结束；多个消费者共享 Sink，要求它可并发调用。Source/Sink 必须能响应中断或具备有限的底层调用超时。输入逐项获取，不预先构造全量集合；正常返回表示所有参与者成功结束。
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+public final class BoundedPipeline {
+    @FunctionalInterface
+    public interface Source {
+        Integer next() throws Exception; // null 表示生产结束，不入队
+    }
+    @FunctionalInterface
+    public interface Sink {
+        void accept(int value) throws Exception;
+    }
+
+    public static void run(Source source, Sink sink, int consumers,
+                           int capacity, long budgetMillis) throws Exception {
+        if (consumers < 1 || consumers > 32 || capacity <= 0
+                || budgetMillis <= 0 || budgetMillis > 60_000) {
+            throw new IllegalArgumentException("消费者为 1～32，容量为正，预算为 1～60000 毫秒");
+        }
+        BlockingQueue<Integer> queue = new ArrayBlockingQueue<>(capacity);
+        CountDownLatch producerDone = new CountDownLatch(1);
+        ExecutorService workers = Executors.newFixedThreadPool(consumers + 1);
+        ExecutorCompletionService<Void> completed = new ExecutorCompletionService<>(workers);
+        List<Future<Void>> tasks = new ArrayList<>();
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMillis);
+        Throwable primary = null;
+        boolean interrupted = false;
+        try {
+            tasks.add(completed.submit(() -> {
+                try {
+                    for (;;) {
+                        checkInterrupted();
+                        Integer item = source.next();
+                        if (item == null) return null;
+                        queue.put(item); // 满队列产生背压，可被中断
+                    }
+                } finally {
+                    producerDone.countDown(); // 只表示不再生产，不表示成功
+                }
+            }));
+            for (int i = 0; i < consumers; i++) {
+                tasks.add(completed.submit(() -> {
+                    for (;;) {
+                        checkInterrupted();
+                        Integer item = queue.poll(50, TimeUnit.MILLISECONDS);
+                        if (item != null) {
+                            sink.accept(item); // 在队列锁之外处理，多个消费者并发调用
+                        } else if (producerDone.getCount() == 0 && queue.isEmpty()) {
+                            return null;
+                        }
+                    }
+                }));
+            }
+            for (int i = 0; i < tasks.size(); i++) {
+                long left = deadline - System.nanoTime();
+                if (left <= 0) throw new TimeoutException("流水线总预算耗尽");
+                Future<Void> done = completed.poll(left, TimeUnit.NANOSECONDS);
+                if (done == null) throw new TimeoutException("流水线总预算耗尽");
+                done.get(); // 按完成顺序观察异常，不能先等阻塞的生产者
+            }
+        } catch (Exception | Error failure) {
+            primary = failure;
+            interrupted = failure instanceof InterruptedException;
+            throw failure;
+        } finally {
+            for (Future<Void> task : tasks) task.cancel(true);
+            workers.shutdownNow(); // 此池只属于本次流水线
+            try {
+                if (!workers.awaitTermination(5, TimeUnit.SECONDS)) {
+                    IllegalStateException cleanup =
+                            new IllegalStateException("参与者未退出，底层调用仍需取消或超时");
+                    if (primary != null) primary.addSuppressed(cleanup);
+                    else throw cleanup;
+                }
+            } catch (InterruptedException cleanup) {
+                interrupted = true;
+                if (primary != null) primary.addSuppressed(cleanup);
+                else throw cleanup;
+            } finally {
+                if (interrupted) Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private static void checkInterrupted() throws InterruptedException {
+        if (Thread.currentThread().isInterrupted()) {
+            throw new InterruptedException("流水线收到取消请求");
+        }
+    }
+}
+```
+
+调用形态为方法片段 `BoundedPipeline.run(source, sink, 3, 64, 5_000)`：三个消费者、队列容量 64、处理等待预算 5 秒，参数均为教学值。Source 只被单个生产者调用；Sink 接受的是独立编号，真实解析结果若写共享容器仍需同步或安全归约。消费者开始与完成的顺序不保证和编号顺序一致。
+
+这个实现有几处互相依赖的保证：
+
+- **先结束生产，再判断排空。** 生产者最后一次 put 完成后才发出 producerDone；消费者先限时 poll，取不到时检查生产已结束且队列为空。poll 返回 null 与结束信号之间可能还有最后一次入队，因此不能省略第二次 isEmpty。只有一个生产者且结束信号不撤销，观察结束后才可确定不再有新项。推广多生产者时需等待全部生产者结束，不能由第一个退出者关闭数据源。
+- **空队列不等于处理完成。** 其他消费者可能已经取走最后一项还在处理。协调者必须取得全部消费者的正常结果，才能报告整组成功。生产者异常也会 countDown，但其 Future 异常会使整组失败，不会因为消费者排空就被掩盖。
+- **故障不被提交顺序遮挡。** CompletionService 按完成顺序交付参与者结果。即使生产者阻塞在满队列，消费失败也能被观察并触发中断。本例只提交 consumers+1 个长期任务，专用池提供同等数量线程，不会让全部线程等待消费而生产者仍排队；完成队列最多保留这几个句柄。依据：[ExecutorCompletionService](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ExecutorCompletionService.html)。
+- **正常结束与紧急取消使用不同信号。** 正常结束用 producerDone 加排空；失败或超时通过取消全部句柄、shutdownNow 中断 put/poll 和合作式业务代码。每轮检查中断，避免处理立即返回时忽略取消。没有在 finally 中 put 一个可能永远放不进去的结束标记。
+- **结果取消后仍等实际退出。** 最后最多另等 5 秒回收专用执行器，因此 budgetMillis 不是方法严格返回上界。清理超时或再次中断会被报告；有原始失败时记录为 suppressed，不覆盖首个失败。若 Source/Sink 不响应中断，线程仍可能存活，方法不能强制停止它，需第 10 章的客户端取消与超时。共享业务池不能照搬 shutdownNow，本例的关闭权来自专用池所有权。
+
+50ms 的 poll 只决定空闲消费者检查正常结束信号的频率，不表示精确退出时刻，也不替代整组截止时间；失败取消时可直接中断等待。每个参与者发生的资源清理必须位于其自身 finally 或 try-with-resources，线程池终止才表明这些任务实际退出。
+
+#### 结束标记为什么不能随手放进 finally
+
+另一种常见协议是向 FIFO 队列投递特殊结束对象。固定 N 个消费者、每个消费者取到标记即退出时，通常需在全部生产者成功结束且不再入队之后，投递 N 个标记；标记必须与普通数据可区分。一个标记只会被一个消费者取走，其他消费者可能继续等待。多个生产者各自在 finally 放标记，还可能让消费者提前退出，留下稍后生产的数据。
+
+即使数量正确，也需处理消费者已失败、队列已满、标记投递中断和总超时。正常排空可以用标记，异常中止仍需独立的取消与协调协议。本例选择结束信号加限时 poll，是为了让退出信号不占数据队列容量；不代表所有系统都应采用轮询。
+
+#### 未处理数据与已经发生的副作用归谁负责
+
+本例是**失败即停止、允许废弃剩余内存数据**的一次性解析模型。失败时，已处理项不回滚；从队列取出但处理失败的项也不会自动重新入队。方法抛异常不表示任何项都没执行，也不提供逐项失败清单、持久化确认或进程崩溃恢复。
+
+若处理的是必须可靠完成的报告导出、扣款或通知，应记录任务 ID、处理状态、幂等键和重试归属，再按第 18.5 节恢复；不能仅靠重新运行整个流水线保证不重不漏。尚在队列、已取出执行中、处理成功但确认未知是不同恢复状态。队列排空、Future 全部 done、执行器实际终止与业务全部成功也必须分开观察。
+
+验证覆盖正常多消费者不丢不重、空输入、生产异常、消费者失败且队列容量耗尽、总超时、协调线程中断以及任务实际清理；通过 Latch 安排失败窗口，不能靠 sleep 猜测生产者已阻塞。实际 HTTP、文件和数据库适配器仍需自己的集成验证。
+
 ## 14. Future 与 CompletableFuture 编排
 
 > CompletableFuture 同时提供未来结果和阶段编排能力：以可见的结果状态保存正常值或异常，以完成节点连接前后依赖，通过 CAS 协调结果发布和节点登记，前置阶段完成后推动满足条件的后续动作。线程池负责调度执行，Future 对象负责结果与依赖；thenApply 适合短小转换，thenCompose 表达依赖另一个异步结果的流程，thenCombine 合并两个正常结果。非 Async 回调的执行线程取决于完成与注册时序，耗时计算或阻塞操作应使用明确且合适的执行器；后续 Async 阶段不会自动继承前一步指定的线程池。业务还需观察异常与拒绝、统一截止时间、避免池内阻塞依赖，并按任务归属管理取消和清理；Future 完成或取消不代表底层 I/O、资源释放和外部副作用已经结束。
@@ -1783,17 +2025,189 @@ finally 里的 cancel 只结束尚未完成的 CompletableFuture 结果，并不
 
 ## 15. ThreadLocal 与上下文传播
 
+> ThreadLocal 通过每个线程独立持有的 ThreadLocalMap 隔离变量绑定：以 ThreadLocal 对象为 key，保存当前线程的 value，set/get/remove 都先定位当前线程再操作它的 Map。Entry 对 key 使用弱引用，避免 Map 单独阻止已被业务放弃的 ThreadLocal 回收；对 value 使用强引用，保证已保存的数据在使用期间不会因 GC 意外消失。但 key 被回收不会自动解除 value 的强引用，所以业务仍需在作用域结束时主动清理。跨线程时，由任务包装器捕获并携带上下文，再向执行线程自己的 Map 安装，退出时恢复旧值或删除绑定；绑定独立不等于 value 对象独立，应优先传递轻量、不可变的快照。
+
 ### 15.1 线程局部不等于请求局部
 
-ThreadLocal 的值按线程存储。线程池复用工作线程时，前一个请求留下的 TraceId、租户或安全信息可能被下一个请求读到。即使没有内存泄漏，也可能已经形成数据隔离错误。
+#### Thread、ThreadLocal 与 ThreadLocalMap 的关系
 
-其 Map 中 key 为弱引用、value 为强引用；key 消失后，遗留项清理取决于后续操作等机制，不保证立即全部清除。也不能声称“重复放入十次大对象必然保留十份”，因为中途可能触发清理。
+以下普通 ThreadLocal 的实现细节以 OpenJDK `jdk-21+35` 为基线；继承型变量另见第 15.4 节。
 
-`InheritableThreadLocal` 在线程创建时传递，不是每次提交线程池任务时传递；复用线程池不能依赖它获得本次请求上下文。
+| 对象 | 持有内容或职责 | 容易混淆的地方 |
+| --- | --- | --- |
+| Thread | 用 threadLocals 字段持有本线程的 Map，按需创建 | 线程结束与一次请求结束不是同一事件 |
+| ThreadLocal | 提供访问入口，同时作为 Map 的 key | 一个 ThreadLocal 对象可以被多个线程共同使用 |
+| ThreadLocalMap | 用 Entry 数组保存当前线程的多个绑定 | 虽定义为 ThreadLocal 的静态内部类，实例却由 Thread 持有 |
+| Entry | 弱引用 key，强引用 value | Entry 本身仍被数组强引用，不是整条记录都弱引用 |
+
+假设 USER、TRACE 是两个共享的 ThreadLocal 对象，两个线程分别赋值后：
+
+```text
+Thread A → Map A → Entry：key 弱引用 USER，value 强引用 "张三"
+                → Entry：key 弱引用 TRACE，value 强引用 "req-A"
+
+Thread B → Map B → Entry：key 弱引用 USER，value 强引用 "李四"
+                → Entry：key 弱引用 TRACE，value 强引用 "req-B"
+```
+
+两个 Map、各自的 Entry 独立，但 USER、TRACE 各只有一个对象。`static final ThreadLocal` 共享的是稳定的键，不把各线程的值合并成一个全局值。普通访问路径操作当前线程自己的 Map，因此不靠对同一个全局 Map 加锁实现隔离；把同一个可变对象存入不同线程，则仍需处理对象本身的并发访问。
+
+#### set、get、remove 怎样执行
+
+1. **set(value)**：取得 `Thread.currentThread()` 和它的 threadLocals；Map 不存在则创建并放入首条记录，否则以当前 ThreadLocal 对象（this）为 key 插入或更新。Map 用 `threadLocalHashCode & (table.length - 1)` 定位，冲突时线性探测后续槽位；键匹配按对象身份判断。遇到失效项会进入替换、清理路径，插入后还可能清理或扩容，不使用 HashMap 的链表/红黑树方案。
+2. **get()**：查当前线程的 Map；找到 Entry 就返回 value，包括 value 为 null 的情况。找不到记录时调用 initialValue，保存结果再返回；默认初始值为 null，withInitial 可指定初始化函数。因此 get 可能创建 Map 或插入记录，并非永远只读。直接命中通常不清理其他失效项，探测未命中的路径可能清理遇到的失效项。
+3. **remove()**：仅查当前线程的 Map；找到对应 Entry 后清除其弱 key，再由 expungeStaleEntry 清除 value 和槽位，并重新安排后续探测区间中的有效 Entry。删除后若留下空洞却不整理，原本因冲突后移的记录可能无法查到。remove 不删除其他线程的绑定，也不销毁 ThreadLocal 对象或自动销毁整个 Map。
+
+例如以下完整教学类 `ThreadLocalBasics.java` 演示初始化与删除的区别；跨线程隔离在第 15.2 节的单工作线程案例中验证：
+
+```java
+public final class ThreadLocalBasics {
+    private static final ThreadLocal<String> USER =
+            ThreadLocal.withInitial(() -> "未登录");
+    private static final ThreadLocal<String> TRACE = new ThreadLocal<>();
+
+    public static void main(String[] args) {
+        try {
+            USER.set("张三");
+            TRACE.set("req-A");
+            System.out.println(USER.get() + "/" + TRACE.get()); // 张三/req-A
+            USER.set(null);
+            System.out.println(USER.get()); // null：记录存在，不触发初始化
+            USER.remove();
+            System.out.println(USER.get()); // 未登录：重新初始化并建立记录
+            System.out.println(TRACE.get()); // req-A：另一个键不受影响
+        } finally {
+            USER.remove(); // 前面的 get 又创建了记录，仍需清理
+            TRACE.remove();
+        }
+    }
+}
+```
+
+依据：[ThreadLocal API](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/ThreadLocal.html)、[OpenJDK 21 get/set/remove、ThreadLocalMap 与 expungeStaleEntry](https://raw.githubusercontent.com/openjdk/jdk/jdk-21%2B35/src/java.base/share/classes/java/lang/ThreadLocal.java)。
+
+#### key 弱引用、value 强引用分别解决什么
+
+下面用教学结构表达 Entry，不是另一个可替代 JDK 实现的 Map：
+
+```text
+Entry extends WeakReference<ThreadLocal<?>>
+    弱引用的 referent = key（ThreadLocal 对象 L）
+    普通 Object 字段 value = 业务对象 V
+```
+
+**L 和 V 是两个需要分别判断可达性的对象；key 被清除、Entry 被删除、V 被回收也是不同事件。** key 使用弱引用，使 Map 不会单独阻止业务已经放弃的 L 回收，并让失效记录可被后续操作识别。即使实际业务常用 static final，局部变量或短寿命组件的实例字段也可以持有 ThreadLocal；弱 key 对这些生命周期短于工作线程的用法仍有意义。
+
+value 使用强引用是为了维持存储语义。例如 `BUFFER.set(new byte[1024])` 后数组没有其他业务引用，后续仍应能通过 BUFFER.get 取回；如果 value 也只用弱引用，一次 GC 就可能使仍需使用的数据消失。强 value 本身是正常设计，问题在于业务已不需要数据，却未结束绑定。
+
+#### 先分别判断 ThreadLocal 对象与 value 的可达性
+
+本节示例只使用普通强引用和 Map 对 key 的弱引用，不涉及软引用或对象复活。从 GC Roots 出发，只要还有一条完整强引用路径，对象就仍然强可达；一条弱引用不会削弱另一条强引用。执行栈中仍有效的引用、JNI 引用，以及通过可达类和静态字段等形成的路径，都要纳入判断，不能只检查某个局部变量是否置空。
+
+| 判断对象 | 仍被保留的典型路径 | 何时具备回收条件 |
+| --- | --- | --- |
+| ThreadLocal 对象 L | 可达静态字段 → L；可达组件 → 实例字段 → L；或者 value 间接引用 L | 业务等路径不再强引用 L，且没有其他阻止回收的引用；Map 的弱 key 本身不会阻止它回收 |
+| value 对象 V | 存活线程 → Map → Entry → V；调用方变量、缓存、任务包装器或其他线程的 Entry → V | Entry 的保留路径解除，且其他地方也不再强引用 V；只回收 L 并不能满足这一条件 |
+
+请求结束不是 GC 的触发规则。变量仍处于源码作用域内，也不保证其引用一直被运行时视为存活：JIT 可以在不破坏 Java 访问语义的前提下提前结束不再使用的引用的存活范围。正确实现的 GC 不会回收仍需通过有效强引用访问的对象；业务已不用但对象仍可达而被保留，是生命周期管理问题。下文的方法返回只用作便于分析的边界，不承诺对象一定等到右花括号才具备回收条件。依据：[引用与可达性](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/ref/package-summary.html)、[Reference 与 reachabilityFence](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/ref/Reference.html)。
+
+#### 四段代码对照：静态键、局部键与外部 value 引用
+
+以下为完整教学类 `ThreadLocalReachability.java`，用于引用关系推演，假设所属类由长期存活的应用类加载器加载。每个方法单独分析；只有 retainByMistake 故意遗漏清理，不在长期复用的业务线程上运行它。使用新数组避免字符串常量池等额外引用影响分析。
+
+```java
+public final class ThreadLocalReachability {
+    private static final ThreadLocal<byte[]> BUFFER = new ThreadLocal<>();
+
+    public static void useStaticKey() {
+        try {
+            BUFFER.set(new byte[1024]);
+            BUFFER.get()[0] = 1;
+        } finally {
+            BUFFER.remove();
+        }
+    }
+
+    public static void useLocalKey() {
+        ThreadLocal<byte[]> local = new ThreadLocal<>();
+        try {
+            local.set(new byte[1024]);
+            local.get()[0] = 2;
+        } finally {
+            local.remove();
+        }
+    }
+
+    public static void retainByMistake() {
+        ThreadLocal<byte[]> local = new ThreadLocal<>();
+        local.set(new byte[1024]);
+        // 反例：丢弃局部键，却没有删除工作线程中的绑定。
+    }
+
+    public static byte[] removeButReturnValue() {
+        try {
+            BUFFER.set(new byte[1024]);
+            BUFFER.get()[0] = 3;
+            return BUFFER.get(); // 返回引用先保存，finally 执行后交给调用方
+        } finally {
+            BUFFER.remove();
+        }
+    }
+}
+```
+
+**① 静态键：useStaticKey 返回后，L 仍存活，V 可以具备回收条件。** 方法执行期间有两条独立路径：
+
+```text
+可达的类及静态字段 BUFFER ──强引用──→ L
+                                     ↑ 弱引用
+存活工作线程 → Map → Entry ──────────┘
+                      └──强引用──→ V（本次请求的数组）
+```
+
+remove 删除当前线程的对应 Entry，不清除静态字段，也不销毁 L。没有其他引用的本次数组 V 随之具备回收条件；L 继续由 BUFFER 强引用，供下一次请求复用。这是正常设计。原因是静态字段持续可达，不是“每次请求都在使用”；即使长期没有请求，也不会因此自动释放 L。static 也不意味着任何情况下都活到 JVM 退出，所属类卸载及引用路径变化仍需按实际可达性判断。
+
+如果去掉这里的 finally，且线程持续存活、记录未覆盖或清理，则 **L 和 V 都会被保留**。L 仍有效，失效项清理不会把它当作垃圾；不必先出现 key=null，旧 V 就可能已经超出业务需要而长期滞留。反过来，执行 remove 后静态 L 仍存活，不妨碍 V 回收。
+
+**② 局部键且正确清理：useLocalKey 返回后，L、V 都可以具备回收条件。** local 没有逃逸到其他对象，Entry 也已经删除；L 没有剩余业务强引用，V 没有 Entry 或其他对象继续保留。remove 的职责仍然只是解除绑定，不是强制 GC。
+
+**③ 局部键但遗漏清理：retainByMistake 返回后，L 可以被回收，V 可能继续滞留。** 假设工作线程继续存活且尚未清理这条记录，过程是：
+
+```text
+方法返回、局部引用不再存活：
+存活线程 → Map → Entry ──弱引用──→ L（无其他强引用，可被回收）
+                    └──强引用──→ V（仍被保留）
+
+当 GC 清除弱 key 后：
+存活线程 → Map → Entry
+                    ├─ key：null
+                    └─ value ──强引用──→ V（仍被保留）
+```
+
+GC 清除弱 key 不会自动执行 `Entry.value = null` 或删除数组槽位，也不等于立刻释放 L 的内存。这一实现不通过引用队列及时删除失效项，而依赖后续部分 Map 操作清理，见前面的 set/get/remove 流程；线程空闲或操作未触及相应路径时，V 可能长期保留。中途也可能触发清理，因此不能声称“调用十次必然永久留下十份数组”。
+
+**④ 删除 Entry 仍不等于 V 可回收：removeButReturnValue 把数组交给了调用方。** 例如下面的方法体片段：
+
+```java
+byte[] held = ThreadLocalReachability.removeButReturnValue();
+System.out.println(held[0]); // 3：remove 不会销毁调用方仍持有的数组
+```
+
+在调用方仍需使用 held 的时段，引用链是 `执行栈中的有效引用 held → V`。虽然当前线程的 Entry 已删除，但 V 仍强可达；只有调用方及其他对象都不再保留它，V 才具备回收条件。异步任务包装器、缓存或其他线程的 Entry 也可能形成同类路径，第 15.2 节的跨线程传递不会深拷贝 value。
+
+#### 弱 key 不能替代完整引用图与业务清理
+
+局部变量消失也不能单独证明 L 可回收：如果将 local 保存到一个可达 Holder 的字段，仍有 `GC Roots → Holder → local字段 → L`。再如方法片段 `ThreadLocal<Object> local = new ThreadLocal<>(); local.set(local);`，当线程持续存活且记录未清理时，有 `线程 → Map → Entry → value → L` 这条完整强引用链；弱 key 无法让 L 回收。环形引用本身不是问题，是否仍有根可达路径才是关键。
+
+对 V，需要检查每一条保留路径分别何时断开：当前线程调用 remove，或者 set 新值（包括 null），可以解除这一条 Entry 对旧 V 的引用；失效记录实际被清理也能解除该路径；OpenJDK 21 在线程退出时会清除 threadLocals 等字段，释放相应 Map 的持有关系。**任务完成或线程池线程空闲不是线程退出**，不能等待后者代替请求级清理。以上变化均不影响其他仍存活的 V 引用；set(null) 虽可解除旧值引用，却保留该键的记录，不能等同于 remove。依据：[Thread.clearReferences / exit](https://raw.githubusercontent.com/openjdk/jdk/jdk-21%2B35/src/java.base/share/classes/java/lang/Thread.java)。
+
+因此，应分别问“谁还在强引用 L”和“谁还在强引用 V”，而不是把“请求结束 → L 被回收 → 只留下 V”当作必然顺序。具备回收条件不等于已经回收，System.gc 也不保证指定对象立即释放。堆分析分别检查 Entry 的 key、value 及到 GC Roots 的保留路径；诊断方法复用 [[01-Java基础与并发/JVM/JVM|JVM]]。本节代码用于展示引用关系，不能凭一次打印、强制 GC 或 OOM 推断固定回收时刻。依据：[System.gc 契约](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/System.html#gc())。
 
 ### 15.2 在提交时捕获，在执行时安装，在退出时恢复
 
-下面是完整的 `ContextTasks.java`，仅处理本例自有的小型上下文；`null` 约定为无上下文。恢复旧值可以兼容嵌套执行和 CallerRuns，不把外层合法上下文误删。
+#### 统一封装上下文及其作用域
+
+业务场景是同一个请求内跨多层方法记录 traceId，或传递已经认证和授权校验的 tenantId。核心业务参数（例如 orderId、patientId）仍通过方法参数传递，不把整个请求、大报告、连接或实体放入隐式上下文。下面沿用第 11.7 节 TaskDecorator 使用的完整 `ContextTasks.java`，适用于 JDK 17/21；仅管理本例自有的小型上下文，null 约定为“无上下文”。
 
 ```java
 import java.util.Objects;
@@ -1812,6 +2226,14 @@ public final class ContextTasks {
         return LOCAL.get();
     }
 
+    public static Context requireCurrent() {
+        Context context = current();
+        if (context == null) {
+            throw new IllegalStateException("当前线程没有业务上下文");
+        }
+        return context;
+    }
+
     public static void install(Context context) {
         if (context == null) {
             LOCAL.remove();
@@ -1822,29 +2244,208 @@ public final class ContextTasks {
 
     public static Runnable capture(Runnable action) {
         Objects.requireNonNull(action);
-        Context captured = current();
+        Context captured = current(); // 捕获发生在调用 capture 的线程
         return () -> {
-            Context previous = current();
+            Context previous = current(); // 这里才进入实际执行线程
             try {
                 install(captured);
                 action.run();
             } finally {
-                install(previous);
+                install(previous); // 有旧值就恢复，没有就 remove
             }
         };
     }
 }
 ```
 
-必须在提交线程中调用 `ContextTasks.capture(task)`，不是等进入工作线程再捕获。它复制的是不可变记录引用；如果上下文装可变 Map，就要定义复制与修改规则。
+#### 同步请求：入口安装，业务只读，出口清理
 
-此包装不负责 Spring Security、MDC、事务连接等框架上下文，生产应使用相应框架支持并逐类界定传播范围。租户 ID 的传播不能代替授权校验。数据库事务通常绑定调用线程，不应该把连接或事务资源复制给并行任务。
+下面的完整教学类 `RequestEntry.java` 表达顶层同步请求的作用域。verified 必须来自已校验的身份及追踪入口，不直接信任客户端传来的租户字段。此类不实现 HTTP 解析或权限认证，next 表示同线程的 Controller → Service 调用链；业务层通过 ContextTasks.requireCurrent 读取，不能自行提前清理。
+
+```java
+import java.util.Objects;
+
+public final class RequestEntry {
+    public static void handle(ContextTasks.Context verified, Runnable next) {
+        Objects.requireNonNull(verified);
+        Objects.requireNonNull(next);
+        try {
+            ContextTasks.install(verified);
+            next.run();
+        } finally {
+            ContextTasks.install(null);
+        }
+    }
+}
+```
+
+该入口拥有整次同步请求，所以退出时清理；不要把它当作嵌套作用域工具。实际 Servlet 同步过滤器在 doFilterInternal 内安装，包住 filterChain.doFilter 并在 finally 清理即可；异步分派和错误分派需要单独定义作用域，不能把“每次请求”理解为始终只有一条线程。若项目已经用框架管理 MDC、安全上下文等，应复用其生命周期，避免再建立相互不一致的数据源。
+
+#### 异步传递本质上是给两个线程的 Map 分别赋值
+
+只有一个异步方法需要 traceId 时，优先在提交前读取并作为参数传入；只有异步调用链确实依赖统一上下文接口时，才使用 capture。过程为：
+
+```text
+请求线程：从自己的 Map 读取 Context A
+                 ↓
+任务包装器：持有 Context A 的引用，随任务入队
+                 ↓
+工作线程：保存旧绑定，将 A 写入自己的 Map，执行业务
+                 ↓
+工作线程：finally 恢复旧绑定；原来没有则 remove
+```
+
+两个线程使用同一个 LOCAL 键，但 Map、Entry 各自独立；在请求线程清理不会删除工作线程的绑定。包装器携带的是同一个不可变 Context 对象的引用，没有深拷贝。record 包含可变集合时也不会自动深度不可变，需要按第 4 章定义快照边界。安全发布由执行器的任务提交协议提供，不来自 ThreadLocal 自身。
+
+必须在提交前调用 `ContextTasks.capture(task)`，不能写成 `executor.execute(() -> ContextTasks.capture(task).run())`，后者到工作线程才捕获，会读错来源。每次新提交重新捕获，不缓存一个包装任务反复代替不同请求。即使捕获到 null，也要在执行期间安装“无上下文”，否则可能误读执行线程的旧值。
+
+#### 单工作线程连续处理请求 A、B
+
+下面完整的 `OrderContextDemo.java` 只模拟订单通知日志，不发送真实通知、不访问数据库。main 模拟两个顶层请求的提交方，order-worker 是同一个被复用的工作线程。目标是验证它依次读到 A、B 的上下文，之后不遗留值；订单只是说明调用层次，不实现订单状态机或可靠消息。
+
+```java
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+public final class OrderContextDemo {
+    public static void main(String[] args) throws Exception {
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(
+                1, 1, 0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(4),
+                task -> new Thread(task, "order-worker"),
+                new ThreadPoolExecutor.AbortPolicy());
+        try {
+            Future<?> a = submit(pool, "req-A", "租户A", 1001L);
+            Future<?> b = submit(pool, "req-B", "租户B", 1002L);
+            a.get(5, TimeUnit.SECONDS);
+            b.get(5, TimeUnit.SECONDS);
+
+            // 故意不包装探针，检查同一个工作线程的真实残留。
+            boolean empty = pool.submit(() -> {
+                try {
+                    return ContextTasks.current() == null;
+                } finally {
+                    ContextTasks.install(null);
+                }
+            }).get(5, TimeUnit.SECONDS);
+            if (!empty || ContextTasks.current() != null) {
+                throw new AssertionError("提交线程或工作线程遗留上下文");
+            }
+        } finally {
+            ContextTasks.install(null);
+            // 池只属于本次演示；生产共享池由第 11 章的管理者关闭。
+            pool.shutdownNow();
+            if (!pool.awaitTermination(5, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("演示线程池未退出");
+            }
+        }
+    }
+
+    private static Future<?> submit(ThreadPoolExecutor pool,
+                                    String traceId, String tenantId,
+                                    long orderId) {
+        try {
+            ContextTasks.install(new ContextTasks.Context(traceId, tenantId));
+            return pool.submit(ContextTasks.capture(() -> notifyOrder(orderId)));
+        } finally {
+            // 只清理当前提交线程；包装器已持有该次上下文。
+            ContextTasks.install(null);
+        }
+    }
+
+    private static void notifyOrder(long orderId) {
+        recordNotification(orderId); // 下层方法不用逐层传 traceId
+    }
+
+    private static void recordNotification(long orderId) {
+        ContextTasks.Context context = ContextTasks.requireCurrent();
+        System.out.printf("[%s] 订单=%d，traceId=%s，租户=%s%n",
+                Thread.currentThread().getName(), orderId,
+                context.traceId(), context.tenantId());
+    }
+}
+```
+
+预期日志依次为订单 1001/req-A/租户A、订单 1002/req-B/租户B，线程名均为 order-worker。get 在这里仅用于演示中观察完成与异常；不代表业务提交后必须同步等待，也不能忽略真实异步任务的失败归属。未包装的探针检查实际残留，若给探针也套 capture，它可能临时遮住脏值，从而误判清理成功。
+
+| 动作 | 提交线程的 Map | 工作线程的 Map |
+| --- | --- | --- |
+| 提交 A | 安装 A，包装器捕获 A，退出入口后删除 | 开始执行时安装 A，结束时恢复原状态 |
+| 提交 B | 安装 B，包装器捕获 B，退出入口后删除 | 复用同一线程，开始执行时安装 B，结束时恢复原状态 |
+| 两个任务都结束 | 本例无上下文 | 本例无上下文 |
+
+表中是各线程自己的顺序，不承诺提交线程清理必然早于或晚于异步执行。包装器持有独立引用，因此请求线程先清理也不影响任务获取其捕获值。它不会复制所有 ThreadLocal；业务只能清理自己拥有的变量，不能反射清空线程上的框架状态。
 
 ### 15.3 异常与嵌套路径同样重要
 
-测试应覆盖：单线程池连续处理租户 A、B；任务抛异常；同线程嵌套包装；没有上下文的请求；拒绝导致任务未运行。只能清理自己拥有的 ThreadLocal，不能通过反射清空线程上所有框架状态。
+#### 为什么退出时恢复旧值，而不总是 remove
 
-恢复旧值是作用域协议，不是修复已有脏数据的万能方法。请求入口仍需安装本次合法上下文，出口清理；后台工作线程的初始状态也要受控。大病历、缓存和连接不宜放入上下文，避免延长保留时间。
+第 15.2 节顶层请求入口退出时删除自己的绑定，通用任务包装器则必须考虑嵌套执行或 CallerRuns：
+
+```text
+执行线程原有 B → 包装任务安装捕获的 A → 执行业务 → finally 恢复 B
+执行线程原无值 → 包装任务安装捕获的 A → 执行业务 → finally remove
+```
+
+线程池饱和时，CallerRunsPolicy 可能让提交线程直接执行任务；若无条件 remove，会误删尚未结束的外层请求上下文。恢复旧值保护的是已有作用域，不是修复历史脏数据的万能方法：所有入口仍需遵守安装与退出协议，后台线程初始状态也要受控。CallerRuns 还有阻塞提交者、关闭后丢弃任务的边界，见第 11.3 节及 [CallerRunsPolicy 契约](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.CallerRunsPolicy.html)。
+
+| 路径 | 上下文和任务责任 |
+| --- | --- |
+| 业务正常或抛异常 | 包装器 finally 恢复，异常交给调用方/Future 观察，不吞掉失败 |
+| 捕获时没有上下文 | 执行期间清除旧绑定，退出时恢复旧值；必需上下文缺失应显式失败 |
+| AbortPolicy 拒绝 | 包装任务未运行，没有向工作线程安装上下文；提交线程仍在自己的 finally 清理并处理拒绝 |
+| 启动前成功取消 | 业务包装体可能根本不运行；本方案不预先向工作线程安装，所以不依赖它的 finally 才完成解绑 |
+| 运行中取消或超时 | 实际执行到 finally 才恢复；Future 已取消不证明已清理，继续按第 10 章观察实际退出 |
+| 同线程嵌套、CallerRuns | 保存并恢复外层上下文，不误删调用方仍需使用的值 |
+
+任务排队期间，包装器仍会强引用捕获快照；即使 ThreadLocal 已 remove，也不能据此推导队列中的快照已回收。保持载荷轻量、队列有界，取消与停机后处理未运行任务的归属；也不要把包装任务长期缓存。该方案只传播自有上下文，不负责 Spring Security、MDC 或事务连接；租户 ID 传递不等于授权，不能把数据库连接或事务资源复制给并行任务。
+
+第 11.7 节已经通过 TaskDecorator 接入同一 capture 协议，使用该 Bean 时无需再重复套同一层包装。对 CompletableFuture 的后续阶段，实际提交者可能是完成上游的其他线程；需在约定的注册时点捕获或显式传参，不能认为装饰器自动继承最初请求，具体时序见第 14.2 节。
+
+验证应覆盖同一工作线程连续 A/B、排队期间提交方切换或清理、异常、空上下文、同线程嵌套、真实 CallerRuns 和拒绝。第 19.4 节已有异常与恢复实验；本章示例通过未包装探针检查残留，不以打印或 sleep 代替断言。验证边界统一记录在第 20.3 节。
+
+### 15.4 InheritableThreadLocal 为什么不等于任务上下文传播
+
+InheritableThreadLocal 使用线程的 inheritableThreadLocals；在允许继承的子线程创建期间，从创建者取得初始绑定，而不是在每次提交线程池任务时重新捕获。默认 childValue 返回父线程的 value 引用，各自的 Map 独立，但 value 仍可能共享；重写 childValue 可以改变初始值，却不改变触发时点。
+
+```text
+请求 A 设置 A → 第一次提交，创建 worker → worker 继承 A
+请求 A 结束  → 提交线程清理             → worker 中的 A 不受影响
+请求 B 设置 B → 第二次提交，复用 worker → 不发生继承，可能仍读到 A
+```
+
+下面是方法片段，可放入独立类验证；故意复用同一个默认允许继承的平台线程，不发送业务请求：
+
+```java
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+static void demonstrateInheritance() throws Exception {
+    InheritableThreadLocal<String> inherited = new InheritableThreadLocal<>();
+    ThreadPoolExecutor pool = new ThreadPoolExecutor(
+            1, 1, 0L, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(2));
+    try {
+        inherited.set("A");
+        System.out.println(pool.submit(inherited::get).get(5, TimeUnit.SECONDS)); // A
+        inherited.set("B");
+        System.out.println(pool.submit(inherited::get).get(5, TimeUnit.SECONDS)); // 仍为 A
+        pool.submit(inherited::remove).get(5, TimeUnit.SECONDS);
+        System.out.println(pool.submit(inherited::get).get(5, TimeUnit.SECONDS)); // null
+    } finally {
+        inherited.remove();
+        pool.shutdownNow();
+        if (!pool.awaitTermination(5, TimeUnit.SECONDS)) {
+            throw new IllegalStateException("继承实验线程池未退出");
+        }
+    }
+}
+```
+
+第三次读取说明：在 worker 清理 A 后，也不会自动继承提交线程中的 B。若提前在没有上下文时预启动线程，任务可能从一开始就读不到请求值；若线程工厂禁用继承，也不会按上例得到 A。结论是“线程创建时继承”可用于明确的新子线程场景，却不能直接满足复用线程池所需的“每任务捕获、安装、恢复”。依据：[InheritableThreadLocal 与 childValue 契约](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/InheritableThreadLocal.html)。
 
 ## 16. ForkJoin 与虚拟线程
 
@@ -2315,6 +2916,8 @@ jcmd <PID> Thread.print -l
 jcmd <PID> help JFR.start
 ```
 
+对第 5.5 节的双锁反例，应从同一组线程栈还原 `T1 持有 A、等待 B；T2 持有 B、等待 A`，把等待对象标识与持有线程对应起来，而非仅凭两个 WAITING 状态判断。synchronized 竞争通常显示 BLOCKED；ReentrantLock 竞争常显示 parking，并可在转储的 ownable synchronizer 信息中找到持有关系。`findMonitorDeadlockedThreads` 面向 monitor，`findDeadlockedThreads` 还覆盖可拥有同步器；JDK 21 的 ThreadMXBean 不监控虚拟线程，也不检测所有 Future、线程池槽位或连接池资源等待环。检测返回空不能证明系统没有活性问题。依据：[ThreadMXBean 契约](https://docs.oracle.com/en/java/javase/21/docs/api/java.management/java/lang/management/ThreadMXBean.html)。
+
 线程转储并非零成本。按合适间隔抓少量快照，看相同等待栈是否持续存在，不把一张瞬时快照当根因。JFR 能辅助分析 monitor 竞争、park、CPU 与执行采样；堆保留分析见 JVM 文档。
 
 | 证据组合 | 优先调查 | 不应直接得出的结论 |
@@ -2691,6 +3294,12 @@ java VirtualThreadProbe
 5. 性能与正确性验证：分别使用 JMH、jcstress 和项目故障注入，不用一个吞吐数字替代全部结论。
 
 ### 20.3 本次验证记录
+
+- 2026-11-06 死锁与生产者—消费者退出协议：新增第 5.5 节双账户等待环、统一加锁顺序与共同等待预算，新增第 13.4 节正常排空、失败中止、结束标记及数据恢复边界，第 19.2 节补充等待图与检测范围。核对 JDK 21 锁、队列、CompletionService 与 ThreadMXBean 契约；OrderedTransfers、BoundedPipeline 和定向测试以 JDK 17.0.11 编译，在 JDK 17.0.11、21.0.3 运行通过。先以闸门形成可中断双锁死锁并检测两线程，再中断清理；验证双向各 1000 次转账守恒、第二把锁超时后第一把锁可被其他线程取得，以及流水线正常多消费者、空输入、生产失败、消费失败、超时和协调者中断。测试均有等待上限，验证专用执行器结束；未执行数据库、HTTP 或生产容量测试，不承诺非合作式 I/O 可强制退出。
+
+- 2026-11-06 ThreadLocal 回收对象澄清：结合引用对话重写第 15.1 节原有弱引用与泄漏说明，分别追踪 ThreadLocal 键对象 L 和业务值 V；以静态键、局部键、遗漏清理和 remove 后返回值四段代码说明可达性，保留失效 Entry 清理及反向引用边界，补充覆盖旧值、线程退出和其他引用的影响。核对 JDK 21 引用 API 与 Thread.clearReferences/exit；新增 ThreadLocalReachability 教学类在 JDK 17.0.11、21.0.3 编译通过，执行正确清理路径，并验证 remove 后返回数组仍可使用、两次调用的数组独立。未运行故意遗漏清理的方法，未强制 GC、制造 OOM 或声称验证具体回收时刻；检查代码围栏、标题、链接和快照差异，修改范围仅为第 15.1 节及本条记录。
+
+- 2026-11-06 ThreadLocal 专题融合：扩充第 15.1 节的对象关系、set/get/remove、弱 key 与强 value 的设计及泄漏引用链；第 15.2 节沿用 ContextTasks，补充同步入口和单工作线程 A/B 任务示例；第 15.3～15.4 节补齐恢复、拒绝、取消、排队引用与 InheritableThreadLocal 的创建时继承边界。源码基线为 OpenJDK `jdk-21+35`；从正文提取 4 个完整类及继承实验片段，在 JDK 17.0.11、21.0.3 编译运行，示例输出符合预期，两个版本均通过 7 组定向断言：初始化/空值/删除与隔离、同步入口异常清理、排队捕获与 A/B 复用、异步异常/嵌套/空上下文恢复、真实饱和 CallerRuns、拒绝后入口清理、继承时点。使用有界等待和闸门，不依赖 sleep，实验池均关闭；检查代码围栏、标题、引用及快照差异。未强制 GC 或制造 OOM，泄漏结论来自源码及可达性分析；未执行 Servlet、MDC、安全框架、真实订单通知或数据库集成，示例不代表生产业务已实现。
 
 - 2026-11-05 CompletableFuture 业务边界补充：将最终阶段归属、选择性降级、观测异常、上下文捕获时点和共享结果隔离融入第 14.1～14.3 节，新增第 14.7 节的入口拒绝与有界分页查询，复用既有聚合器、线程池管理、取消和恢复说明。按 JDK 21 API 与 OpenJDK `jdk-21+35` 源码核对；从最终正文提取新增 3 个教学类及既有 PatientAggregation，在 JDK 17.0.11、21.0.3 编译通过，两个版本均通过 6 组定向实验：最终阶段与降级/观测异常、共享期限与完成权限隔离、入口/派生拒绝及 allOf/anyOf、窗口上限与失败停止翻页、聚合超时早于底层清理、排队消耗总预算。使用有界等待和闸门控制时序，完成后关闭实验执行器；检查代码围栏、标题、图片引用与快照差异。未连接真实数据库、HTTP 或 Spring 上下文传播组件，分页一致性、适配器超时、资源实际取消、幂等输出与容量仍需集成验证，示例窗口和预算不代表生产定参。
 - 2026-11-05 CompletableFuture 原理图补充：在第 14 章增加一段原理与使用技巧总结，第 14.2 节回链到新增第 14.6 节，将纯 thenApply 简洁时序图和顶部带代码的 supplyAsync→thenApply→thenApplyAsync 图保存到知识库 image 目录并使用相对链接嵌入；补齐图中辅助方法、节点关联与线程切换的独立示例。按 OpenJDK `jdk-21+35` 源码核对，在 JDK 21.0.3 编译并验证纯链登记及同线程完成传播、指定 io-0/calc-0 的执行顺序，以及完成后注册 thenApply 由 main 执行的路径；图片完成视觉检查，校验 PNG 完整性、引用可达、代码围栏与快照差异。仅验证 JDK 机制，未新增真实 I/O 或性能实验。
