@@ -11,7 +11,7 @@ struct ReflectionEditor: NSViewRepresentable {
         paragraph.lineSpacing = 6
         paragraph.paragraphSpacing = 12
         return [.font: NSFont.systemFont(ofSize: 15),
-                .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph]
+                .foregroundColor: StudyTheme.text, .paragraphStyle: paragraph]
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -28,7 +28,7 @@ struct ReflectionEditor: NSViewRepresentable {
         text.autoresizingMask = [.width]
         text.textContainer?.widthTracksTextView = true
         text.textContainerInset = NSSize(width: 20, height: 18)
-        text.backgroundColor = .textBackgroundColor
+        text.backgroundColor = StudyTheme.canvas
         text.minSize = .zero
         text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         text.delegate = context.coordinator
@@ -89,7 +89,7 @@ enum EvidenceRenderer {
 
     static func attributed(_ source: String, root: String = "") -> NSAttributedString {
         let output = NSMutableAttributedString(string: "")
-        let prose: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 14), .foregroundColor: NSColor.labelColor]
+        let prose: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 14), .foregroundColor: StudyTheme.text]
         for block in blocks(source) {
             switch block {
             case .prose(let text):
@@ -103,14 +103,14 @@ enum EvidenceRenderer {
                 }
             case .code(let language, let code):
                 if !language.isEmpty {
-                    output.append(NSAttributedString(string: language + "\n", attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: NSColor.secondaryLabelColor]))
+                    output.append(NSAttributedString(string: language + "\n", attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: StudyTheme.muted]))
                 }
                 let style = NSMutableParagraphStyle()
                 style.lineSpacing = 3
                 output.append(NSAttributedString(string: code + "\n", attributes: [
                     .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
-                    .foregroundColor: NSColor.labelColor,
-                    .backgroundColor: NSColor.quaternaryLabelColor,
+                    .foregroundColor: StudyTheme.text,
+                    .backgroundColor: StudyTheme.subtle,
                     .paragraphStyle: style
                 ]))
             }
@@ -128,11 +128,13 @@ struct EvidencePreview: NSViewRepresentable {
         scroll.hasVerticalScroller = true
         let text = NSTextView()
         text.isEditable = false; text.isSelectable = true
+        text.insertionPointColor = StudyTheme.text
         text.isVerticallyResizable = true
         text.autoresizingMask = [.width]
         text.textContainer?.widthTracksTextView = true
-        text.textContainerInset = NSSize(width: 12, height: 12)
-        text.backgroundColor = .textBackgroundColor
+        text.textContainerInset = NSSize(width: 24, height: 20)
+        text.linkTextAttributes = [.foregroundColor: StudyTheme.link]
+        text.backgroundColor = StudyTheme.canvas
         text.minSize = .zero
         text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         scroll.documentView = text
@@ -198,13 +200,13 @@ struct EvidenceEditor: View {
                 Spacer()
             }
             if mode == "预览" {
-                if source.isEmpty { Text("在“源码”中粘贴记录；用三反引号包围代码，可在此预览。").font(.caption).foregroundStyle(.secondary) }
+                if source.isEmpty { Text("在“源码”中粘贴记录；用三反引号包围代码，可在此预览。").font(.caption).foregroundStyle(Color(nsColor: StudyTheme.muted)) }
                 EvidencePreview(source: source, root: root).frame(height: 300)
             } else {
                 TextEditor(text: $source).font(.system(size: 13, design: .monospaced)).frame(height: 300)
             }
-            Text("图片添加到记录末尾；⌘S 保存图片引用和笔记。代码保留缩进与换行。").font(.caption).foregroundStyle(.secondary)
-        }.padding(8).background(Color(nsColor: .textBackgroundColor)).clipShape(RoundedRectangle(cornerRadius: 8))
+            Text("图片添加到记录末尾；⌘S 保存图片引用和笔记。代码保留缩进与换行。").font(.caption).foregroundStyle(Color(nsColor: StudyTheme.muted))
+        }.padding(12).background(Color(nsColor: StudyTheme.canvas)).clipShape(RoundedRectangle(cornerRadius: 6))
         .alert("图片未能添加", isPresented: Binding(get: { imageError != nil }, set: { if !$0 { imageError = nil } })) {
             Button("好", role: .cancel) { imageError = nil }
         } message: { Text(imageError ?? "") }

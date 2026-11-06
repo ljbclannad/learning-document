@@ -13,8 +13,8 @@ enum NotesMarkdown {
             let weight: NSFont.Weight = bold || intent.contains(.stronglyEmphasized) ? .semibold : .regular
             var font = intent.contains(.code) ? NSFont.monospacedSystemFont(ofSize: size - 1, weight: weight) : NSFont.systemFont(ofSize: size, weight: weight)
             if intent.contains(.emphasized) { font = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask) }
-            var attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
-            if intent.contains(.code) { attributes[.backgroundColor] = NSColor.quaternaryLabelColor }
+            var attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: StudyTheme.text]
+            if intent.contains(.code) { attributes[.backgroundColor] = StudyTheme.subtle }
             if intent.contains(.strikethrough) { attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
             if let link = run.link { attributes[.link] = link }
             result.append(NSAttributedString(string: String(parsed.characters[run.range]), attributes: attributes))
@@ -34,7 +34,7 @@ enum NotesMarkdown {
                 style.lineSpacing = 4; style.paragraphSpacing = 14
                 result.append(NSAttributedString(string: code + "\n", attributes: [
                     .font: NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
-                    .foregroundColor: NSColor.labelColor, .backgroundColor: NSColor.quaternaryLabelColor,
+                    .foregroundColor: StudyTheme.text, .backgroundColor: StudyTheme.subtle,
                     .paragraphStyle: style]))
             case .prose(let prose):
                 for line in prose.components(separatedBy: "\n") {
@@ -42,12 +42,16 @@ enum NotesMarkdown {
                     let style = NSMutableParagraphStyle()
                     style.lineSpacing = 6; style.paragraphSpacing = 10
                     let paragraph: NSMutableAttributedString
-                    if let image = ImageAttachments.attachment(line, root: root) {
+                    if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                        // Markdown 段落分隔只留小间距，避免原文空行叠加成大块留白。
+                        paragraph = NSMutableAttributedString(string: "", attributes: [.font: NSFont.systemFont(ofSize: 4)])
+                        style.lineSpacing = 0; style.paragraphSpacing = 4
+                    } else if let image = ImageAttachments.attachment(line, root: root) {
                         paragraph = NSMutableAttributedString(attributedString: image)
                     } else if let match = heading.firstMatch(in: line, range: range) {
                         let level = (line as NSString).substring(with: match.range(at: 1)).count
                         let title = (line as NSString).substring(with: match.range(at: 2))
-                        paragraph = NSMutableAttributedString(attributedString: inline(title, size: CGFloat(max(16, 26 - level * 2)), bold: true))
+                        paragraph = NSMutableAttributedString(attributedString: inline(title, size: CGFloat([30, 24, 20, 17, 16, 15][level - 1]), bold: true))
                         style.paragraphSpacingBefore = 10; style.paragraphSpacing = 12
                     } else if let match = list.firstMatch(in: line, range: range) {
                         let indent = (line as NSString).substring(with: match.range(at: 1)).replacingOccurrences(of: "\t", with: "    ").count
@@ -64,7 +68,7 @@ enum NotesMarkdown {
                     } else {
                         paragraph = NSMutableAttributedString(attributedString: inline(line, size: 15))
                     }
-                    paragraph.append(NSAttributedString(string: "\n"))
+                    paragraph.append(NSAttributedString(string: "\n", attributes: [.font: NSFont.systemFont(ofSize: line.trimmingCharacters(in: .whitespaces).isEmpty ? 4 : 15)]))
                     paragraph.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: paragraph.length))
                     result.append(paragraph)
                 }
@@ -117,9 +121,9 @@ struct ReflectionNotesEditor: View {
                 if editing { ReflectionEditor(source: $source) }
                 else { EvidencePreview(source: source, root: root, markdown: true) }
             }.frame(height: 420)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.15)))
-            Text("编辑 Markdown 原文，切换到预览查看排版；⌘S 保存到文档。").font(.caption).foregroundStyle(.secondary)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(nsColor: StudyTheme.border)))
+            Text("编辑 Markdown 原文，切换到预览查看排版；⌘S 保存到文档。").font(.caption).foregroundStyle(Color(nsColor: StudyTheme.muted))
         }.frame(maxWidth: 860).frame(maxWidth: .infinity)
     }
 }

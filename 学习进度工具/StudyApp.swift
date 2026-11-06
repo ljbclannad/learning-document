@@ -285,7 +285,7 @@ struct ContentView: View {
     @ObservedObject var model: StudyModel
     @AppStorage("compactWorkspace") private var compactWorkspace = true
     @AppStorage("sidebarVisible") private var sidebarVisible = true
-    let accent = Color(red: 0.15, green: 0.42, blue: 0.32)
+    let accent = Color(nsColor: StudyTheme.link)
     func field(_ key: WritableKeyPath<StudyDay, String>) -> Binding<String> {
         Binding(get: { model.draft?[keyPath: key] ?? "" }, set: { value in model.change { $0[keyPath: key] = value } })
     }
@@ -300,6 +300,8 @@ struct ContentView: View {
             if sidebarVisible { sidebar }
             detail
         }.frame(minWidth: 930, minHeight: 700).textFieldStyle(.roundedBorder)
+        .foregroundStyle(Color(nsColor: StudyTheme.text)).tint(accent)
+        .background(Color(nsColor: StudyTheme.canvas)).groupBoxStyle(StudyPanelStyle())
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Button { sidebarVisible.toggle() } label: {
@@ -312,8 +314,8 @@ struct ContentView: View {
     }
     private var sidebar: some View {
 VStack(alignment: .leading, spacing: 18) {
-                Label("研习手记", systemImage: "leaf.fill").font(.title2.bold()).foregroundStyle(accent)
-                Text("工程实践 · 日常积累").foregroundStyle(.secondary)
+                Label("研习手记", systemImage: "book.closed").font(.system(size: 20, weight: .semibold))
+                Text("工程实践 · 日常积累").foregroundStyle(Color(nsColor: StudyTheme.muted))
                 if let s = model.snapshot {
                     Text("\(s.summary.completed) / 60 天 · \(s.summary.hours, specifier: "%g") 小时").font(.callout)
                     ProgressView(value: Double(s.summary.completed), total: 60).tint(accent)
@@ -322,10 +324,10 @@ VStack(alignment: .leading, spacing: 18) {
                             ForEach(s.weeks.indices, id: \.self) { i in
                                 Button { model.select(i, 0) } label: {
                                     HStack(alignment: .top) {
-                                        Text(String(format: "%02d", i+1)).monospacedDigit().foregroundStyle(.secondary)
+                                        Text(String(format: "%02d", i+1)).monospacedDigit().foregroundStyle(Color(nsColor: StudyTheme.muted))
                                         Text(Presentation.text(s.weeks[i].title.replacingOccurrences(of: "第 \(String(format: "%02d", i+1)) 周 ", with: ""))).frame(maxWidth: .infinity, alignment: .leading)
-                                        Text("\(s.weeks[i].summary.completed)/5").font(.caption).foregroundStyle(.secondary)
-                                    }.padding(10).background(model.week == i ? accent.opacity(0.12) : .clear).clipShape(RoundedRectangle(cornerRadius: 8))
+                                        Text("\(s.weeks[i].summary.completed)/5").font(.caption).foregroundStyle(Color(nsColor: StudyTheme.muted))
+                                    }.padding(10).background(model.week == i ? Color(nsColor: StudyTheme.selection) : .clear).clipShape(RoundedRectangle(cornerRadius: 6)).overlay(alignment: .leading) { if model.week == i { RoundedRectangle(cornerRadius: 2).fill(accent).frame(width: 3).padding(.vertical, 8) } }
                                 }.buttonStyle(.plain)
                             }
                         }
@@ -333,24 +335,24 @@ VStack(alignment: .leading, spacing: 18) {
                 }
                 Spacer(minLength: 0)
                 Toggle("简洁视图", isOn: $compactWorkspace).toggleStyle(.switch).font(.callout)
-                Label("文档保存在本地", systemImage: "internaldrive").font(.caption).foregroundStyle(.secondary)
+                Label("文档保存在本地", systemImage: "internaldrive").font(.caption).foregroundStyle(Color(nsColor: StudyTheme.muted))
                 Button("在 Finder 中查看文档") { NSWorkspace.shared.open(URL(fileURLWithPath: model.root)) }.buttonStyle(.link)
-            }.padding(22).frame(minWidth: 235, idealWidth: 265, maxWidth: 300)
+            }.padding(20).frame(minWidth: 235, idealWidth: 265, maxWidth: 300).background(Color(nsColor: StudyTheme.subtle))
     }
     private var detail: some View {
 VStack(spacing: 0) {
                 if let s = model.snapshot, let d = model.draft {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 22) {
-                            Text(Presentation.text(s.weeks[model.week].title)).font(.largeTitle.bold())
-                            Text("理解一个原理，完成一次实践，留下一点思考。").foregroundStyle(.secondary)
+                            Text(Presentation.text(s.weeks[model.week].title)).font(.system(size: 25, weight: .semibold))
+                            Text("理解一个原理，完成一次实践，留下一点思考。").foregroundStyle(Color(nsColor: StudyTheme.muted))
                             HStack(spacing: 10) {
                                 ForEach(0..<5) { i in
                                     Button { model.select(model.week, i) } label: {
                                         VStack(alignment: .leading, spacing: 4) {
                                             Text("第 \(i+1) 天").font(.headline)
-                                            Text(Presentation.text(s.weeks[model.week].days[i].status)).font(.caption).foregroundStyle(.secondary)
-                                        }.frame(maxWidth: .infinity, alignment: .leading).padding(12).background(model.day == i ? accent.opacity(0.14) : Color.primary.opacity(0.04)).clipShape(RoundedRectangle(cornerRadius: 10))
+                                            Text(Presentation.text(s.weeks[model.week].days[i].status)).font(.caption).foregroundStyle(Color(nsColor: StudyTheme.muted))
+                                        }.frame(maxWidth: .infinity, alignment: .leading).padding(12).background(Color(nsColor: model.day == i ? StudyTheme.selection : StudyTheme.subtle)).clipShape(RoundedRectangle(cornerRadius: 6)).overlay(RoundedRectangle(cornerRadius: 6).stroke(model.day == i ? accent : Color(nsColor: StudyTheme.border), lineWidth: 1))
                                     }.buttonStyle(.plain)
                                 }
                             }
@@ -365,7 +367,7 @@ VStack(spacing: 0) {
                                 }.padding(12)
                             }
                             } else {
-                                Label("关闭侧栏的简洁视图，可编辑其余实践笔记与周总结。", systemImage: "text.book.closed").font(.caption).foregroundStyle(.secondary)
+                                Label("关闭侧栏的简洁视图，可编辑其余实践笔记与周总结。", systemImage: "text.book.closed").font(.caption).foregroundStyle(Color(nsColor: StudyTheme.muted))
                             }
                             if !compactWorkspace {
                             GroupBox("实践笔记") {
@@ -399,8 +401,8 @@ VStack(spacing: 0) {
                 Divider()
                 HStack {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(model.dirty ? "有未保存的修改" : "已与本地文档同步").font(.caption).foregroundStyle(.secondary)
-                        Text(model.message).font(.caption).foregroundStyle(model.error ? .red : .secondary).textSelection(.enabled)
+                        Text(model.dirty ? "有未保存的修改" : "已与本地文档同步").font(.caption).foregroundStyle(Color(nsColor: StudyTheme.muted))
+                        Text(model.message).font(.caption).foregroundStyle(model.error ? .red : Color(nsColor: StudyTheme.muted)).textSelection(.enabled)
                     }
                     Spacer()
                             HStack {
@@ -419,14 +421,14 @@ VStack(spacing: 0) {
                                 .help("后一天（⌘⌥→），支持跨周切换")
                             }.buttonStyle(.bordered)
                     Button("重新加载") { if model.mayDiscard() { model.load() } }
-                    Button("保存到文档") { model.save() }.buttonStyle(.borderedProminent).tint(accent).keyboardShortcut("s").disabled(model.draft == nil)
-                }.padding(18)
+                    Button("保存到文档") { model.save() }.buttonStyle(.borderedProminent).tint(Color(nsColor: StudyTheme.success)).keyboardShortcut("s").disabled(model.draft == nil)
+                }.padding(18).background(Color(nsColor: StudyTheme.subtle))
             }.frame(minWidth: 660)
     }
     private func dayFields(_ d: StudyDay, _ s: Snapshot) -> some View {
 GroupBox {
                                 VStack(alignment: .leading, spacing: 16) {
-                                    Text(Presentation.text(d.title)).font(.title2.bold())
+                                    Text(Presentation.text(d.title)).font(.system(size: 19, weight: .semibold))
                                     HStack {
                                         Picker("进展", selection: field(\.status)) { ForEach(s.statuses, id: \.self) { Text(Presentation.text($0)).tag($0) } }
                                         Picker("理解程度", selection: field(\.level)) { ForEach(s.levels, id: \.self) { Text(Presentation.text($0)).tag($0) } }
@@ -441,7 +443,7 @@ GroupBox {
                                         TextField("例如 4.5", text: Binding(get: { model.hours }, set: { model.hours = $0; model.dirty = true })).frame(width: 90)
                                         Text("小时")
                                     }
-                                    Text("按实际情况记录；勾选任务不会自动标记当天完成。").font(.caption).foregroundStyle(.secondary)
+                                    Text("按实际情况记录；勾选任务不会自动标记当天完成。").font(.caption).foregroundStyle(Color(nsColor: StudyTheme.muted))
                                 }.padding(12)
                             }
     }
@@ -458,16 +460,16 @@ GroupBox("今日安排") {
     }
     func editor(_ label: String, weekly: Bool) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(Presentation.text(label)).font(.callout).foregroundStyle(.secondary)
+            Text(Presentation.text(label)).font(.system(size: 13, weight: .semibold))
             if label == "待跟进问题与任务" && !weekly {
-                Text("记录待核实的问题、核实方式，以及未完成任务、顺延原因和下一步安排。").font(.caption).foregroundStyle(.secondary)
+                Text("记录待核实的问题、核实方式，以及未完成任务、顺延原因和下一步安排。").font(.caption).foregroundStyle(Color(nsColor: StudyTheme.muted))
             }
             if label == "代码、图、实验或问答证据" && !weekly {
                 EvidenceEditor(source: note(label, weekly: weekly), root: model.root)
             } else if label == "我的解释或答案要点" && !weekly {
                 ReflectionNotesEditor(source: note(label), root: model.root)
             } else {
-            TextEditor(text: note(label, weekly: weekly)).font(.body).frame(height: 95).padding(5).background(Color(nsColor: .textBackgroundColor)).clipShape(RoundedRectangle(cornerRadius: 6)).overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.2)))
+            TextEditor(text: note(label, weekly: weekly)).font(.body).frame(height: 95).padding(5).background(Color(nsColor: StudyTheme.canvas)).clipShape(RoundedRectangle(cornerRadius: 6)).overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(nsColor: StudyTheme.border)))
             }
         }
     }
@@ -479,6 +481,7 @@ GroupBox("今日安排") {
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var model: StudyModel?
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--check-theme") { ThemePreviewCheck.run() }
         if CommandLine.arguments.contains("--check-follow-up") { StudyModel().checkFollowUpEditor() }
         if CommandLine.arguments.contains("--check-markdown") { NotesMarkdown.check() }
         if CommandLine.arguments.contains("--check-evidence") {

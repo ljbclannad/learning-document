@@ -55,6 +55,10 @@ python3 '/Users/lejinbo/Documents/Obsidian Vault/Learning-document/学习进度�
 
 ## 日常学习外观
 
+界面采用 GitHub 风格：中性的白色／深灰画布、浅灰／深灰侧栏、细边框和 6 点圆角，蓝色链接与导航选中态，绿色“保存到文档”主按钮。统一颜色定义在 `StudyTheme.swift`，自动跟随系统浅色与深色模式；侧栏选择同时使用色块和左侧标记。表单、按钮、键盘操作和数据保存仍使用现有原生控件。
+
+Markdown 预览使用清晰的六级标题尺寸、等宽代码和柔和代码底色，段落分隔减少重复空白，正文周围增加阅读留白。颜色与排版只影响显示，不改写原文，也不新增 Markdown 语法支持。
+
 应用图标采用暖白底、深绿色手记和叶片。矢量绘制源文件为 `Assets/DrawIcon.swift`；构建时自动生成各分辨率 PNG 并打包为 `StudyIcon.icns`，通过 `CFBundleIconFile` 注册，后续更新会保留图标。
 
 应用窗口和菜单名称为“研习手记”，侧栏使用“工程实践 · 日常积累”。周主题、每日任务、状态选项采用中性的学习和工程实践表述；资料列表仅显示笔记名称，不展示原始目录路径。
@@ -124,3 +128,12 @@ python3 -m unittest -v
 ```
 
 检查自动复制 Markdown 到临时目录，加入旧字段样例，创建真实 SwiftUI / NSTextView 编辑控件，验证旧内容合并展示、输入绑定、保存、重新创建模型和视图后的内容，以及旧字段保留。结束时清理临时数据，并逐字节确认真实文档未变。不修改计划目录设置。这是原生控件集成检查，不覆盖鼠标点击、快捷键、完整窗口布局或退出后进程重启。
+
+
+主题原生预览检查：
+
+```sh
+'学习进度.app/Contents/MacOS/StudyProgress' --check-theme -compactWorkspace NO -sidebarVisible YES
+```
+
+使用内存中的 Markdown 样例生成 `/tmp/study-theme-light.png` 和 `/tmp/study-theme-dark.png`，不调用保存、不改写学习记录或视图偏好。截图来自实际 SwiftUI/AppKit 视图，分别按浅色和深色绘制；不包含系统窗口装饰，不代替完整桌面交互验收。
