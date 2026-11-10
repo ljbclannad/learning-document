@@ -1,6 +1,6 @@
 # 第 02 周 Spring与数据库原理
 
-状态：未开始。实际日期范围：待填写。计划投入：20～25 小时。
+状态：学习中。实际日期范围：2026-11-10 至 2026-11-10。计划投入：20～25 小时。
 
 导航：[[00-索引与面试/AI应用后端三个月复习/三个月复习总计划]] · [[00-索引与面试/AI应用后端三个月复习/学习进度记录]]
 
@@ -19,7 +19,7 @@
 
 | 学习日 | 主题 | 状态 |
 | --- | --- | --- |
-| 第 1 天 | Spring容器与代理 | 未开始 |
+| 第 1 天 | Spring容器与代理 | 学习中 |
 | 第 2 天 | 事务边界与MyBatis | 未开始 |
 | 第 3 天 | 索引与执行计划 | 未开始 |
 | 第 4 天 | MVCC与锁 | 未开始 |
@@ -27,7 +27,7 @@
 
 ## 第 1 天 Spring容器与代理
 
-实际日期：待填写。实际时长：待填写。状态：未开始。掌握程度：未评估。
+实际日期：2026-11-10。实际时长：待填写。状态：学习中。掌握程度：未评估。
 
 ### 当日任务
 
@@ -42,15 +42,44 @@
 
 #### 实际完成内容
 
-待记录。
+1. sping IOC 、 DI
 
 #### 我的解释或答案要点
 
-待记录。
+1. Spring主要管理的内容为：
+	a. 对象：创建了哪些对象、各自如何创建
+	b. 依赖关系：对象之间如何建立依赖关系
+	c. 对象生命周期：对象何时初始化、何时销毁，哪些对象共享一个实例，哪些对象需要按作用域创建
+	d. 对象的扩展处理：哪些对象需要被增强，例如增加事务拦截
+2. 控制反转反转的为业务对象对依赖的创建、选择和获取的控制权。
+3. BeanDefinition相比于之间创建对象，多了以下4点能力
+	a. 先登记规则，之后再创建实例：登记 BeanDefinition，必要时创建 Bean
+	b. 同一份定义可以用于创建多个实例
+	c. 在创建对象前修改创建规则：Spring 提供了处理 Bean 定义的扩展点。例如，`BeanFactoryPostProcessor` 可以在常规 Bean 实例化之前修改定义中的属性值等元数据。
+	d. 将创建规则与实例缓存分开
+4. 字段注入、Setter 注入和构造器注入都会利用 DependencyDescriptor 描述具体注入点的依赖要求，再委托 BeanFactory 解析，但描述的对象、执行时机和注入动作不同：
+	a. 字段注入：发生在对象实例化之后，由 AutowiredAnnotationBeanPostProcessor 将标注 @Autowired 的字段包装成 DependencyDescriptor。例如 @Autowired private InventoryService inventoryService;，描述的是这个字段的依赖要求，交给 BeanFactory 解析得到 dependency 后，通过反射执行 field.set(bean, dependency)，直接写入当前对象的字段，不调用 Setter。执行方式是“先创建对象，再解析依赖并直接写入字段”
+	b. Setter 注入：也发生在对象实例化之后，由 AutowiredAnnotationBeanPostProcessor 将标注 @Autowired 的 Setter 的参数包装成 DependencyDescriptor。例如 @Autowired public void setInventoryService(InventoryService inventoryService)，描述的是第 0 个参数的依赖要求，交给 BeanFactory 解析得到 dependency 后，通过反射执行 method.invoke(bean, dependency)，调用当前对象的 Setter，由方法体完成赋值或其他处理。执行方式是“先创建对象，再解析参数并调用方法”；仅声明 Setter 不会自动触发这套注解注入流程
+	c. 构造器注入：发生在对象实例化之前。例如 public OrderService(Repository<Order> orderRepository, @Qualifier("wechat") PaymentService paymentService, Optional<AuditService> auditService, @Value("${order.timeout:3000}") int timeout)，Spring 为每个需要自动装配的参数分别创建 DependencyDescriptor，由 ConstructorResolver 委托 BeanFactory 解析：根据 Repository<Order> 区分订单仓储与用户仓储，根据 @Qualifier("wechat") 筛选支付 Bean，根据 Optional<AuditService> 允许审计依赖缺失，根据 @Value 读取配置或使用默认值并转换为 int。所有参数准备齐全后，再调用构造器，效果相当于 new OrderService(orderRepositoryBean, wechatPaymentServiceBean, Optional.empty(), 3000)（假设没有审计 Bean，且超时配置缺失）。执行方式是“先解析依赖，再创建对象
+5. BeanFactory 拿到 DependencyDescriptor 后，先识别依赖形式：`@Value` 走值解析与类型转换，`Optional<T>` 允许目标缺失，`ObjectProvider<T>` 提供延迟获取入口；对于普通 Bean 依赖，根据所需类型寻找候选，再结合泛型、`@Qualifier` 等条件筛选。单值注入只剩一个候选时直接使用；存在多个候选时，按 @Primary、依赖名称匹配等规则尝试确定唯一结果，仍无法确定则报歧义错误；没有候选时，根据是否必需决定报错或返回缺失结果。集合注入则通常收集符合条件的多个 Bean。选定目标后，通过 getBean(...) 获取已有实例或触发创建，再返回给注入流程。这是逻辑上的判断过程，实际实现可能通过缓存、名称快捷匹配提前得到结果，但仍需满足相应匹配条件。
+6. 
 
 #### 代码、图、实验或问答证据
 
-待记录。
+```
+参数解析没有代理，没有扩展的正常流程
+想创建 OrderService
+    │
+    └── 缺 InventoryService，先去获取它
+            │
+            └── 缺 InventoryRepository，先去获取它
+                    │
+                    └── 无参构造器，可以创建
+            │
+            └── 参数齐了，可以创建 InventoryService
+    │
+    └── 参数齐了，可以创建 OrderService
+```
 
 #### 反馈与需要修正的理解
 
@@ -64,13 +93,19 @@
 
 待记录。
 
+#### 待跟进问题与任务
+
+待记录。
+
 #### 下次具体起点
 
 待记录。
 
 #### 复测时间与结果
 
-待记录。
+1. thenApply会把回调返回的Future当成普通结果，所以外面又包装了一层Future；thenCompose会把回调返回的异步任务接到当前流程中，最终返回的是订单查询的结果，不会嵌套Future。
+2. 通过 submit() 提交任务后，任务异常会被保存在返回的 Future 中。调用 Future.get() 时，如果任务执行失败，会抛出 ExecutionException，通过 getCause() 可以取得任务抛出的原始异常
+3. 针对类似fetchToken().thenApply(token -> fetchUser(token))的写法，外层正常完成只表示回调返回了内层 Future，不能保证内部已经执行成功，内部fetchUser可能还在执行、也可能执行成功、也有可能异常返回成功
 
 ## 第 2 天 事务边界与MyBatis
 
