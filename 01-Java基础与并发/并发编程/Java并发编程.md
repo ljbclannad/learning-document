@@ -128,7 +128,7 @@ if (!tasks.containsKey(taskId)) {
 
 如果对象由当前请求独享，连续 `set` 通常不需要 Java 锁；“局部变量”本身不能证明对象独享，还要排除共享缓存、单例字段或异步任务持有同一引用。多个请求各自查询同一数据库行，通常得到不同 Java 对象，分别锁住各自实体不能协调数据库竞争。
 
-如果多个线程共享同一对象，应让完整的“检查条件 → 修改关联字段”以及要求一致快照的读取遵循同一把锁，或使用不可变快照整体替换。分别给各个 setter 加锁，不能阻止线程在两个 setter 之间读到中间状态；封装成 `markPaid(...)` 能集中业务规则，但不会自动获得线程安全。
+==如果多个线程共享同一对象，应让完整的“检查条件 → 修改关联字段”以及要求一致快照的读取遵循同一把锁==，或使用不可变快照整体替换。分别给各个 setter 加锁，不能阻止线程在两个 setter 之间读到中间状态；封装成 `markPaid(...)` 能集中业务规则，但不会自动获得线程安全。
 
 普通 POJO 的 `set` 修改内存，数据库事务回滚不会自动撤销这些赋值。涉及持久化时，应明确实际 SQL 的执行时点，以及最终提交是否受状态条件、版本条件或锁定读保护。
 
@@ -206,13 +206,13 @@ WHERE id = :product_id
 
 #### 第一步：共享范围必须覆盖所有竞争者
 
-| 数据与共享范围 | 优先考虑的方向 | 需要排除的误判 |
-| --- | --- | --- |
-| 当前请求独享的对象 | 通常不需要同步 | 局部引用仍可能指向共享缓存、单例或异步任务中的对象 |
-| 同一 JVM 中共享的内存状态 | 原子类、synchronized、ReentrantLock、读写锁等 | 多个实例各有一把本地锁，不能互相协调；同一 JVM 中不同锁对象也不能互斥 |
-| 多个实例共同修改数据库数据 | 条件更新、版本校验、数据库锁、唯一约束与事务 | 不必因为部署多个实例就默认增加分布式锁 |
-| 多个实例需要协调一段业务执行 | 数据库认领、按业务键串行处理，或 Redisson 等分布式协调 | 取得执行权不等于持久化成功，也不等于旧执行者以后不能写入 |
-| 数据库、缓存、消息与外部接口共同参与 | 分别设计提交、幂等、可靠事件与恢复协议 | 普通锁或一个本地事务不能让这些资源整体原子提交 |
+| 数据与共享范围            | 优先考虑的方向                             | 需要排除的误判                               |
+| ------------------ | ----------------------------------- | ------------------------------------- |
+| 当前请求独享的对象          | 通常不需要同步                             | 局部引用仍可能指向共享缓存、单例或异步任务中的对象             |
+| 同一 JVM 中共享的内存状态    | 原子类、synchronized、ReentrantLock、读写锁等 | 多个实例各有一把本地锁，不能互相协调；同一 JVM 中不同锁对象也不能互斥 |
+| 多个实例共同修改数据库数据      | 条件更新、版本校验、数据库锁、唯一约束与事务              | 不必因为部署多个实例就默认增加分布式锁                   |
+| 多个实例需要协调一段业务执行     | 数据库认领、按业务键串行处理，或 Redisson 等分布式协调    | 取得执行权不等于持久化成功，也不等于旧执行者以后不能写入          |
+| 数据库、缓存、消息与外部接口共同参与 | 分别设计提交、幂等、可靠事件与恢复协议                 | 普通锁或一个本地事务不能让这些资源整体原子提交               |
 
 数据最终存于数据库时，应尽量让最终约束由数据库条件、唯一约束或经过验证的锁定协议落实。外层执行协调可以减少重复工作，但必须继续考虑绕过该入口、进程重启与迟到执行者；具体故障窗口见第 18.1～18.2 节。
 
@@ -436,14 +436,14 @@ public final class ProfileSnapshots {
 
 ### 5.2 显式锁提供额外的等待控制
 
-| 能力 | synchronized | ReentrantLock |
-| --- | --- | --- |
-| 重入 | 支持，同线程重复进入 | 支持，持有计数匹配解锁次数 |
-| 获取时可中断 | 进入 monitor 不支持 | `lockInterruptibly()` |
-| 尝试或超时获取 | 无对应直接语法 | `tryLock()`、带时间的 `tryLock` |
-| 公平策略 | 不承诺 | 可配置，但不等于调度器公平 |
-| 条件等待 | `wait/notify/notifyAll` | 可建立多个 Condition |
-| 释放 | 语言结构保障 | 调用方在 `finally` 中负责 |
+| 能力      | synchronized            | ReentrantLock              |
+| ------- | ----------------------- | -------------------------- |
+| 重入      | 支持，同线程重复进入              | 支持，持有计数匹配解锁次数              |
+| 获取时可中断  | 进入 monitor 不支持          | `lockInterruptibly()`      |
+| 尝试或超时获取 | 无对应直接语法                 | `tryLock()`、带时间的 `tryLock` |
+| 公平策略    | 不承诺                     | 可配置，但不等于调度器公平              |
+| 条件等待    | `wait/notify/notifyAll` | 可建立多个 Condition            |
+| 释放      | 语言结构保障                  | 调用方在 `finally` 中负责         |
 
 显式锁的正确形态是**获取成功后才进入负责释放的 try/finally**。如果 `lockInterruptibly()` 抛异常，不能在外层无条件 `unlock()`。
 
@@ -469,6 +469,80 @@ try {
 偏向锁是旧 HotSpot 的优化，JDK 15 默认禁用，后续版本已移除。旧资料中的“偏向 → 轻量级 → 重量级”不是所有 JDK 都必须遵循的状态机。锁释放、监视器回收/退膨胀、偏向撤销是不同操作。
 
 JIT 可在满足条件时消除线程封闭对象的锁，也可能合并部分连续加锁；不是只要代码长得像示例就必然优化。对象头布局和锁实现应固定版本看源码，性能结论以竞争数据与基准验证。
+
+#### synchronized 的 Mark Word 变化图
+
+**先选 JDK 与锁模式，再沿对应分支读图。** 下图以 HotSpot 的传统对象头布局为前提：旧偏向锁以 JDK 8 为例；传统栈锁以 JDK 21 的 `LM_LEGACY` 为例；新版轻量级锁以 JDK 21 可选、JDK 23 默认的 `LM_LIGHTWEIGHT` 为例。不同分支是实现对比，不是一个对象必须依次经历的升级阶梯；不覆盖紧凑对象头及 ObjectMonitorTable 等其他配置。
+
+图中右侧两位是锁标记；偏向分支额外展示其前面的偏向位。`头信息` 简写 hash、age 等字段，未逐位展开；指针状态会复用 Mark Word 的空间，不表示对象头变大。
+
+```mermaid
+flowchart TB
+    ENTRY["确认实际锁对象<br/>同步块：表达式对象；实例方法：this；静态方法：声明类的 Class"]
+
+    subgraph LEGACY["历史路径：偏向锁与传统栈锁"]
+        B0["可偏向但尚未绑定线程<br/>线程为空 / epoch / age / 1 / 01"]
+        B1["偏向线程 A<br/>线程 A / epoch / age / 1 / 01"]
+        R["撤销偏向<br/>检查并保留实际持有关系"]
+        U["普通未锁定<br/>头信息 / 01；旧布局偏向位为 0"]
+        L["传统栈锁持有中<br/>栈中锁记录指针 / 00<br/>原 Mark Word 保存在锁记录中"]
+
+        B0 -->|首次偏向获取成功| B1
+        B1 -->|A 再次进入或退出通常保留偏向信息| B1
+        B1 -->|满足重偏向条件时更换偏向目标| B1
+        B1 -->|其他线程获取等触发撤销路径| R
+        R -->|撤销时已无人持锁| U
+        R -->|撤销时仍有持有者，恢复栈锁表示| L
+        U -->|保存原头，CAS 安装锁记录指针成功| L
+        L -->|识别同线程重入，记录重入关系| L
+        L -->|未膨胀，最外层退出时 CAS 恢复原头成功| U
+    end
+
+    subgraph LIGHT["新版轻量级锁：JDK 21 可选，JDK 23 默认"]
+        N0["普通未锁定<br/>头信息 / 01"]
+        N1["快速锁持有中<br/>头信息 / 00<br/>保留头部数据，通过线程 LockStack 等维护持有关系"]
+        N0 -->|CAS 将锁位由 01 改为 00，配合 LockStack| N1
+        N1 -->|未膨胀，最后一次释放成功，锁位恢复 01| N0
+    end
+
+    subgraph MONITOR["膨胀后的 ObjectMonitor 路径：图示传统指针编码"]
+        M1["已关联 ObjectMonitor，当前有持有者<br/>ObjectMonitor 指针 / 10<br/>monitor 保存原头并维护持有与重入关系"]
+        M0["已关联 ObjectMonitor，当前无持有者<br/>ObjectMonitor 指针 / 10<br/>可能仍有竞争者或条件等待者"]
+        D["满足空闲与安全条件后退膨胀<br/>恢复普通对象头"]
+        M1 -->|完全解锁；或 wait 释放全部持有进入等待| M0
+        M0 -->|某线程获取成功；被通知者也需重新竞争| M1
+        M1 -->|同线程重入，或仅退出一层且仍持有| M1
+        M0 -->|没有持有者、等待者等，且通过安全检查| D
+    end
+
+    ENTRY -.->|JDK 8 启用偏向且对象可偏向| B0
+    ENTRY -.->|非偏向的传统栈锁路径| U
+    ENTRY -.->|新版轻量级锁路径| N0
+    L -->|竞争慢路径、合法 wait 等需要膨胀| M1
+    N1 -->|竞争慢路径、合法 wait 等需要膨胀| M1
+    U -->|需要直接使用 monitor 时可从未锁定状态膨胀| M0
+    N0 -->|需要直接使用 monitor 时可从未锁定状态膨胀| M0
+    D -->|传统栈锁模式| U
+    D -->|新版轻量级锁模式| N0
+
+    classDef unlocked fill:#e8f5e9,stroke:#388e3c,color:#1b5e20;
+    classDef fast fill:#e3f2fd,stroke:#1976d2,color:#0d47a1;
+    classDef monitor fill:#fff3e0,stroke:#ef6c00,color:#9a4500;
+    classDef biased fill:#f3e5f5,stroke:#8e24aa,color:#4a148c;
+    class U,N0 unlocked;
+    class L,N1 fast;
+    class M1,M0,D monitor;
+    class B0,B1,R biased;
+```
+
+读图时注意以下边界：
+
+- **偏向信息不等于当前持锁。** A 退出同步区后，Mark Word 仍可能指向 A；是否正在持有要结合执行状态判断。撤销偏向不必然直接膨胀，重偏向也不等于把仍被持有的锁交给另一线程。
+- **同为 `00`，含义随模式变化。** 传统栈锁的 Mark Word 编码锁记录指针；新版轻量级锁保留其他头部数据，改变锁位，并配合线程侧结构。图中新版路径省略重入细节，不能照搬传统栈锁记录的表示。
+- **膨胀保留持有关系，解锁不等于退膨胀。** 已有持有者时，膨胀不把锁授予竞争者；`10` 只说明对象关联了 monitor，不说明它此刻一定有人持有。只有满足安全条件时才可退膨胀，不保证解锁后立即发生，也不是永远无法恢复。
+- **图展示主要稳定状态，不是逐条机器指令。** 竞争失败可能先重试，不能套用固定自旋次数；调用合法 `wait()` 也可能在无其他竞争线程时导致膨胀。省略了膨胀中的瞬态、GC 标记/转发状态及 JIT 锁消除路径。identity hash 的计算也可能影响偏向撤销或传统栈锁膨胀，JOL 实验应避免无意调用默认 `toString()` 等干扰观察。
+
+依据：[JDK 8 Mark Word 布局与偏向编码](https://github.com/openjdk/jdk8u/blob/master/hotspot/src/share/vm/oops/markOop.hpp)、[OpenJDK jdk-21+35 的 Mark Word 与锁模式](https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/hotspot/share/oops/markWord.hpp)、[JDK 21 monitor 膨胀与退膨胀实现](https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/hotspot/share/runtime/synchronizer.cpp)、[OpenJDK jdk-23+37 默认锁模式](https://github.com/openjdk/jdk/blob/jdk-23%2B37/src/hotspot/share/runtime/globals.hpp)。本图为源码机制总结，不代表已通过 JOL 实测所有状态。
 
 ### 5.5 完整案例：双账户转账如何形成并消除死锁
 
@@ -619,17 +693,144 @@ LockSupport 为线程维护最多一个许可：提前 `unpark` 可使之后一�
 
 ### 7.4 StampedLock 的验证边界
 
-乐观读先获取 stamp，把必要字段读到局部变量，再 validate；验证失败则取得读锁并重读。它不可重入，不提供 Condition，转换锁模式的尝试可以失败。
+StampedLock 提供写锁、普通读锁和乐观读三种模式。普通读锁允许多个读者共享，但获取与释放仍需维护共享状态；乐观读不登记普通读锁持有，先复制数据，再检查读取窗口是否受到写锁干扰，适合读取短小、容易安全复制且写入干扰较少的本地共享状态。收益需结合验证失败率、回退次数和尾延迟测试，不能仅凭“读多写少”认定更快。
 
-```text
-取得 stamp → 复制 x、y 到局部变量 → 验证
-                                    ├ 成功：使用局部副本
-                                    └ 失败：加读锁 → 重读 → 解锁
+| 模式 | 入口与返回值 | 互斥与退出方式 |
+| --- | --- | --- |
+| 写锁 | `writeLock()` 返回写 stamp | 独占，阻止其他写锁与普通读锁；`unlockWrite(stamp)` 释放 |
+| 普通读锁 | `readLock()` 返回读 stamp | 读者可共享，阻止写锁；`unlockRead(stamp)` 释放 |
+| 乐观读 | `tryOptimisticRead()` 返回观察 stamp，当前持写锁时返回 0 | 不阻止写者；复制后调用 `validate(stamp)`，无须解锁 |
+
+stamp 是与锁状态和模式相关的 `long` 凭据，不是业务数据副本、线程 ID 或永久有效的业务版本。StampedLock 不可重入，不提供 Condition，也没有可配置的公平模式；锁模式转换可能失败。`tryConvertToWriteLock` 在满足条件时可将普通读锁转换为写锁，失败返回 0 且原读锁仍持有；成功后必须保存新 stamp。依据：[JDK 21 StampedLock API](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/StampedLock.html)。
+
+#### 同一实例的 reserve 与 snapshot
+
+下面是完整教学类，保存为 `InventoryView.java`，使用 JDK 17+。不变量是 `available + reserved = 10`，且可用量非负。所有写入通过同一把写锁完成，读取返回由两个基本类型值组成的不可变快照；该组件只保护同一 JVM 的共享实例，不代替数据库库存或跨实例协调。
+
+```java
+import java.util.concurrent.locks.StampedLock;
+
+public final class InventoryView {
+    private final StampedLock lock = new StampedLock();
+    private int available = 10;
+    private int reserved = 0;
+
+    public record Snapshot(int available, int reserved) {}
+
+    public void reserve(int quantity) {
+        if (quantity <= 0) {
+            throw new IllegalArgumentException("预留数量必须大于 0");
+        }
+        long stamp = lock.writeLock();
+        try {
+            if (available < quantity) {
+                throw new IllegalStateException("库存不足");
+            }
+            available -= quantity;
+            reserved += quantity;
+        } finally {
+            lock.unlockWrite(stamp);
+        }
+    }
+
+    public Snapshot snapshot() {
+        long stamp = lock.tryOptimisticRead();
+        int localAvailable = available;
+        int localReserved = reserved;
+
+        if (!lock.validate(stamp)) {
+            stamp = lock.readLock();
+            try {
+                localAvailable = available;
+                localReserved = reserved;
+            } finally {
+                lock.unlockRead(stamp);
+            }
+        }
+        return new Snapshot(localAvailable, localReserved);
+    }
+}
 ```
 
-验证成功不冻结未来状态，也不能把任意不安全操作变安全。乐观阶段遍历正被修改的 HashMap、解引用结构暂时不一致的对象图、产生外部副作用，都可能在验证前出错。应限制为可容忍中间不一致的短读取，并让所有写者使用同一把写锁。
+`snapshot()` 是调用方主动调用的普通业务方法，不由 StampedLock 自动触发：例如查询线程调用 `inventory.snapshot()`，预留线程调用同一个 `inventory.reserve(2)`。每个请求各自 new 一个实例就不共享这里的数据和锁。方法中的两次基本类型字段读取即使暂时不一致，也只形成候选局部值；本例允许 stamp 为 0 时先复制再验证失败，复杂对象访问不能据此照搬。
 
-“乐观读接受旧值”不是完整描述：它可以提供满足协议的一致观察，但业务是否要求最新版本还要另外定义。依据：[StampedLock API](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/StampedLock.html)。
+#### state、stamp 与 validate 的判断机制
+
+以下实现细节固定为 OpenJDK `jdk-21+35`，不作为应用应依赖的数值契约。内部 `state` 是 `volatile long`，包含写入代次、写锁位和普通读计数；低 7 位为读计数相关位，写锁位 `WBIT = 128`，`SBITS = ~127L` 屏蔽普通读计数。读计数溢出另有处理，不展开在此图中。
+
+- `tryOptimisticRead()`：读到写锁位为 1 时返回 0；否则返回 `state & SBITS`，不修改读计数。
+- 写锁获取：通过原子状态更新设置写锁位；写锁释放：清除持写状态并推进代次。写完后不会简单回到原来的无锁编码。
+- `validate(stamp)`：先执行 `U.loadFence()`，再比较 `(stamp & SBITS) == (state & SBITS)`。屏障约束之前的数据读取与后面的状态检查；比较忽略普通读者数量变化，但能检测写锁介入。不能删掉屏障，仅用普通版本字段比较就声称具有同样保证。
+
+新建锁且没有其他操作时，状态可以按下表推导：
+
+| 时点 | state | 已保存的乐观 stamp | 验证含义 |
+| --- | --- | --- | --- |
+| 初始无锁 | 256 | 取得 256 | 状态未变时可通过 |
+| 写线程获取写锁 | 384，即 256 + 128 | 仍是 256 | 写锁位不同，验证失败 |
+| 写线程释放写锁 | 512，即 384 + 128 | 仍是 256 | 写入代次不同，验证失败 |
+
+**validate 检查的是写锁介入，不是业务字段内容。** 即使写线程没有修改字段，或者修改后又改回原值，旧乐观 stamp 仍会失效。stamp 为 0 也不能通过正常验证。其表示有限，可能回绕，不应跨极长时间保存或充当持久化版本。源码依据：[状态常量、tryOptimisticRead、validate 与写锁释放](https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/java.base/share/classes/java/util/concurrent/locks/StampedLock.java)。
+
+#### 两个线程：读到混合值后如何恢复
+
+假设只有 R、W 两个线程，共用一个刚创建的 InventoryView。以下是受控教学时序，不保证每次自然调度都这样发生；乐观读取本身不能保证第⑦步必然看到新值。
+
+| 步骤 | R：调用 snapshot() | W：调用 reserve(2) | state |
+| --- | --- | --- | --- |
+| ① | 取得乐观 stamp = 256 | 尚未获取写锁 | 256 |
+| ② | 复制 available，得到 10，随后暂停 | — | 256 |
+| ③ | — | 获取写锁，自己的写 stamp = 384 | 384 |
+| ④ | — | available 从 10 改为 8 | 384 |
+| ⑤ | — | reserved 从 0 改为 2 | 384 |
+| ⑥ | — | 用写 stamp 释放写锁 | 512 |
+| ⑦ | 继续复制 reserved，可能得到 2；候选副本为 10、2 | 方法结束 | 512 |
+| ⑧ | validate(256) 发现当前相关状态为 512，返回 false | — | 512 |
+| ⑨ | 获取普通读锁，重读得到 8、2 | — | 513，读计数为 1 |
+| ⑩ | 释放读锁，返回 Snapshot(8, 2) | — | 512 |
+
+R 的局部 stamp 不会被 W 自动改写；它保留读取起点的凭据，才能与当前状态比较。第⑨步给 stamp 重新赋值后，它变成普通读锁的释放凭据。回退只丢弃 R 的候选局部值，不会撤销 W 的写入。如果第⑧步发生在 W 尚未解锁时，验证同样失败，R 随后的 `readLock()` 需等待写锁释放才能重读。
+
+#### 乐观读取、验证与回退流程图
+
+图中 R、W 的实线各自表示执行路径，虚线表示写锁状态变化会影响验证，不表示 R 必须等待 W 才能执行 validate。
+
+```mermaid
+flowchart TB
+    subgraph READER["读线程 R：snapshot"]
+        R0["调用 tryOptimisticRead<br/>保存观察 stamp；当前持写锁则得到 0"]
+        R1["复制 available、reserved 到局部变量<br/>此时仅是候选副本，可能不一致"]
+        R2{"validate 是否成功？<br/>读取屏障后比较 stamp 与 state 的相关位"}
+        R3["保留已验证的局部副本"]
+        R4["调用 readLock<br/>写锁仍被持有时等待"]
+        R5["取得普通读锁<br/>重新读取两个字段，覆盖候选局部值"]
+        R6["finally 释放普通读锁"]
+        R7["返回由局部值构造的 Snapshot<br/>不承诺返回瞬间仍是最新数据"]
+        R0 --> R1 --> R2
+        R2 -->|成功| R3
+        R2 -->|失败，包括 stamp 为 0| R4
+        R4 --> R5 --> R6 --> R7
+        R3 --> R7
+    end
+    subgraph WRITER["写线程 W：reserve，参数有效且库存充足"]
+        W0["取得写锁<br/>设置写锁位；示例 state：256 → 384"]
+        W1["写锁内更新两个字段<br/>available：10 → 8；reserved：0 → 2"]
+        W2["finally 释放写锁并推进代次<br/>示例 state：384 → 512"]
+        W0 --> W1 --> W2
+    end
+    W0 -.->|旧 stamp：256 与 384 不同| R2
+    W2 -.->|旧 stamp：256 与 512 不同| R2
+```
+
+#### 成功、失败与适用边界
+
+若 R 先复制 10、0 并验证成功，W 才开始修改，R 仍可返回 Snapshot(10, 0)：验证覆盖此前读取窗口，不冻结未来状态。之后必须使用已验证的局部副本，再读共享字段属于新的观察窗口。相反，validate 失败只说明不能依据该凭据直接采用候选值，不表示候选数据必然错误。
+
+所有写者必须使用同一把写锁，否则验证无法检测绕过协议的字段修改。乐观阶段遍历正被修改的 HashMap、解引用结构暂时不一致的对象图或产生外部副作用，都可能在验证前出错；应限制为可容忍中间不一致、无副作用的短读取。持写锁时调用本例 snapshot 也不安全：乐观验证失败后转取读锁会因不可重入而自阻塞。业务需要“读取后条件仍成立才能修改”时，应使用写锁或正确的模式转换与重检，不能凭一次 validate 成功直接执行后续扣减。
+
+> 面试表述：StampedLock 通过写锁、普通读锁和乐观读协调本地共享状态。乐观读先取得 stamp，将数据复制到局部变量，再验证期间是否有写锁介入；写锁获取改变写锁位，释放推进代次，因此写者正在写或已经写完都能使旧凭据失效。验证成功使用局部副本，失败通常加普通读锁重新读取；它不回滚写者，也不保证数据始终最新，且要求所有写入遵守同一写锁协议。
+
+验证应覆盖无写入时通过、写锁持有中失败、写锁释放后旧 stamp 失败、初次获取得到 0、普通读计数变化不使乐观 stamp 失效，以及验证成功后允许返回旧快照。可用 CountDownLatch 控制 R 复制第一字段后由 W 完成更新，再让 R 验证与回退；等待必须有上限，不能依赖 sleep 猜测线程进度。具体执行范围见第 20.3 节验证记录。
 
 ### 7.5 本地缓存回源的隐藏竞争
 
@@ -736,13 +937,13 @@ AQS（AbstractQueuedSynchronizer）解决的是同步器之间重复的线程协
 
 `state` 是 AQS 的 `volatile int` 字段，子类通过 `getState()`、`setState()`、`compareAndSetState()` 访问。volatile 提供相应的可见性与顺序，CAS 原子地完成条件更新；不能因为字段 volatile，就把任意读改写组合视为原子操作。
 
-| 扩展方法 | 子类需要回答的问题 |
-| --- | --- |
-| `tryAcquire(arg)` | 独占获取是否成功 |
-| `tryRelease(arg)` | 独占状态是否已完全释放，是否需要通知等待者 |
+| 扩展方法                    | 子类需要回答的问题                        |
+| ----------------------- | -------------------------------- |
+| `tryAcquire(arg)`       | 独占获取是否成功                         |
+| `tryRelease(arg)`       | 独占状态是否已完全释放，是否需要通知等待者            |
 | `tryAcquireShared(arg)` | 共享获取是否成功；负数失败，非负成功，正数还表示后续获取可能成功 |
-| `tryReleaseShared(arg)` | 本次释放是否需要推动等待者重新尝试 |
-| `isHeldExclusively()` | 当前线程是否独占持有，用于支持相应的 Condition 等协议 |
+| `tryReleaseShared(arg)` | 本次释放是否需要推动等待者重新尝试                |
+| `isHeldExclusively()`   | 当前线程是否独占持有，用于支持相应的 Condition 等协议 |
 
 这些方法应短小、线程安全，通常不在其中阻塞；公共获取入口再负责必要的等待。互斥锁还要校验所有者：ReentrantLock 的 owner 保存在父类 `AbstractOwnableSynchronizer` 的 `exclusiveOwnerThread` 中，并未编码进 state。只检查 state 非零就允许 unlock，会错误地放行非持有线程；Semaphore、CountDownLatch 则没有这种独占所有权要求。依据：[AQS API 契约](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/AbstractQueuedSynchronizer.html)。
 
@@ -979,6 +1180,8 @@ FutureTask 的取消也不保证立即从普通 ThreadPoolExecutor 队列中移�
 
 对在途资源的严格计数，应在执行体的 `finally` 中释放，或由客户端明确报告操作结束。若仅在 Future 的完成回调中释放许可，取消导致 Future 提前完成时，底层调用可能还在使用资源，从而超出并发上限。
 
+对通过 `submit()` 启动的子任务，任务拥有者保留对应的 Future，在结果失去用途时取消该任务。第 11.4 节的报告查询展示了等待超时和等待方中断时怎样取消自己拥有的任务。已开始的任务要在执行线程上响应中断，关闭本次使用的连接、文件等资源，然后退出。线程池此时才能让该工作线程继续取任务。若清理本身仍在等待，工作线程仍被本次任务占用。
+
 需要确认实际清理完成时，可在资源关闭之后发送独立的执行结束信号。只等待已取消 Future 的 get，不能等待任务体退出；FutureTask 的 done 回调同样可能早于任务体结束。若任务在启动前就取消，任务体的 finally 根本不会执行，提交前获得的许可、任务登记和业务状态需由未启动路径另行清理，并用统一协议防止重复释放。执行器整体关闭与剩余任务归属见第 11.5 节。
 
 ### 10.4 不同操作如何响应中断
@@ -1165,19 +1368,193 @@ execute(task)
 
 ### 11.4 execute 与 submit 的异常去向
 
-直接 execute 一个抛出未捕获异常的 Runnable，可能导致该工作线程异常退出，由线程未捕获异常处理器观察；线程池可按策略补充工作线程。
+父任务直接调用子方法时，双方共用一个调用栈。子方法抛出的异常会传回父任务，未被处理时，父任务在调用点之后的正常流程也会跳过。独立提交子任务后，子任务有自己的执行边界。提交端包围 `execute()` 或 `submit()` 的 `try/catch` 可处理 `AbortPolicy` 等拒绝策略同步抛出的 `RejectedExecutionException`。对于已经交给工作线程的任务，执行失败要在任务内部或结果消费端处理。若采用 `CallerRunsPolicy`，饱和时任务可能在提交线程运行，见第 11.3 节。
 
-submit 通常把任务包装成 FutureTask，异常被记录在 Future 中，`get()` 再以 ExecutionException 抛出；忽略 Future 就可能忽略任务失败。`afterExecute` 的 Throwable 参数也不能保证直接看到被 FutureTask 捕获的异常，需要识别完成句柄并按正确协议检查结果。
+普通 `ThreadPoolExecutor.execute()` 直接执行一个未包装的 Runnable 时，若异常逃出 `run()`，该工作线程会退出。线程的 `UncaughtExceptionHandler` 可以记录失败，池在运行状态允许时会尝试补充工作线程。`submit()` 默认用 FutureTask 包装任务，FutureTask 捕获并保存任务抛出的异常，工作线程可以继续处理队列。若父任务提交子任务后丢弃 Future，它仍可能正常完成，子任务的失败则无人消费。[ThreadPoolExecutor 的 afterExecute 契约](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html#afterExecute(java.lang.Runnable,java.lang.Throwable)) · [OpenJDK 21 的工作线程退出流程](https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/java.base/share/classes/java/util/concurrent/ThreadPoolExecutor.java#L954-L977)
 
-监控应同时有任务失败数、拒绝数、排队耗时和执行耗时，而不只是线程数。
+#### 在能够恢复的地方捕获，在需要结果的地方等待
+
+若处理一批报告时，业务允许记录某条数据的格式错误并继续下一条，就在处理单条报告的边界捕获该类错误。若错误意味着整项任务失败，资源通过 `try-with-resources` 或 `finally` 清理，异常继续交给外层任务包装。只写日志后返回 `null` 会让 Future 显示正常完成，调用方容易把失败当成无数据。
+
+当接口需要根据子任务结果决定是否继续时，用 `Future.get()` 取得结果。以下完整教学类 `ReportQueryWait.java` 演示同步接口在允许阻塞的协调线程等待一条只读报告。`reportPool` 使用抛出异常的拒绝策略，并由外部管理。`readReport` 是本次请求独占的查询任务，应在任务体内借用和关闭连接，并应用第 10.5 节的客户端超时。`waitMillis` 只用于本次结果等待，跨多个步骤的总截止时间按第 14.4 节处理。返回记录供服务内部区分结果，异常原因用于内部日志或上层决策。
+
+```java
+import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+public final class ReportQueryWait {
+    public enum Status { OK, REJECTED, FAILED, WAIT_TIMED_OUT, CANCELLED }
+
+    public record Result(Status status, String report, Throwable cause) {}
+
+    public static Result query(ExecutorService reportPool, Callable<String> readReport,
+                               long waitMillis) throws InterruptedException {
+        Future<String> child;
+        try {
+            child = reportPool.submit(readReport);
+        } catch (RejectedExecutionException rejected) {
+            return new Result(Status.REJECTED, null, rejected);
+        }
+
+        try {
+            String report = child.get(waitMillis, TimeUnit.MILLISECONDS);
+            return new Result(Status.OK, report, null);
+        } catch (ExecutionException failed) {
+            return new Result(Status.FAILED, null, failed.getCause());
+        } catch (TimeoutException waitExpired) {
+            child.cancel(true);
+            return new Result(Status.WAIT_TIMED_OUT, null, waitExpired);
+        } catch (CancellationException cancelled) {
+            return new Result(Status.CANCELLED, null, cancelled);
+        } catch (InterruptedException interrupted) {
+            child.cancel(true);
+            throw interrupted;
+        }
+    }
+}
+```
+
+例如请求协调线程调用 `ReportQueryWait.query(reportPool, () -> reportClient.read(patientId), 300)`，只有结果为 OK 才继续使用报告内容。若 `readReport` 自己抛出 TimeoutException，`get()` 会抛 ExecutionException，此时结果是 FAILED，原因是任务内部的超时。若 `get(timeout, unit)` 直接抛出 TimeoutException，说明结果等待到期。示例能主动取消，是因为该只读查询只服务本次请求。等待方被中断时，代码取消自己拥有的子任务并向上传播中断。取消到执行体实际退出之间的资源归还见第 10.3 节。若父任务正在同一个固定池里运行，同步等待可能占满所有工作线程，改用第 14.5 节的阶段编排方式。[Future 的 get 和 cancel 契约](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Future.html)
+
+后台任务只需报告失败时，可以让普通 execute 任务通过未捕获异常处理器报告，或为返回的结果句柄安排观察者。CompletableFuture 的最终阶段可用第 14.1 节的 `whenComplete` 观察。在线程池的 `afterExecute` 钩子中，如果 Throwable 为空且 Runnable 是 Future，应先确认 `isDone()`，再用 `get()` 提取失败，避免把处理下一项任务的工作线程变成结果等待者。周期 Future 尤其需要这项检查，见第 13.2 节。监控分别记录任务失败、拒绝、排队耗时和执行耗时。
 
 ### 11.5 关闭不等于完成
+
+正常完成、异常被任务包装捕获或响应取消后退出，都会结束本次任务对工作线程的占用。普通 ThreadPoolExecutor 的线程数超过 `corePoolSize` 时，空闲超过 `keepAliveTime` 的工作线程可以退出。核心线程默认保留，需要回收时可配置正数 `keepAliveTime` 并启用 `allowCoreThreadTimeOut(true)`。单个子任务的取消由任务拥有者负责，整个池的关闭由池的拥有者负责。[线程池的空闲回收契约](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html#allowCoreThreadTimeOut(boolean))
 
 `shutdown()` 启动有序关闭，拒绝新提交，但**方法本身不等待任务全部结束**。`awaitTermination` 才负责限时等待。`shutdownNow()` 尝试中断执行中任务，并返回尚未执行的队列任务，不能保证所有工作马上停止。
 
 返回的未执行任务要记录或重新交付；其中的 Future 不应假设自动取消。生产停机顺序应包含停止接流、停止提交、限时排空、取消/回收、保存未完成工作的归属，再关闭数据库与客户端资源。
 
 JDK 21 的 ExecutorService 可用于 try-with-resources，其 close 会等待结束；不能把这一用法不加说明地复制到 JDK 17，也不能把“自动关闭”误读成“超时后立即退出”。
+
+#### 用线程身份和队列进度区分四种情况
+
+以报告查询池为例，任务结束后可能由原工作线程接下一项，也可能由补充的线程接下一项，具体取决于第 11.4 节的异常边界。如果查询、锁等待或清理始终没有结束，工作线程仍在任务里，池大小即使维持不变，也可能已经没有空闲名额。关闭请求或 Future 取消后仍处于这种状态时，应按第 10.3～10.5 节检查执行体和底层客户端的实际退出。
+
+下面的完整示例 `WorkerLifecycleDemo.java` 用一个固定单线程池依次观察复用、异常退出后的补充和长期占用，再用两个请求级局部池模拟遗漏关闭。替换前后的线程故意使用同一个名字，通过比较 `Thread` 对象确定是否为原线程。`CountDownLatch` 控制任务占用的时间，模拟等待尚未结束的查询。所有等待都有限时，示例保留池的引用并在实验末尾关闭。
+
+```java
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+public final class WorkerLifecycleDemo {
+    public static void main(String[] args) throws Exception {
+        ThreadPoolExecutor reportPool = oneWorker("report-worker");
+        try {
+            Thread replacement = observeReuseAndReplacement(reportPool);
+            observeOccupiedWorker(reportPool, replacement);
+        } finally {
+            reportPool.shutdownNow();
+            awaitTermination(reportPool);
+        }
+        observeUnclosedRequestPools();
+        System.out.println("工作线程的四组观察均通过");
+    }
+
+    private static Thread observeReuseAndReplacement(ThreadPoolExecutor pool)
+            throws Exception {
+        Thread first = probeWorker(pool);
+        require(probeWorker(pool) == first, "任务正常结束后复用原线程");
+
+        IllegalStateException failure = new IllegalStateException("模拟报告查询失败");
+        Future<?> failed = pool.submit(() -> { throw failure; });
+        try {
+            failed.get(5, TimeUnit.SECONDS);
+            throw new AssertionError("应得到任务异常");
+        } catch (ExecutionException result) {
+            require(result.getCause() == failure, "Future 应保存原异常");
+        }
+        require(probeWorker(pool) == first, "submit 失败后仍复用原线程");
+
+        CountDownLatch uncaught = new CountDownLatch(1);
+        first.setUncaughtExceptionHandler((thread, error) -> {
+            if (error == failure) {
+                uncaught.countDown();
+            }
+        });
+        pool.execute(() -> { throw failure; });
+        await(uncaught);
+        first.join(TimeUnit.SECONDS.toMillis(5));
+        Thread replacement = probeWorker(pool);
+        require(!first.isAlive() && replacement != first, "原线程退出，新线程接活");
+        return replacement;
+    }
+
+    private static void observeOccupiedWorker(ThreadPoolExecutor pool, Thread worker)
+            throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Future<?> occupied = pool.submit(() -> {
+            entered.countDown();
+            await(release);
+            return null;
+        });
+        Future<Thread> next;
+        try {
+            await(entered);
+            next = pool.submit(Thread::currentThread);
+            require(pool.getPoolSize() == 1 && pool.getQueue().contains(next),
+                    "工作线程仍活着，但后续任务只能排队");
+        } finally {
+            release.countDown();
+        }
+        occupied.get(5, TimeUnit.SECONDS);
+        require(next.get(5, TimeUnit.SECONDS) == worker, "占用结束后原线程接活");
+    }
+
+    private static void observeUnclosedRequestPools() throws Exception {
+        ThreadPoolExecutor requestA = oneWorker("request-A");
+        ThreadPoolExecutor requestB = oneWorker("request-B");
+        try {
+            Thread a = probeWorker(requestA);
+            Thread b = probeWorker(requestB);
+            require(a != b && a.isAlive() && b.isAlive(),
+                    "两次请求任务已结束，但两个未关闭的池各保留一条线程");
+        } finally {
+            requestA.shutdown();
+            requestB.shutdown();
+            awaitTermination(requestA);
+            awaitTermination(requestB);
+        }
+    }
+
+    private static ThreadPoolExecutor oneWorker(String name) {
+        return new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(1), task -> new Thread(task, name));
+    }
+
+    private static Thread probeWorker(ThreadPoolExecutor pool) throws Exception {
+        return pool.submit(Thread::currentThread).get(5, TimeUnit.SECONDS);
+    }
+
+    private static void await(CountDownLatch latch) throws InterruptedException {
+        require(latch.await(5, TimeUnit.SECONDS), "等待同步信号超时");
+    }
+
+    private static void awaitTermination(ThreadPoolExecutor pool) throws InterruptedException {
+        require(pool.awaitTermination(5, TimeUnit.SECONDS), "实验线程池未终止");
+    }
+
+    private static void require(boolean condition, String message) {
+        if (!condition) {
+            throw new AssertionError(message);
+        }
+    }
+}
+```
+
+在 `observeOccupiedWorker` 中，后续任务已经入队，只有释放闸门、前一项任务退出后，原工作线程才能执行它。在 `observeUnclosedRequestPools` 中，两次任务均已完成，仍存活的是两个本应随请求结束的池所保留的线程。反复创建而不关闭时，即使系统没有查询积压，遗留线程也可能增长。实验通过有限占用展示执行名额何时归还，通过保留引用展示遗漏关闭的时序，实际排查依据见第 19.2 节。
 
 ### 11.6 实例、静态与方法局部线程池：谁创建，谁管理
 
@@ -1190,7 +1567,7 @@ JDK 21 的 ExecutorService 可用于 try-with-resources，其 close 会等待结
 | 方法内 new 线程池 | 每次执行创建语句就有一份 | 适合一次性、数量受控且有明确结束点的工作，由该作用域关闭；高频请求通常复用外部执行器 |
 | 注入单例线程池 Bean | 同一容器中引用同一 Bean 的对象共享 | 容器管理池生命周期，调用方管理自己的任务结果与取消 |
 
-方法返回不会关闭局部线程池，局部变量不可见也不能使存活工作线程自动退出。普通固定线程池的核心线程默认不会空闲超时：即使任务已经结束，每请求创建一个池而不关闭，也会不断遗留等待工作的线程。反过来，共享池维持稳定数量的空闲线程属于正常复用，不应仅凭 WAITING 状态认定泄漏。创建线程池也不意味着立即创建全部配置线程，默认通常按需启动；机制见第 11.1 节。
+第 11.5 节的两个局部池展示了泄漏路径。任务结束或方法返回后，普通固定线程池仍保持运行，核心线程可以继续在工作队列的 `take()` 上等待。漏关一次就可能遗留一组线程，反复发生才会持续累积。对仍在服务的共享池，空闲等待是复用所需的状态。在线请求应复用由服务或容器管理的池，池的拥有者在服务结束时统一关闭。工作线程何时启动见第 11.1 节。[OpenJDK 21 的 getTask 取任务逻辑](https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/java.base/share/classes/java/util/concurrent/ThreadPoolExecutor.java#L998-L1027)
 
 若必须使用一次性局部池，JDK 21 可在明确等待整批结束的作用域内使用 try-with-resources，JDK 17 则显式关闭；两者都要处理任务卡住时如何退出，具体协议见第 11.5 节。allowCoreThreadTimeOut 可调整空闲回收，但不能代替所有权与关闭设计。
 
@@ -1498,7 +1875,7 @@ Ncore_IO,预算估算 ≈ 8 ×（75% − 67.5%）×（1 + 0.195 / 0.005）
 | Condition | 锁保护的状态谓词成立 | while 重检，唤醒后仍需抢锁 |
 | Exchanger | 与另一个参与者交换数据 | 对方退出时必须能超时或取消 |
 
-Latch 通常在任务 finally 中 countDown，表示该任务不再参与等待，但错误要另行收集。提交前就把计数设为 N，若中途提交被拒绝却未修正完成协议，等待者可能永远等不到零。
+若已开始的子任务抛异常并跳过了正常路径上的 `countDown()`，它本身会退出，仍可能卡住的是调用 `await()` 的协调者。若计数表示执行结束，可在任务 `finally` 中 `countDown()`，并单独收集错误。任务被拒绝或在开始前取消时，任务体的 `finally` 无法发送信号，须由提交侧处理这两种分支。若协调者还需要确认子任务成功，直接观察第 11.4 节的 Future 可以同时获得完成信号和失败原因。
 
 屏障参与者数量大于实际可运行线程数时，前面任务占满线程并在屏障等待，后面任务排队无法到达，也可能发生线程饥饿。并发工具的组合必须看全局资源图。
 
@@ -1508,7 +1885,45 @@ Latch 通常在任务 finally 中 countDown，表示该任务不再参与等待�
 
 同一个 Runnable 被注册两次，或者定时回调只是向另一个执行器提交真正工作，这种不重叠保证就不覆盖全部业务执行体。扫描补偿任务时要明确：跳过重叠、串行排队还是允许分片并发。
 
-周期任务若一次执行抛出未处理异常，后续周期执行会被抑制；应保存 ScheduledFuture、监测异常完成，并明确可恢复异常如何处理。不能 catch 所有 Throwable 后假装任务持续健康。
+JDK `ScheduledThreadPoolExecutor` 用 `FutureTask.runAndReset()` 执行每轮周期任务。只有本轮正常执行且重置成功，才计算下次触发时间并重新入队。若异常逃出周期回调，该 `ScheduledFuture` 会异常完成，同一次注册后续不再触发，工作线程可以继续调度池里的其他任务。如果周期回调只是 `submit()` 一个子任务就返回，子任务的失败会留在独立的 Future 里，回调本身仍可能正常完成并继续触发。[JDK 周期任务契约](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ScheduledThreadPoolExecutor.html#scheduleWithFixedDelay(java.lang.Runnable,long,long,java.util.concurrent.TimeUnit)) · [OpenJDK 21 周期任务重新入队逻辑](https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/java.base/share/classes/java/util/concurrent/ScheduledThreadPoolExecutor.java#L284-L292)
+
+例如定时刷新报告状态时，本轮读取下游超时可以记录并等待下轮重扫，其他 I/O 错误按本例策略让注册异常结束。下面是完整教学类 `ReportStatusSchedule.java`。`refresh` 代表本轮同步执行的只读刷新，由适配器设置读取超时并清理本轮资源。拥有者保存 `start` 返回的句柄，供观测和停调使用。
+
+```java
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.SocketTimeoutException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
+public final class ReportStatusSchedule {
+    private static final System.Logger LOG =
+            System.getLogger(ReportStatusSchedule.class.getName());
+
+    @FunctionalInterface
+    public interface RefreshRound {
+        void run() throws IOException;
+    }
+
+    public static ScheduledFuture<?> start(ScheduledExecutorService scheduler,
+                                           RefreshRound refresh) {
+        return scheduler.scheduleWithFixedDelay(() -> {
+            try {
+                refresh.run();
+            } catch (SocketTimeoutException timeout) {
+                LOG.log(System.Logger.Level.WARNING, "本轮报告状态查询超时，下轮重扫", timeout);
+            } catch (IOException failed) {
+                throw new UncheckedIOException("报告状态刷新失败", failed);
+            }
+        }, 0, 1, TimeUnit.SECONDS);
+    }
+}
+```
+
+第一种异常被明确恢复，本轮回调返回后还有下一轮。第二种异常会使该次注册终止，意外的运行时异常也会保留为失败。监控先看 `registration.isDone()`，终止后再用 `get()` 区分 ExecutionException 和 CancellationException。持续正常运行的周期 Future 不会完成，因此在工作线程或 `afterExecute` 中直接 `get()` 可能占住线程。若只需停止后续轮次、允许当前轮完成，可由任务拥有者调用 `registration.cancel(false)`。需尝试中断当前轮时使用 `cancel(true)`，实际退出仍遵循第 10 章的中断与清理规则。
+
+若同一池里所有到期任务都不再执行，应检查工作线程是否被同池 `get()`、锁或 I/O 占住。例如单线程调度池中，当前回调提交子任务到同一池再同步等待，子任务一直排队，其他到期任务也无法执行。旧的 `java.util.Timer` 只有一条调度线程，未捕获异常可以使这条线程退出，影响同一个 Timer 上的全部任务。[Timer 契约](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/Timer.html) · [OpenJDK 21 Timer 执行循环](https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/java.base/share/classes/java/util/Timer.java#L499-L542)
 
 取消的长延时任务默认可能保留在队列直到延迟到期；可评估 `setRemoveOnCancelPolicy(true)`。ScheduledThreadPoolExecutor 使用延迟队列，调大 maximumPoolSize 不提供普通有界池那样的扩容效果。依据：[ScheduledThreadPoolExecutor API](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ScheduledThreadPoolExecutor.html)。
 
@@ -2925,6 +3340,8 @@ jcmd <PID> help JFR.start
 | CPU 低、active 高、HTTP 栈聚集 | 下游慢、连接等待、超时缺失 | 线程不足，直接扩十倍 |
 | 队列持续上涨、堆低水位上升 | 到达率超过处理能力、任务持有大上下文 | 一定是 JVM 参数错误 |
 | 长时间等待 Future，子任务在同池队列 | 线程饥饿或依赖环 | JVM 没报死锁所以正常 |
+| 同一批工作线程长期停在业务或清理栈，池大小稳定，已到达任务继续积压 | 任务长期占用执行名额，结合实际进度、超时和持有资源确认 | 线程数稳定就表示池健康 |
+| 线程数随请求累积，多批线程空闲在工作队列的 `take()`，池创建和关闭记录不匹配 | 旧池在生命周期结束后仍保留线程，按执行器实例追查归属 | 只凭 WAITING 状态就能判定泄漏 |
 | 写锁等待长 | 读锁持有时间、回源、调度与竞争 | 默认读写锁必然无限放行新读者 |
 | 周期任务不再出现 | ScheduledFuture 异常、关闭状态 | 调度器随机失效 |
 | Future 已取消但下游仍忙 | 取消未传递、执行体不响应 | cancel 返回 true 就已释放资源 |
@@ -3295,6 +3712,12 @@ java VirtualThreadProbe
 
 ### 20.3 本次验证记录
 
+- 2026-11-10 工作线程生命周期对照：在第 11.5 节补充 `WorkerLifecycleDemo`，第 11.6 节解释局部池遗漏关闭，第 19.2 节补充线程长期占用和旧池留存的诊断证据。依据 JDK 21 契约和 OpenJDK `jdk-21+35` 的取任务与退出逻辑，从正文提取示例，在 JDK 17.0.11 和 21.0.3 编译并运行。两个版本均通过四组观察，覆盖正常返回和 `submit` 失败后复用同一个线程、普通 `execute` 失败后原线程退出且新线程接活、等待结束前后队列能否推进、两个局部池的任务完成后仍分别持有活线程。长期占用用有限闸门模拟，局部池保留引用以便实验结束时关闭。
+
+- 2026-11-10 子任务异常与工作线程归还：在第 10.3、11.4～11.5、13.1～13.2 节补充任务取消归属、提交与执行异常、同步结果等待、空闲线程回收以及周期任务失败。按 JDK 21 API 与 OpenJDK `jdk-21+35` 源码核对。从正文提取 `ReportQueryWait` 和 `ReportStatusSchedule`，在 JDK 17.0.11 和 21.0.3 编译并通过五组定向检查，覆盖正常结果、任务内部超时与提交拒绝，等待超时取消后清理完成才复用原线程，等待方中断的传播与子任务取消，`execute` 和 `submit` 对工作线程的不同影响，以及可恢复异常继续触发、其他异常停止该次周期注册。实验用内存桩和有界等待，执行器均已关闭。真实报告客户端的取消和超时取决于第 10.5 节说明的适配器契约。
+
+- 2026-11-09 StampedLock 图解补充：扩充第 7.4 节三种模式、InventoryView 教学类、state/stamp/validate 机制、双线程时序及 Mermaid 流程图。源码基线为 OpenJDK `jdk-21+35`；从正文提取完整类，以 JDK 21.0.3、`--release 17` 编译并在 JDK 21.0.3 运行定向检查：无写入验证成功、普通读计数不影响验证、持写期间返回 0 与旧 stamp 失败、释放后旧 stamp 仍失败。临时测试通过反射读取教学类字段并用 CountDownLatch 安排双线程交错，观察候选值 10/2 被拒绝、读锁重读得到 8/2；闸门额外提供可见性，只验证该受控时序与回退协议，不声称自然竞争必然读到混合值。另验证原 snapshot 返回值、旧快照保持不变、非法数量和库存不足不改变状态；等待有上限，执行器已关闭。检查文档差异、围栏与图节点连线；未进行 Obsidian 实际渲染、性能压测或数据库集成。
+
 - 2026-11-06 死锁与生产者—消费者退出协议：新增第 5.5 节双账户等待环、统一加锁顺序与共同等待预算，新增第 13.4 节正常排空、失败中止、结束标记及数据恢复边界，第 19.2 节补充等待图与检测范围。核对 JDK 21 锁、队列、CompletionService 与 ThreadMXBean 契约；OrderedTransfers、BoundedPipeline 和定向测试以 JDK 17.0.11 编译，在 JDK 17.0.11、21.0.3 运行通过。先以闸门形成可中断双锁死锁并检测两线程，再中断清理；验证双向各 1000 次转账守恒、第二把锁超时后第一把锁可被其他线程取得，以及流水线正常多消费者、空输入、生产失败、消费失败、超时和协调者中断。测试均有等待上限，验证专用执行器结束；未执行数据库、HTTP 或生产容量测试，不承诺非合作式 I/O 可强制退出。
 
 - 2026-11-06 ThreadLocal 回收对象澄清：结合引用对话重写第 15.1 节原有弱引用与泄漏说明，分别追踪 ThreadLocal 键对象 L 和业务值 V；以静态键、局部键、遗漏清理和 remove 后返回值四段代码说明可达性，保留失效 Entry 清理及反向引用边界，补充覆盖旧值、线程退出和其他引用的影响。核对 JDK 21 引用 API 与 Thread.clearReferences/exit；新增 ThreadLocalReachability 教学类在 JDK 17.0.11、21.0.3 编译通过，执行正确清理路径，并验证 remove 后返回数组仍可使用、两次调用的数组独立。未运行故意遗漏清理的方法，未强制 GC、制造 OOM 或声称验证具体回收时刻；检查代码围栏、标题、链接和快照差异，修改范围仅为第 15.1 节及本条记录。
@@ -3344,17 +3767,17 @@ java VirtualThreadProbe
 
 下表沿用库存 10、A 扣 2、B 扣 3，假设记录存在、请求有效，且成功路径最终提交。SQL 形态是教学简写。
 
-| 方案 | A 的处理 | B 的处理 | 需要检查的结果 |
-| --- | --- | --- | --- |
-| 直接在数据库当前值上扣减 | `SET stock=stock-2 WHERE id=? AND stock>=2`，提交后为 8 | 冲突时等待行锁，之后基于 8 扣 3，提交后为 5 | 影响行数；零行不能继续成功流程 |
-| 版本号乐观锁 | 读到版本 3，计算 8；以版本 3 更新并递增，提交 | 若也读到版本 3，旧条件更新返回 0；允许重试时新事务重读 8、重算 5 | 版本条件、影响行数、重试与最终提交 |
-| `SELECT ... FOR UPDATE` | 同一事务内先锁定读 10，计算并更新 8，提交释放锁 | 在锁定读阶段等待；A 提交后读到 8，再计算并更新 5 | 读、校验、写必须在同一事务；仍处理超时与死锁 |
+| 方案                      | A 的处理                                              | B 的处理                                | 需要检查的结果                |
+| ----------------------- | -------------------------------------------------- | ------------------------------------ | ---------------------- |
+| 直接在数据库当前值上扣减            | `SET stock=stock-2 WHERE id=? AND stock>=2`，提交后为 8 | 冲突时等待行锁，之后基于 8 扣 3，提交后为 5            | 影响行数；零行不能继续成功流程        |
+| 版本号乐观锁                  | 读到版本 3，计算 8；以版本 3 更新并递增，提交                         | 若也读到版本 3，旧条件更新返回 0；允许重试时新事务重读 8、重算 5 | 版本条件、影响行数、重试与最终提交      |
+| `SELECT ... FOR UPDATE` | 同一事务内先锁定读 10，计算并更新 8，提交释放锁                         | 在锁定读阶段等待；A 提交后读到 8，再计算并更新 5          | 读、校验、写必须在同一事务；仍处理超时与死锁 |
 
 追问边界：乐观锁同样能扣库存，不限于简单修改；带版本的 UPDATE 本身也是原子 SQL，分类不是互斥的。这里“原子 SQL”特指直接在数据库当前值上增减的方案。乐观锁的 UPDATE 仍可能拿行锁并等待；`FOR UPDATE` 的范围取决于索引、谓词和隔离级别，也不会阻止所有普通快照读。依据：[InnoDB 锁定读](https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html)；版本冲突细节见第 18.1 节。
 
 **追问 4：100 个请求都读到版本 3，一个成功后，剩下 99 个会怎样？是不是高 QPS 就不该用乐观锁？**
 
-回答要点：在首个更新提交、版本不重置且所有写者遵守协议的前提下，其余旧版本 UPDATE 仍会执行，可能先等锁，再因版本不匹配返回 0；不会自动跳过、抛异常或重新计算。首个事务回滚时，后续请求仍可能以版本 3 成功。性能取决于同一记录的冲突率、读到写的时间窗口、候选计算成本和重试策略；高 QPS 分散到不同 key 未必高冲突。要观察冲突率、每次成功的尝试次数、数据库等待和尾延迟，不能只看总请求量。
+回答要点：==在首个更新提交、版本不重置且所有写者遵守协议的前提下，其余旧版本 UPDATE 仍会执行，可能先等锁，再因版本不匹配返回 0；不会自动跳过、抛异常或重新计算。==首个事务回滚时，后续请求仍可能以版本 3 成功。性能取决于同一记录的冲突率、读到写的时间窗口、候选计算成本和重试策略；高 QPS 分散到不同 key 未必高冲突。要观察冲突率、每次成功的尝试次数、数据库等待和尾延迟，不能只看总请求量。
 
 **追问 5：乐观锁冲突后直接循环重试可以吗？**
 
@@ -3362,13 +3785,13 @@ java VirtualThreadProbe
 
 **追问 6：Redisson 和 `SELECT ... FOR UPDATE` 都是悲观锁，能直接互换吗？锁的范围都很大吗？**
 
-回答要点：二者都能协调多个应用实例，但约束的位置不同。数据库锁约束冲突的数据库操作；Redisson `RLock` 只协调获取同一 key 的路径，绕过它的 SQL 仍能写入。粒度由业务 key、数据库索引和查询条件决定，不天然是“一大块”。普通 RLock 不提供跨 Redis、数据库和 RPC 的统一事务。
+回答要点：==二者都能协调多个应用实例，但约束的位置不同。数据库锁约束冲突的数据库操作；Redisson `RLock` 只协调获取同一 key 的路径，绕过它的 SQL 仍能写入==。粒度由业务 key、数据库索引和查询条件决定，不天然是“一大块”。普通 RLock 不提供跨 Redis、数据库和 RPC 的统一事务。
 
 必须继续说明两个失败窗口：一是事务方法中的 `finally` 解锁可能早于 Spring 代理提交，合理顺序应为“加 Redis 锁 → 新数据库事务读取并更新 → 提交或回滚完成 → 解 Redis 锁”，还要核对更外层事务；二是旧持有者暂停、租约到期、新持有者完成后，旧持有者恢复仍可能写资源。watchdog 续期不能消除所有暂停与故障窗口，关键资源还需校验版本或 fencing token，单纯防止误解锁不等于防止陈旧写入。依据：[Redisson 锁与 fencing](https://redisson.pro/docs/data-and-services/locks-and-synchronizers/)、[Spring 物理事务与传播边界](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/tx-propagation.html)。
 
 **追问 7：既然已经加锁，为什么还要幂等？**
 
-回答要点：锁解决竞争，幂等识别重复业务动作。同一订单的两次扣减即使串行，也可能执行两次；两个不同订单即使都不是重复请求，也会竞争同一商品库存。因此需要同时定义业务幂等键和库存更新条件；数据库内可用唯一约束配合同一事务，重复时返回既有结果或明确处理中状态。先查“没有处理”再插入，若缺少原子约束仍有竞态；锁也不会自动回滚已发送的外部请求。
+回答要点：==锁解决竞争，幂等识别重复业务动作。同一订单的两次扣减即使串行，也可能执行两次；两个不同订单即使都不是重复请求，也会竞争同一商品库存。因此需要同时定义业务幂等键和库存更新条件；数据库内可用唯一约束配合同一事务，重复时返回既有结果或明确处理中状态。先查“没有处理”再插入，若缺少原子约束仍有竞态；锁也不会自动回滚已发送的外部请求==。
 
 **追问 8：什么时候修改 MySQL 隔离级别？改了配置为什么没生效？**
 
@@ -3380,7 +3803,7 @@ java VirtualThreadProbe
 
 **追问 9：volatile 到底保证什么？为什么 `count++` 仍不安全？**
 
-回答要点：用 happens-before 解释发布，而不是只说“刷新主内存”。一次发布中，普通字段写入 → volatile 写 → 读到此次发布的 volatile 值 → 读取普通字段，可通过传递性证明可见性。volatile 单次读写具有相应原子性，包括 long/double，但 `count++` 仍是读、算、写；多字段检查修改也不因各字段 volatile 而成为整体原子操作。它约束可观察顺序，不是禁止所有重排。证明例子见第 3.2 节。依据：[JLS 17.4～17.7](https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html)。
+回答要点：用 happens-before 解释发布，而不是只说“刷新主内存”。==一次发布中，普通字段写入 → volatile 写 → 读到此次发布的 volatile 值 → 读取普通字段==，可通过传递性证明可见性。volatile 单次读写具有相应原子性，包括 long/double，但 `count++` 仍是读、算、写；多字段检查修改也不因各字段 volatile 而成为整体原子操作。它约束可观察顺序，不是禁止所有重排。证明例子见第 3.2 节。依据：[JLS 17.4～17.7](https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html)。
 
 **追问 10：`volatile` 引用、不可变快照和原子引用有什么区别？**
 
@@ -3396,13 +3819,13 @@ java VirtualThreadProbe
 
 **追问 13：synchronized 和 ReentrantLock 怎么选？**
 
-回答要点：普通结构化互斥可先用 synchronized；需要可中断获取、超时尝试、多个 Condition 或可配置公平策略时评估 ReentrantLock。前者由语言结构释放，后者须在成功获取后进入 try/finally。公平性不等于业务严格按请求顺序完成，也不能仅凭“底层 CAS”判定性能。能力表与异常边界见第 5.2 节。
+回答要点：==普通结构化互斥可先用 synchronized；需要可中断获取、超时尝试、多个 Condition 或可配置公平策略时评估 ReentrantLock。==前者由语言结构释放，后者须在成功获取后进入 try/finally。公平性不等于业务严格按请求顺序完成，也不能仅凭“底层 CAS”判定性能。能力表与异常边界见第 5.2 节。
 
 ### 21.4 P0：条件等待与通知
 
 **追问 14：`wait()` 到 `notify()` 再到继续执行，顺序是什么？**
 
-回答要点：持有同一对象 monitor → 条件不满足 → wait 释放该 monitor 的持有并等待 → 通知/超时/中断等使其恢复竞争 → 重新获取 monitor 并恢复重入层数 → 返回或按契约抛异常。wait 只释放本对象的 monitor，不释放其他锁；notify 不释放通知者的锁，也不把锁直接授予等待者。依据：[Object 等待与通知契约](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Object.html)。
+回答要点：==持有同一对象 monitor → 条件不满足 → wait 释放该 monitor 的持有并等待 → 通知/超时/中断等使其恢复竞争 → 重新获取 monitor 并恢复重入层数 → 返回或按契约抛异常。wait 只释放本对象的 monitor，不释放其他锁；notify 不释放通知者的锁，也不把锁直接授予等待者。==依据：[Object 等待与通知契约](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Object.html)。
 
 **追问 15：为什么必须用 while，不能用 if？notify 先于 wait 会怎样？**
 
@@ -3410,7 +3833,7 @@ java VirtualThreadProbe
 
 **追问 16：等待锁、等待条件和 sleep，线程状态有什么区别？**
 
-回答要点：等待进入 synchronized monitor 通常是 BLOCKED；Object.wait 是 WAITING/TIMED_WAITING，通知后重新竞争 monitor 可能为 BLOCKED；sleep 是 TIMED_WAITING 且不释放锁。AQS 的 park 等待通常显示 WAITING/TIMED_WAITING，不能把所有锁等待都归为 BLOCKED。结合栈、持有者和持续时间诊断，不能看到 WAITING 就认定死锁。状态表见第 10.1 节。
+回答要点：==等待进入 synchronized monitor 通常是 BLOCKED；Object.wait 是 WAITING/TIMED_WAITING，通知后重新竞争 monitor 可能为 BLOCKED；sleep 是 TIMED_WAITING 且不释放锁==。AQS 的 park 等待通常显示 WAITING/TIMED_WAITING，不能把所有锁等待都归为 BLOCKED。结合栈、持有者和持续时间诊断，不能看到 WAITING 就认定死锁。状态表见第 10.1 节。
 
 ### 21.5 P1：AQS 与 ReentrantReadWriteLock
 
