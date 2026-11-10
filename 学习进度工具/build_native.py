@@ -22,7 +22,7 @@ empty = build / 'empty.modulemap'
 empty.write_text('// 本次构建忽略重复的旧模块定义。\n')
 overlay = build / 'overlay.json'
 overlay.write_text(json.dumps({'version': 0, 'roots': [{'type': 'file', 'name': '/Library/Developer/CommandLineTools/usr/include/swift/module.modulemap', 'external-contents': str(empty)}]}))
-subprocess.run(["xcrun", "swiftc", "-parse-as-library", "-target", "arm64-apple-macosx14.0", '-vfsoverlay', str(overlay), '-Xcc', '-ivfsoverlay', '-Xcc', str(overlay), "-O", str(root / "StudyApp.swift"), str(root / "Presentation.swift"), str(root / "StudyTheme.swift"), str(root / "EvidenceView.swift"), str(root / "ImageAttachments.swift"), str(root / "MarkdownNotes.swift"), "-o", str(contents / "MacOS/StudyProgress"), "-framework", "SwiftUI", "-framework", "AppKit"], check=True)
+subprocess.run(["xcrun", "swiftc", "-parse-as-library", "-target", "arm64-apple-macosx14.0", '-vfsoverlay', str(overlay), '-Xcc', '-ivfsoverlay', '-Xcc', str(overlay), "-O", str(root / "StudyApp.swift"), str(root / "Presentation.swift"), str(root / "StudyTheme.swift"), str(root / "EvidenceView.swift"), str(root / "ImageAttachments.swift"), str(root / "MarkdownNotes.swift"), str(root / "MarkdownTable.swift"), str(root / "DirtyStateCheck.swift"), str(root / "ReflectionSaveCheck.swift"), "-o", str(contents / "MacOS/StudyProgress"), "-framework", "SwiftUI", "-framework", "AppKit"], check=True)
 for name in ["native_bridge.py", "server.py"]:
     shutil.copy2(root / name, contents / "Resources" / name)
 iconset = build / 'StudyIcon.iconset'

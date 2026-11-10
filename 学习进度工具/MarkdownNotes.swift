@@ -25,7 +25,7 @@ enum NotesMarkdown {
     static func render(_ source: String, root: String) -> NSAttributedString {
         let result = NSMutableAttributedString(string: "")
         let heading = try! NSRegularExpression(pattern: #"^ {0,3}(#{1,6})\s+(.+?)(?:\s+#+)?$"#)
-        let list = try! NSRegularExpression(pattern: #"^(\s*)([-+*]|\d+[.)])\s+(.*)$"#)
+        let list = try! NSRegularExpression(pattern: #"^([ \t]*)([-+*]|\d+[.)]|[a-zA-Z][.)])[ \t]+(.*)$"#)
         for block in EvidenceRenderer.blocks(source) {
             switch block {
             case .code(let language, let code):
@@ -51,7 +51,7 @@ enum NotesMarkdown {
                     } else if let match = heading.firstMatch(in: line, range: range) {
                         let level = (line as NSString).substring(with: match.range(at: 1)).count
                         let title = (line as NSString).substring(with: match.range(at: 2))
-                        paragraph = NSMutableAttributedString(attributedString: inline(title, size: CGFloat([30, 24, 20, 17, 16, 15][level - 1]), bold: true))
+                        paragraph = NSMutableAttributedString(attributedString: inline(title, size: CGFloat([26, 22, 18, 16, 15, 14][level - 1]), bold: true))
                         style.paragraphSpacingBefore = 10; style.paragraphSpacing = 12
                     } else if let match = list.firstMatch(in: line, range: range) {
                         let indent = (line as NSString).substring(with: match.range(at: 1)).replacingOccurrences(of: "\t", with: "    ").count
@@ -60,15 +60,15 @@ enum NotesMarkdown {
                         var prefix = ["-", "+", "*"].contains(marker) ? "•" : marker
                         if body.hasPrefix("[ ] ") { prefix = "☐"; body = String(body.dropFirst(4)) }
                         else if body.hasPrefix("[x] ") || body.hasPrefix("[X] ") { prefix = "☑"; body = String(body.dropFirst(4)) }
-                        paragraph = NSMutableAttributedString(attributedString: inline(prefix + "\t" + body, size: 15))
+                        paragraph = NSMutableAttributedString(attributedString: inline(prefix + "\t" + body, size: 14))
                         style.firstLineHeadIndent = CGFloat(indent) * 7
                         style.headIndent = style.firstLineHeadIndent + 32
                         style.tabStops = [NSTextTab(textAlignment: .left, location: style.headIndent)]
                         style.paragraphSpacing = 8
                     } else {
-                        paragraph = NSMutableAttributedString(attributedString: inline(line, size: 15))
+                        paragraph = NSMutableAttributedString(attributedString: inline(line, size: 14))
                     }
-                    paragraph.append(NSAttributedString(string: "\n", attributes: [.font: NSFont.systemFont(ofSize: line.trimmingCharacters(in: .whitespaces).isEmpty ? 4 : 15)]))
+                    paragraph.append(NSAttributedString(string: "\n", attributes: [.font: NSFont.systemFont(ofSize: line.trimmingCharacters(in: .whitespaces).isEmpty ? 4 : 14)]))
                     paragraph.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: paragraph.length))
                     result.append(paragraph)
                 }
@@ -78,6 +78,21 @@ enum NotesMarkdown {
     }
 
     @MainActor static func check() {
+        let nested = render("1. Spring主要管理的内容为：\n\ta. 对象：创建了哪些对象\n    b. 依赖关系：对象之间如何建立依赖\n        A) 更深一层\n2. 下一项", root: "")
+        for (text, indent) in [("a.\t对象", CGFloat(28)), ("b.\t依赖关系", CGFloat(28)), ("A)\t更深一层", CGFloat(56))] {
+            let range = (nested.string as NSString).range(of: text)
+            guard range.location != NSNotFound else {
+                print("失败：字母子列表未识别：\(text)"); exit(1)
+            }
+            let style = nested.attribute(.paragraphStyle, at: range.location, effectiveRange: nil) as! NSParagraphStyle
+            precondition(style.firstLineHeadIndent == indent && style.headIndent == indent + 32)
+            precondition(style.lineSpacing == 6 && style.paragraphSpacing == 8)
+            let font = nested.attribute(.font, at: range.location, effectiveRange: nil) as! NSFont
+            precondition(font.pointSize == 14)
+        }
+        let fenced = render("```text\n\ta. 保持代码原文\n```", root: "")
+        precondition(fenced.string.contains("\ta. 保持代码原文"))
+
         let source = "## 原理\n\n1. 调用 `interrupt()`\n   - **协作取消**\n- [x] 已验证\n\n```java\n    run();\n```"
         let host = NSHostingView(rootView: ReflectionNotesEditor(source: .constant(source), root: ""))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 500), styleMask: [.titled], backing: .buffered, defer: false)

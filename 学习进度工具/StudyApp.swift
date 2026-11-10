@@ -1,8 +1,8 @@
 import SwiftUI
 import AppKit
 
-struct StudyTask: Codable { var done: Bool; var text: String }
-struct StudyDay: Codable {
+struct StudyTask: Codable, Equatable { var done: Bool; var text: String }
+struct StudyDay: Codable, Equatable {
     var number: Int; var title: String; var date: String; var hours: Double?
     var status: String; var level: String; var tasks: [StudyTask]; var records: [String: String]
 }
@@ -233,7 +233,22 @@ p.write_text(s)
         select(target.week, target.day)
     }
     func change(_ action: (inout StudyDay) -> Void) {
-        guard var value = draft else { return }; action(&value); draft = value; dirty = true
+        guard var value = draft else { return }; action(&value)
+        if value != draft { draft = value }
+        refreshDirty()
+    }
+    func refreshDirty() {
+        guard let snapshot, let draft else { dirty = false; return }
+        let stored = snapshot.weeks[week].days[day]
+        let hoursChanged: Bool
+        if hours.isEmpty { hoursChanged = stored.hours != nil }
+        else if let number = Double(hours), number.isFinite { hoursChanged = number != stored.hours }
+        else { hoursChanged = true }
+        dirty = draft != stored || review != snapshot.weeks[week].review || hoursChanged
+    }
+    func changeHours(_ value: String) {
+        if hours != value { hours = value }
+        refreshDirty()
     }
     func save() {
         guard let snapshot, let draft else { return }
@@ -291,7 +306,10 @@ struct ContentView: View {
     }
     func note(_ label: String, weekly: Bool = false) -> Binding<String> {
         Binding(get: { weekly ? model.review[label] ?? "" : model.draft?.records[label] ?? "" }, set: { value in
-            if weekly { model.review[label] = value; model.dirty = true }
+            if weekly {
+                if model.review[label] != value { model.review[label] = value }
+                model.refreshDirty()
+            }
             else { model.change { $0.records[label] = value } }
         })
     }
@@ -440,7 +458,7 @@ GroupBox {
                                         }
                                         Spacer()
                                         Text("实际时长")
-                                        TextField("例如 4.5", text: Binding(get: { model.hours }, set: { model.hours = $0; model.dirty = true })).frame(width: 90)
+                                        TextField("例如 4.5", text: Binding(get: { model.hours }, set: { model.changeHours($0) })).frame(width: 90)
                                         Text("小时")
                                     }
                                     Text("按实际情况记录；勾选任务不会自动标记当天完成。").font(.caption).foregroundStyle(Color(nsColor: StudyTheme.muted))
@@ -481,6 +499,9 @@ GroupBox("今日安排") {
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var model: StudyModel?
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--check-reflection-save") { ReflectionSaveCheck.run() }
+        if CommandLine.arguments.contains("--check-dirty") { DirtyStateCheck.run() }
+        if CommandLine.arguments.contains("--check-tables") { MarkdownTable.check() }
         if CommandLine.arguments.contains("--check-theme") { ThemePreviewCheck.run() }
         if CommandLine.arguments.contains("--check-follow-up") { StudyModel().checkFollowUpEditor() }
         if CommandLine.arguments.contains("--check-markdown") { NotesMarkdown.check() }

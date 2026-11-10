@@ -10,7 +10,7 @@ struct ReflectionEditor: NSViewRepresentable {
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = 6
         paragraph.paragraphSpacing = 12
-        return [.font: NSFont.systemFont(ofSize: 15),
+        return [.font: NSFont.systemFont(ofSize: 14),
                 .foregroundColor: StudyTheme.text, .paragraphStyle: paragraph]
     }
 
@@ -32,6 +32,7 @@ struct ReflectionEditor: NSViewRepresentable {
         text.minSize = .zero
         text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         text.delegate = context.coordinator
+        context.coordinator.textView = text
         scroll.documentView = text
         return scroll
     }
@@ -48,9 +49,32 @@ struct ReflectionEditor: NSViewRepresentable {
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: ReflectionEditor
+        weak var textView: NSTextView?
+        weak var observedUndoManager: UndoManager?
+        deinit { NotificationCenter.default.removeObserver(self) }
+        func observeUndo(_ manager: UndoManager?) {
+            guard observedUndoManager !== manager else { return }
+            if let previous = observedUndoManager {
+                for name in [Notification.Name.NSUndoManagerDidUndoChange, Notification.Name.NSUndoManagerDidRedoChange] {
+                    NotificationCenter.default.removeObserver(self, name: name, object: previous)
+                }
+            }
+            observedUndoManager = manager
+            if let manager {
+                for name in [Notification.Name.NSUndoManagerDidUndoChange, Notification.Name.NSUndoManagerDidRedoChange] {
+                    NotificationCenter.default.addObserver(self, selector: #selector(syncAfterUndo), name: name, object: manager)
+                }
+            }
+        }
+        @objc private func syncAfterUndo(_ notification: Notification) {
+            guard let text = textView, text.string != parent.source else { return }
+            parent.source = text.string
+        }
         init(_ parent: ReflectionEditor) { self.parent = parent }
         func textDidChange(_ notification: Notification) {
             guard let text = notification.object as? NSTextView else { return }
+            observeUndo(text.undoManager)
+            guard text.string != parent.source else { return }
             parent.source = text.string
         }
     }
@@ -93,14 +117,16 @@ enum EvidenceRenderer {
         for block in blocks(source) {
             switch block {
             case .prose(let text):
-                for line in text.components(separatedBy: "\n") {
+                output.append(MarkdownTable.render(text) { line in
+                    let value = NSMutableAttributedString(string: "")
                     if let attachment = ImageAttachments.attachment(line, root: root) {
-                        output.append(attachment)
-                        output.append(NSAttributedString(string: "\n", attributes: prose))
+                        value.append(attachment)
+                        value.append(NSAttributedString(string: "\n", attributes: prose))
                     } else {
-                        output.append(NSAttributedString(string: line + "\n", attributes: prose))
+                        value.append(NSAttributedString(string: line + "\n", attributes: prose))
                     }
-                }
+                    return value
+                })
             case .code(let language, let code):
                 if !language.isEmpty {
                     output.append(NSAttributedString(string: language + "\n", attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: StudyTheme.muted]))
