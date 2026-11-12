@@ -481,7 +481,9 @@ Spring JDBC 事务管理器通常以 DataSource 为键绑定 ConnectionHolder；
 
 对 Spring 管理的 `SqlSessionTemplate` 调用 `commit/rollback/close` 会被拒绝，而不只是“可能提前提交”。另一方面，业务直接操纵 Connection 或另开原生 SqlSession，又可能绕开集成层的保护。
 
-## 7.3 提交发生在方法返回给调用方之前
+## 7.3 方法返回与物理提交的边界
+
+下图只描述当前代理范围新建本地 JDBC 事务、业务正常返回的路径，例如无外层事务时的 `REQUIRED`，或独立开启的 `REQUIRES_NEW`。业务方法返回给代理后，由代理完成事务，再向调用方返回结果；不能把这个顺序套到参与已有事务的内层方法。
 
 ```mermaid
 sequenceDiagram
@@ -491,7 +493,7 @@ sequenceDiagram
     participant M as Mapper
     participant D as 数据库
     C->>P: 调用事务方法
-    P->>D: 开启或参与事务
+    P->>D: 新建物理事务
     P->>S: 执行业务方法
     S->>M: 写业务记录
     M->>D: 执行 SQL
@@ -502,6 +504,10 @@ sequenceDiagram
     D-->>P: 提交结果
     P-->>C: 返回结果或抛出提交异常
 ```
+
+如果内层 `REQUIRED` 加入外层事务，内层返回时不会独立物理提交：外层调用 → 内层写入并返回 → 外层继续执行 → 外层事务最终提交或回滚。即使内层返回成功，外层之后抛出异常仍可回滚这些写入，调用方不能据内层返回就发送不可撤回的外部通知。可靠事件应与业务数据写入同一事务的 Outbox，再由提交后的投递流程处理。
+
+该边界与 [[02-Spring与微服务/Spring/Spring核心原理|Spring 核心原理]] 中“新建本地 JDBC 事务”的完成顺序一致。依据：[Spring 6.2 事务传播](https://docs.spring.io/spring-framework/reference/6.2/data-access/transaction/declarative/tx-propagation.html)。验证时应覆盖“内层正常返回、外层随后回滚，记录不落库”的路径；本轮仅核对文档和图示，未执行框架集成实验。
 
 业务方法最后一行日志写“完成”，不代表提交已经成功。提交阶段可能才触发批处理执行、约束错误或连接异常。
 

@@ -98,7 +98,7 @@ FROM
 窗口函数在 PostgreSQL 中提供了强大的分析能力，允许在查询中进行复杂的计算，而不需要改变结果集的结构。通过合理使用窗口函数，可以实现灵活的数据分析和报告功能。
 
 # 3. Inheritance（继承）
-PostgreSQL 的继承（Inheritance）功能允许创建表之间的层次结构，使得子表可以继承父表的结构和数据。这种特性非常适合需要对相似数据进行分组和管理的场景。以下是关于 PostgreSQL 继承的详细介绍。
+本节以 PostgreSQL 17 的传统表继承 `INHERITS` 为基线。子表继承父表的列定义及可继承约束，但不会复制或继承父表中已有的数据。查询父表默认包含子表，是查询范围扩展，不是数据复制；传统继承也不能直接等同于声明式分区。
 
 ## 1. 基本概念
 
@@ -149,7 +149,7 @@ SELECT * FROM ONLY animals;
 
 ## 4. 插入数据
 
-可以向父表和子表插入数据：
+`INSERT` 只写入显式指定的目标表，不会因为继承关系自动路由到子表。下面第一行写入 `animals`，后两行分别写入 `dogs` 和 `cats`：
 
 ```sql
 INSERT INTO animals (name, species) VALUES ('Buddy', 'Dog');
@@ -159,13 +159,14 @@ INSERT INTO cats (name, species, color) VALUES ('Whiskers', 'Cat', 'Black');
 
 ## 5. 更新和删除
 
-- 更新和删除操作也适用于父表和子表：
-  - 如果在父表中进行删除操作，默认情况下会影响所有子表。
-  - 可以使用 `CASCADE` 选项来确保删除父表时，相关的子表数据也被删除。
+- 对父表执行 `UPDATE` 或 `DELETE` 时，默认也处理后代表中符合条件的行；使用 `ONLY animals` 可限定只处理父表。
+- 删除行与删除表是两种操作。`DELETE` 没有这里所说的 `CASCADE` 选项；`DROP TABLE animals CASCADE` 会删除父表及依赖的子表等对象，不能作为清理数据行的替代。
 
 ## 6. 约束和索引
 
-子表可以有自己的约束和索引，但不能更改父表的约束。例如，子表不能删除父表中的主键约束。
+父表的 `CHECK`（未声明 `NO INHERIT`）和 `NOT NULL` 约束会继承；主键、唯一约束、外键和索引不会自动继承。继承的列和检查约束也不能在子表上随意删除。
+
+示例中的 `animals.id` 主键只约束父表自身，不保证 `dogs.id`、`cats.id` 唯一，也不保证跨父子表全局唯一。即使子表分别建立主键，也只获得各表内部的唯一性；共享序列默认值同样不能替代唯一约束。需要全局唯一性时，应重新选择统一实体表或集中约束的建模方式。
 
 ## 7. 继承的使用场景
 
@@ -175,7 +176,9 @@ INSERT INTO cats (name, species, color) VALUES ('Whiskers', 'Cat', 'Black');
 ## 8. 注意事项
 
 - 继承表在设计上需要谨慎，过度使用可能导致复杂性和性能问题。
-- PostgreSQL 的继承并不支持所有 SQL 标准的继承特性，如多重继承。
+- 支持多个父表，例如 `INHERITS (parent_a, parent_b)`；同名列合并时类型必须一致，约束合并也有兼容要求。
+- 最小验证思路：在隔离测试库建上述三张表，向 `dogs` 显式插入两行相同 `id`，确认父表主键不会阻止重复；再比较 `SELECT * FROM animals` 与 `SELECT * FROM ONLY animals`。本轮未连接数据库执行此实验。
+- 官方依据：[PostgreSQL 17 表继承及限制](https://www.postgresql.org/docs/17/ddl-inherit.html)。
 
 ### 总结
 
@@ -277,7 +280,7 @@ PostgreSQL 和 MySQL 是两个流行的开源关系数据库管理系统（RDBMS
 ## 1. 数据库特性
 
 - **数据完整性**：
-  - **PostgreSQL**：支持强大的数据完整性，支持复杂的约束、外键、触发器和规则。具有更高级的事务处理能力（如多版本并发控制 - MVCC）。
+  - **PostgreSQL**：支持约束、外键、触发器和规则；MVCC 与隔离级别需按具体实现理解，不能据此笼统认定事务能力更高级。
   - **MySQL**：也支持外键和约束，但在某些存储引擎（如 MyISAM）中不支持事务和外键约束。
 
 - **数据类型**：
@@ -301,7 +304,7 @@ PostgreSQL 和 MySQL 是两个流行的开源关系数据库管理系统（RDBMS
 
 ## 5. 事务处理
 
-- **PostgreSQL**：支持高级事务特性，如可序列化隔离级别和多版本并发控制（MVCC）。
+- **PostgreSQL**：支持 MVCC 和可序列化隔离；默认隔离级别为 Read Committed。具体快照与重试边界见下文，不能仅凭隔离级别名称套用其他数据库的实现。
 - **MySQL**：在 InnoDB 存储引擎中支持事务，但在其他存储引擎（如 MyISAM）中无法实现。
 
 ## 6. 备份和恢复
@@ -323,20 +326,39 @@ PostgreSQL 和 MySQL 是两个流行的开源关系数据库管理系统（RDBMS
 
 选择 PostgreSQL 还是 MySQL 主要取决于具体的应用需求和开发环境。PostgreSQL 更加适合需要复杂数据处理和高数据完整性的场景，而 MySQL 在高并发和简单查询方面表现良好。
 
+### PostgreSQL 17 的快照与隔离边界
+
+MVCC 通过保留行版本，让普通查询按快照判断可见性。事务能看到自身已执行的修改；“使用快照”不意味着所有读写都不加锁，写写冲突和显式锁仍可能等待或失败。MySQL InnoDB 也有 MVCC，不能以是否支持 MVCC 区分两者。
+
+| 隔离级别 | PostgreSQL 17 的主要语义 | 应用需要处理的边界 |
+| --- | --- | --- |
+| Read Uncommitted | 按 Read Committed 执行 | 不提供脏读模式 |
+| Read Committed（默认） | 普通 SELECT 每条语句取得快照 | 同一事务两次查询可读到不同已提交结果 |
+| Repeatable Read | 从事务中首条非事务控制语句建立快照，后续复用 | 不出现幻读，但仍可能有写偏差等序列化异常；并发更新也可能报错 |
+| Serializable | 在快照隔离基础上检查危险的读写依赖 | 可用序列化失败中止事务，应用应重试整个事务 |
+
+例如两名值班医生分别读到“还有两人在岗”，随后各自更新自己的记录下班：更新不冲突不代表业务约束成立。应根据约束设计锁或 Serializable 事务，并对 SQLSTATE `40001` 做有界的整笔事务重试；外部发送等副作用不能随着数据库重试无条件重复。
+
+**双会话验证步骤（未执行）**：在独立实验库创建一行测试记录；会话 A 以 RC 开启事务并读取，会话 B 更新该行后提交，A 再读应看到新值。重新初始化记录，以 RR 重复相同时序，A 第二次普通 SELECT 应仍读到旧值；结束 A 后新事务才能读到 B 的提交。两种模式都不能把自己的未提交写入排除在自身可见结果之外。
+
+隔离语义的依据：[PostgreSQL 17 事务隔离](https://www.postgresql.org/docs/17/transaction-iso.html)。快照造成的旧版本保留及清理限制见第 9、10 节。
+
 # 6.PostgreSQL的WAL
-WAL（Write-Ahead Logging）是 PostgreSQL 中的一种重要机制，用于确保数据的一致性和可靠性。它通过记录对数据库的所有更改来实现持久性和故障恢复。以下是关于 PostgreSQL WAL 的详细介绍。
+本节以 PostgreSQL 17 的普通持久表、`fsync=on` 为基线。WAL 为崩溃恢复提供日志依据；临时表、UNLOGGED 表等不能套用“所有数据修改都由 WAL 持久化”的说法。
 
 ## 1. WAL 的基本概念
 
-- **写前日志**：WAL 的核心思想是在将数据更改写入数据库之前，首先将这些更改记录到日志文件中。这样，即使发生故障，系统也可以通过这些日志恢复数据。
-- **事务保证**：WAL 确保了 ACID（原子性、一致性、隔离性、持久性）属性中的持久性。只有当更改被成功写入 WAL 后，才会被认为是完成的。
+WAL 的先后约束是：**脏数据页写入数据文件前，对应 WAL 必须先持久化**。这不是“日志先刷盘，然后才修改内存数据页”。日志缓冲、共享缓冲中的数据页、磁盘数据文件是三个不同对象。
 
 ## 2. WAL 的工作原理
 
-1. **记录更改**：当一个事务对数据库进行更改时，PostgreSQL 首先将这些更改写入 WAL。
-2. **刷新日志**：WAL 被写入磁盘，确保日志在物理存储中持久化。
-3. **应用更改**：随后，PostgreSQL 会将更改应用到数据页，数据页的更改会在后台异步执行。
-4. **检查点**：定期创建检查点，确保 WAL 中的日志不会无限增长。检查点会将所有未写入数据页的更改刷新到磁盘。
+1. 执行更新时修改共享缓冲中的页，并生成相关 WAL；页成为脏页。不能把所有内存修改理解成后台回放日志。
+2. WAL 可由提交路径、WAL writer 等写出；写入操作系统缓存与持久化到存储也应区分。
+3. 默认同步提交在返回成功前等待本地提交日志持久化；配置同步备库时还可能等待备库。`synchronous_commit=off` 可提前确认，崩溃后可能丢失最近已确认的事务，但不同于关闭 `fsync`。
+4. 脏页可以在提交前或提交后刷出，但必须满足先持久化对应 WAL 的约束；提交不要求把该事务所有数据页刷盘。
+5. 检查点推进恢复起点，并完成其所要求的脏页刷盘。数据库仍可并发产生新修改；检查点不是“清空所有待写页”，也不保证旧 WAL 都可删除。
+
+依据：[WAL 原理](https://www.postgresql.org/docs/17/wal-intro.html)、[异步提交](https://www.postgresql.org/docs/17/wal-async-commit.html)。
 
 ## 3. WAL 的优势
 
@@ -376,17 +398,19 @@ WAL（Write-Ahead Logging）是 PostgreSQL 中的一种重要机制，用于确�
 
 #### 1.3 `archive_command`
 
-- **说明**：指定归档 WAL 文件的命令。该命令在每个 WAL 文件成功创建后执行。
+- **说明**：指定归档 WAL 文件的命令。该命令用于归档已完成的 WAL 段，不是在空段文件刚创建时执行；成功退出必须代表归档确已成功。
 - **示例**：
   ```conf
-  archive_command = 'cp %p /path/to/archive/%f'
+  archive_command = 'test ! -f /path/to/archive/%f && cp %p /path/to/archive/%f'
   ```
+
+上述命令只是单机目录归档示例，目录须事先存在。归档重试遇到同名文件时，应核实内容后处理，不能覆盖未知文件或无条件返回成功。依据：[官方归档配置与重试说明](https://www.postgresql.org/docs/17/continuous-archiving.html#BACKUP-ARCHIVING-WAL)。
 
 ### 2. WAL 相关的性能配置
 
 #### 2.1 `wal_buffers`
 
-- **说明**：设置用于 WAL 的内存缓冲区大小。默认值通常是 16MB，适合大多数应用。
+- **说明**：设置 WAL 缓冲大小。默认配置为 `-1`，按 `shared_buffers` 的 1/32 自动选择，至少 64kB、至多一个 WAL 段大小（通常 16MB）；下面是显式设置示例，不是固定默认值。
 - **示例**：
   ```conf
   wal_buffers = 16MB
@@ -402,7 +426,7 @@ WAL（Write-Ahead Logging）是 PostgreSQL 中的一种重要机制，用于确�
 
 #### 2.3 `max_wal_size`
 
-- **说明**：设置 WAL 文件的最大总大小，超过该大小时会触发检查点。
+- **说明**：控制自动检查点相关的 WAL 增长目标，是软限制，不是 `pg_wal` 目录的磁盘配额。高负载、归档失败、复制保留需求等都可使实际占用超过它。
 - **示例**：
   ```conf
   max_wal_size = 1GB
@@ -410,7 +434,7 @@ WAL（Write-Ahead Logging）是 PostgreSQL 中的一种重要机制，用于确�
 
 #### 2.4 `min_wal_size`
 
-- **说明**：设置 WAL 文件的最小总大小，PostgreSQL 在恢复时会保留这些 WAL 文件。
+- **说明**：当 WAL 磁盘占用低于该值时，检查点倾向于回收旧段供后续复用，而非删除；用于保留应对写入波动的空间，不是恢复保留期。
 - **示例**：
   ```conf
   min_wal_size = 80MB
@@ -430,7 +454,7 @@ WAL（Write-Ahead Logging）是 PostgreSQL 中的一种重要机制，用于确�
 
 #### 4.1 `synchronous_commit`
 
-- **说明**：控制事务提交的同步方式。可以设置为 `on`, `off`, `local`, `remote_write`, `remote_apply`。
+- **说明**：控制提交成功前等待到哪一步，可设 `on`、`off`、`local`、`remote_write`、`remote_apply`；远端等待还取决于同步备库配置。`off` 允许在本地提交日志持久化前返回，不能据客户端成功就断言已抗崩溃持久化。
 - **示例**：
   ```conf
   synchronous_commit = on
@@ -455,146 +479,97 @@ SELECT * FROM pg_stat_wal;
 ## 6. WAL 文件管理
 
 - **WAL 文件存储**：WAL 文件存储在数据目录的 `pg_wal` 子目录中。
-- **归档**：启用归档后，可以将 WAL 文件复制到安全的位置，确保在故障时可以恢复。
+- **归档**：连续可用的 WAL 归档需结合匹配的基础备份，才能支持相应恢复目标；仅打开归档开关不是恢复验收。
+- **回收边界**：检查点之后仍被归档或复制需要的日志不能直接回收。检查 `pg_stat_archiver` 的失败情况、复制槽保留位点和磁盘占用，不把 `max_wal_size` 当作容量保护。不要手动删除 `pg_wal` 文件。
+- 参数依据：[PostgreSQL 17 WAL 配置](https://www.postgresql.org/docs/17/runtime-config-wal.html)。
 
 ## 7. 重要性
 
-WAL 是 PostgreSQL 数据库系统的核心部分，它确保了高可用性与数据的完整性，是实现灾难恢复和备份的基础。
+WAL 是恢复与复制的基础；高可用性还依赖复制、故障检测和切换方案，不能由 WAL 单独保证。
 
 ## 总结
 
-WAL 是 PostgreSQL 的一项关键机制，通过记录所有数据更改，确保了数据的一致性和持久性。理解 WAL 的工作原理和配置，可以帮助数据库管理员更好地管理和维护 PostgreSQL 数据库。
+分析 WAL 问题时分别确认：事务确认的持久化条件、脏页刷盘顺序、检查点推进和日志保留原因。它们共同影响恢复与空间占用，但不是同一个开关。
 
 # 7.TOAST机制
-TOAST（The Oversized-Attribute Storage Technique）是 PostgreSQL 中的一种机制，用于处理大型数据类型，如文本、二进制或其他大型字段。TOAST 允许 PostgreSQL 高效地存储和管理超出页大小限制的属性，从而避免性能问题。以下是关于 TOAST 机制的详细介绍。
 
-## 1. TOAST 的基本概念
+本节以 PostgreSQL 17 为基线。普通行不能跨多个数据页直接存储，TOAST 为 `text`、`bytea`、`jsonb` 等可变长类型提供压缩和／或行外存储。判断依据包括整行宽度和列的存储策略，不是每个字段统一按 2KB 切分。
 
-- **目的**：TOAST 旨在存储超大字段，例如 `TEXT`、`BYTEA` 或 `JSONB` 类型的数据，这些字段可能会超出 PostgreSQL 页的大小限制（通常为 8KB）。
-- **工作原理**：当字段的大小超过一定阈值时，TOAST 会将其分割成较小的块，并将这些块存储在单独的 TOAST 表中。
+## 1. 从行宽到存储策略
 
-## 2. TOAST 的工作机制
+当行太宽时，TOAST 尝试缩小主表中的行。可压缩数据可能压缩后仍放在主表；需要行外存储时，主表保留指针，值在关联的 TOAST 表中分块保存。块大小与触发阈值是不同概念。
 
-- **存储方式**：
-  - PostgreSQL 会首先检查大字段的大小。
-  - 如果字段大小小于或等于 2KB，数据会直接存储在主表中。
-  - 如果字段大小大于 2KB，数据会被压缩并分割为多个块，存储到 TOAST 表中。
-  
-- **TOAST 表**：每个具有 TOAST 属性的表都会有一个相应的 TOAST 表，存储超大字段的压缩和分割数据。
+| 列存储策略 | 压缩与行外存储行为 |
+| --- | --- |
+| PLAIN | 不压缩、不行外存储 |
+| EXTENDED | 允许压缩和行外存储，通常先尝试压缩 |
+| EXTERNAL | 允许行外存储，不压缩 |
+| MAIN | 优先压缩并留在主表，无法容纳时仍可行外存储 |
 
-## 3. TOAST 的压缩
+因此“字段超过 2KB 必然进入 TOAST 表”不成立。读取行外值会增加取数成本，压缩也有 CPU 成本；TOAST 改善存储布局，不保证所有查询更快。
 
-- **压缩算法**：TOAST 使用内置的压缩算法（如 LZ compression）来减少存储空间，提高性能。
-- **压缩阈值**：可以通过配置参数 `toast.tuple_target` 来设置压缩的目标大小。默认值通常为 2048 字节。
+## 2. 表目标与列策略
 
-## 4. TOAST 的优点
-
-- **节省空间**：通过压缩和分割，TOAST 提高了大型属性的存储效率。
-- **提高性能**：避免将大量数据直接存储在主表中，减少了页的占用，提高了查询性能。
-
-## 5. TOAST 的使用
-
-- **自动管理**：用户无需手动管理 TOAST，PostgreSQL 会自动处理 TOAST 的创建和维护。
-- **查询时支持**：当查询包含 TOAST 字段时，PostgreSQL 会自动从 TOAST 表中加载数据。
-
-## 6. 相关参数
-
-- **`toast.tuple_target`**：控制 TOAST 存储的目标大小，可以影响压缩和存储行为。
-- **`TOAST` 表的控制**：可以通过 SQL 语句手动查询 TOAST 表，但通常不建议直接操作 TOAST 表。
-
-## 7. 例子
-
-假设我们有一个包含大型文本字段的表：
+正确表存储参数是 `toast_tuple_target`，用于调整 TOAST 处理的行长度目标；默认块大小下通常约 2KB，不是单字段硬阈值。改变它不自动重写已有行。下面只演示合法配置形式，不代表调优建议：
 
 ```sql
 CREATE TABLE large_texts (
     id SERIAL PRIMARY KEY,
     content TEXT
-);
+) WITH (toast_tuple_target = 2040);
+ALTER TABLE large_texts ALTER COLUMN content SET STORAGE EXTENDED;
 ```
 
-如果插入的 `content` 字段非常大，PostgreSQL 会自动使用 TOAST 机制处理这些数据。
+具体值是否压缩、是否外置还受数据可压缩性和其他列影响。列的 `COMPRESSION` 或 `default_toast_compression` 决定可用的压缩方式，实际算法支持需核对构建环境。
 
-## 总结
+验证时应比较相同逻辑长度但可压缩性不同的数据，结合 `pg_column_size`、关联 TOAST 表大小和查询计划观察，不能仅用字符数断言物理存储方式。本轮未执行此数据库实验。
 
-TOAST 机制是 PostgreSQL 中处理大型数据类型的重要功能，能够有效地管理超出页大小限制的字段。通过压缩和分割，TOAST 提高了存储效率和查询性能，使得 PostgreSQL 能够灵活地处理各种数据类型。
+依据：[TOAST 机制](https://www.postgresql.org/docs/17/storage-toast.html)、[CREATE TABLE 存储参数](https://www.postgresql.org/docs/17/sql-createtable.html#SQL-CREATETABLE-STORAGE-PARAMETERS)。
 
-# 8.auth_explain扩展
-`auto_explain` 是 PostgreSQL 的一个扩展模块，用于自动记录执行计划和执行时间信息。它特别有助于调试和优化查询性能，尤其是在没有明确使用 `EXPLAIN` 命令的情况下。以下是关于 `auto_explain` 的详细介绍。
+# 8.auto_explain扩展
 
-## 1. 功能概述
+本节以 PostgreSQL 17 为基线。`auto_explain` 记录符合条件的执行计划；它不是加载后就自动记录全部查询，也不是只对最终慢查询产生采集成本。
 
-- **自动记录**：`auto_explain` 会自动记录每个查询的执行计划及其执行时长，并将这些信息写入 PostgreSQL 的日志中。
-- **帮助优化**：通过分析记录的执行计划，数据库管理员可以识别性能瓶颈并进行优化。
+## 1. 限定启用范围
 
-## 2. 如何启用 `auto_explain`
-
-要使用 `auto_explain`，需要在 PostgreSQL 的配置文件 `postgresql.conf` 中进行以下设置：
-
-1. **加载扩展**：
-   在 PostgreSQL 中加载 `auto_explain` 模块。可以在配置文件中添加以下行：
-   ```conf
-   shared_preload_libraries = 'auto_explain'
-   ```
-
-2. **设置日志记录**：
-   配置要记录的查询执行时间阈值和其他相关参数。例如：
-   ```conf
-   auto_explain.log_min_duration = '1s'  # 记录执行时间超过 1 秒的查询
-   auto_explain.log_analyze = on          # 记录分析信息
-   auto_explain.log_buffers = on          # 记录缓冲区使用情况
-   auto_explain.log_timing = on           # 记录时间信息
-   ```
-
-3. **重启 PostgreSQL**：
-   修改配置后，需要重启 PostgreSQL 服务以使更改生效。
-
-## 3. 记录的内容
-
-当 `auto_explain` 启用后，日志中会包含以下内容：
-
-- **执行计划**：查询的执行计划，包含每个节点的详细信息。
-- **执行时间**：查询的总执行时间。
-- **行数**：返回的行数以及处理的行数。
-- **缓冲区使用情况**：读取和写入的缓冲区页数。
-
-## 4. 使用示例
-
-在 PostgreSQL 中启用 `auto_explain` 后，执行一些查询，如果查询执行时间超过设定的阈值（如 1 秒），将自动在日志中记录相关信息。例如：
+在有相应权限且已安装模块的实验实例中，可由超级用户在单会话加载，避免为了试验修改全局启动参数：
 
 ```sql
-SELECT * FROM large_table WHERE filter_condition;
+LOAD 'auto_explain';
+SET auto_explain.log_min_duration = '1s';
+SET auto_explain.log_analyze = on;
+SET auto_explain.log_buffers = on;
+SET auto_explain.log_timing = off;
+SET auto_explain.log_nested_statements = off;
+SET auto_explain.sample_rate = 0.1;
 ```
 
-如果这个查询的执行时间超过 1 秒，相关的执行计划信息就会被记录到日志中。
+`sample_rate` 为抽样比例；达到时间阈值但未被抽样的语句不保证记录。需要复现实验时可在单会话将采样率设为 1、阈值设为 0，再执行已知查询并检查服务端日志，结束后断开会话。以上数值为教学配置，不是通用生产参数。
 
-## 5. 日志分析
+长期启用可选择 `session_preload_libraries` 或 `shared_preload_libraries`。后者修改需要重启；前者用于后续新会话。修改时保留已有模块列表，具体权限与生效方式按配置项确认，不能将所有参数变更都说成必须重启。
 
-通过分析 `auto_explain` 记录的日志，可以识别性能问题。例如，长时间运行的查询可能使用了不合适的索引，或者查询计划可能需要调整。可以根据日志中的信息调整查询或数据库配置。
+## 2. 记录内容与开销
 
-## 6. 其他配置选项
+`log_analyze` 采集实际执行信息，`log_buffers` 依赖它；关闭 `log_timing` 可减少逐节点读时钟成本，但不消除行数等采集开销。阈值决定是否输出日志，不能阻止执行过程中为判断和记录而付出的采集成本。尤其全量采样并同时启用分析与节点计时，短查询也会承担开销。
 
-除了基本的 `log_min_duration` 外，`auto_explain` 还支持其他配置选项，例如：
+`log_nested_statements` 是是否考虑记录函数内部语句的布尔开关，不是嵌套深度；`log_verbose` 用于更详细的计划信息。先确定是否需要实际行数、缓冲统计或节点时间，再决定采集开关、抽样率和会话范围。
 
-- **`auto_explain.log_nest_level`**：控制嵌套的查询深度。
-- **`auto_explain.log_verbose`**：记录更详细的执行信息。
-
-## 总结
-
-`auto_explain` 是 PostgreSQL 中非常实用的工具，可以帮助开发者和数据库管理员自动记录查询的执行计划和性能数据，从而优化数据库的性能。通过合理配置，可以有效识别和解决性能瓶颈。
+本轮核对参数名称及依赖关系，未加载模块或测量性能开销。依据：[PostgreSQL 17 auto_explain](https://www.postgresql.org/docs/17/auto-explain.html)。
 
 # 9.autovacuum
+本节参数与调度说明以 PostgreSQL 17 为基线。
+
 `autovacuum` 是 PostgreSQL 中的一个重要功能，用于自动执行数据库的清理和维护任务，确保数据库的性能和健康。它主要通过定期清理死元组（dead tuples）和更新统计信息来优化数据库性能。以下是关于 `autovacuum` 的详细介绍。
 
 ## 1. 主要功能
 
-- **清理死元组**：在 PostgreSQL 中，删除或更新操作不会立即回收空间，而是标记为死元组。`autovacuum` 会定期扫描表，清理这些死元组，释放空间。
+- **清理死元组**：更新通常产生新行版本，删除使旧版本不再对未来快照可见，但旧版本可能仍被现有快照需要。只有满足清理条件的版本才能被回收，不能把“已更新／已删除”直接等同于“立即可清理”。
 - **更新统计信息**：`autovacuum` 还会更新表的统计信息，以便查询优化器能够生成更有效的查询计划。
 
 ## 2. 工作原理
 
-- **触发条件**：`autovacuum` 会根据表中的活动情况和配置参数定期运行。每当执行特定的 DML 操作（如 INSERT、UPDATE 或 DELETE）时，`autovacuum` 会被触发。
-- **后台进程**：`autovacuum` 是一个后台进程，自动监控数据库中的活动，并在需要时执行清理任务。
+- **触发条件**：DML 更新统计信息，后台根据统计阈值等条件选择表，不是每次 DML 同步触发清理。PG 17 还会根据插入阈值和冻结年龄启动相应清理；达到条件也不保证立刻有 worker 可用。
+- **后台进程**：launcher 调度多个 worker，由 worker 检查表并按需执行 VACUUM 或 ANALYZE。
 
 ## 3. 配置参数
 
@@ -613,16 +588,16 @@ SELECT * FROM large_table WHERE filter_condition;
   ```
 
 - **`autovacuum_naptime`**：
-  - 设置 `autovacuum` 进程之间的时间间隔（单位：秒）。
+  - 控制对各数据库安排检查的最小间隔；不是所有 worker 统一休眠的周期，也不保证每张表每分钟清理一次。
   ```conf
-  autovacuum_naptime = 60  # 每 60 秒检查一次
+  autovacuum_naptime = '60s'  # 按数据库安排检查
   ```
 
 - **`autovacuum_vacuum_threshold`** 和 **`autovacuum_vacuum_scale_factor`**：
   - 控制触发 `autovacuum` 的条件。结合这两个参数，可以设置在表中有多少死元组后触发清理。
   ```conf
   autovacuum_vacuum_threshold = 50
-  autovacuum_vacuum_scale_factor = 0.1  # 表中有 10% 的行作为死元组时触发
+  autovacuum_vacuum_scale_factor = 0.1  # 示例：阈值为 50 + 0.1 × 估计行数
   ```
 
 - **`autovacuum_analyze_threshold`** 和 **`autovacuum_analyze_scale_factor`**：
@@ -645,7 +620,15 @@ SELECT * FROM large_table WHERE filter_condition;
   ANALYZE your_table_name;
   ```
 
-## 5. 注意事项
+## 5. 长快照、冻结与回卷防护
+
+旧快照仍可能读到的版本不能提前清除。长期事务、长期查询，以及某些复制槽保留的 xmin 等都可能阻碍清理边界推进；单纯增加 worker 或反复执行 VACUUM 不会消除这些保留需求。应先查明持有者及业务用途，再处理，不能机械终止会话或删除槽。
+
+事务 ID 的有限空间要求定期冻结足够老的元组，防止 XID 回卷破坏可见性判断。即使表很少更新也需要维护；反回卷清理甚至可在常规 autovacuum 被关闭时启动。长期无法推进冻结会导致告警，最终可能拒绝分配新的事务 ID，不能只监控死元组数量。
+
+可结合 `pg_stat_activity` 中的事务时间和 `backend_xmin`、`pg_replication_slots` 的保留信息，以及 `age(datfrozenxid)` 判断原因；年龄阈值按实例配置解释。对照 [PostgreSQL 17 日常维护](https://www.postgresql.org/docs/17/routine-vacuuming.html) 中的冻结与 autovacuum 章节。
+
+## 6. 注意事项
 
 - **性能影响**：`autovacuum` 可能会影响数据库性能，特别是在高负载情况下。合理配置参数可以减小影响。
 - **死元组数量**：如果表中死元组数量过多，可能会导致性能下降，建议定期监控和调整 `autovacuum` 配置。
@@ -659,10 +642,11 @@ SELECT * FROM large_table WHERE filter_condition;
 
 ### 1. 工作原理
 
-在 PostgreSQL 中，当执行 `DELETE` 或 `UPDATE` 操作时，原始行并不会立即从数据库中删除，而是标记为死元组。这些死元组会占用存储空间，导致数据库膨胀和性能下降。`VACUUM` 的主要任务是：
+`DELETE` 或 `UPDATE` 后，旧版本是否可回收取决于可见性边界；仍被快照需要的版本不能被 VACUUM 提前删除。长期无法回收会增加空间占用。`VACUUM` 的主要任务是：
 
 - **清理死元组**：扫描表，删除死元组并释放空间。
-- **更新统计信息**：保持表的统计信息最新，以帮助查询优化器生成更有效的查询计划。
+- **维护信息**：更新空间、可见性及部分表级统计信息；列值分布统计由 ANALYZE 采集，普通 VACUUM 不能替代 ANALYZE。
+- **冻结旧版本**：推进冻结边界以防事务 ID 回卷，机制见第 9 节。
 - **维护可用空间**：确保数据库中有足够的可用空间，以避免频繁的磁盘I/O。
 
 ### 2. `VACUUM` 的类型
@@ -670,7 +654,7 @@ SELECT * FROM large_table WHERE filter_condition;
 #### 2.1 `VACUUM`
 
 - **说明**：标准的 `VACUUM` 命令。
-- **功能**：清理死元组，回收空间，更新统计信息，但不会立即返回空间到操作系统。
+- **功能**：回收可清理版本所占空间供表内部复用，维护可见性与冻结信息；通常不缩小文件，但可能截断完全空闲的尾部页面。
 
 ```sql
 VACUUM your_table_name;
@@ -680,7 +664,7 @@ VACUUM your_table_name;
 
 - **说明**：更彻底的清理。
 - **功能**：重写整个表并返回未使用的空间到操作系统。
-- **注意**：在执行过程中会锁定表，因此可能会影响并发访问。
+- **注意**：需要 ACCESS EXCLUSIVE 锁，会阻塞普通访问，还需要重写所需的额外磁盘空间；不能作为常规 autovacuum 的替代。
 
 ```sql
 VACUUM FULL your_table_name;
@@ -716,7 +700,7 @@ VACUUM FULL your_table_name;
 
 ### 4. 注意事项
 
-- **性能影响**：`VACUUM` 可能会消耗资源，因此应在低峰时段运行。
+- **性能影响**：手动重维护可评估低峰执行，但常规 autovacuum 和反回卷维护不能简单推迟到低峰。VACUUM 不能放在显式事务块内执行。
 - **频率**：根据系统的写入负载，定期运行 `VACUUM` 是维护数据库性能的好习惯。
 - **监控死元组**：可以通过查询系统视图 `pg_stat_user_tables` 来监控死元组数量。
 
@@ -982,7 +966,7 @@ PostgreSQL 提供了多种操作符来查询 JSONB 数据。使用合适的操�
 SELECT * FROM users WHERE data @> '{"city": "New York"}';
 ```
 
-这个查询会利用 GIN 索引，如果存在。
+整个 `data` 列上的适用 GIN 索引可以支持该包含条件，但是否选择索引仍取决于统计信息、选择率和成本。
 
 #### 2.2 使用 `->` 和 `->>` 操作符
 
@@ -995,12 +979,12 @@ SELECT data->>'name' AS name FROM users WHERE data->>'city' = 'New York';
 
 ### 3. 使用表达式索引
 
-如果你经常按 JSONB 数据中的特定字段查询，可以考虑创建表达式索引。
+如果经常按 `data->>'city'` 的文本值做等值查询，可建立该表达式的 B-tree 索引。`data->'city'` 返回 JSONB，给它建 GIN 索引不能支撑下例的文本等值条件；索引表达式和操作符必须匹配。
 
 #### 3.1 创建表达式索引
 
 ```sql
-CREATE INDEX idx_users_city ON users USING GIN ((data->'city'));
+CREATE INDEX idx_users_city ON users ((data->>'city'));
 ```
 
 #### 3.2 查询时使用表达式索引
@@ -1011,15 +995,19 @@ SELECT * FROM users WHERE (data->>'city') = 'New York';
 
 ### 4. 查询性能分析
 
-可以使用 `EXPLAIN ANALYZE` 来分析查询的执行计划，确保查询正在使用索引。
+可以使用 `EXPLAIN (ANALYZE, BUFFERS)` 检查实际计划、估计与实际行数、缓冲访问。它会执行查询；小表或低选择率条件选择顺序扫描可能更合理，不能把“必须走索引”作为唯一正确性标准。
 
 ```sql
-EXPLAIN ANALYZE SELECT * FROM users WHERE data @> '{"city": "New York"}';
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM users WHERE data @> '{"city": "New York"}';
 ```
+
+**定向验证步骤（未执行）**：在独立实验库向 `users` 加入足够多且城市分布不均的数据，执行 `ANALYZE users`；分别检查 `data @> ...` 对整个 JSONB 列的 GIN，以及 `data->>'city' = ...` 对表达式 B-tree 的计划。检查 Index Cond 是否对应目标条件，不把仅显示索引名当作匹配证明。保留相同数据和查询比较修订前后，不能用关闭顺序扫描代替真实性能判断。
+
+依据：[PostgreSQL 17 JSONB 索引](https://www.postgresql.org/docs/17/datatype-json.html#JSON-INDEXING)。
 
 ### 5. 示例总结
 
-以下是一个完整的示例，展示了如何创建表、插入 JSONB 数据、创建索引和高效查询 JSONB 数据：
+以下小数据示例展示 GIN 支持的包含查询，行数太少时可能使用顺序扫描：
 
 ```sql
 -- 创建表
@@ -1041,7 +1029,7 @@ CREATE INDEX idx_users_data ON users USING GIN (data);
 SELECT * FROM users WHERE data @> '{"city": "New York"}';
 
 -- 使用 EXPLAIN 分析查询
-EXPLAIN ANALYZE SELECT * FROM users WHERE data @> '{"city": "New York"}';
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM users WHERE data @> '{"city": "New York"}';
 ```
 
 ### 总结
@@ -1176,64 +1164,48 @@ WHERE to_tsvector('english', body) @@ to_tsquery('PostgreSQL');
 PostgreSQL 的全文搜索功能强大且灵活，能够高效处理大文本数据的搜索需求。通过创建索引、使用 `to_tsvector` 和 `to_tsquery` 函数，可以实现高效的文本搜索。根据需求，可以使用不同的词典和查询方式来优化搜索结果。
 
 # 15.常用docker部署
-将 PostgreSQL 数据文件映射到宿主机是确保数据持久化的重要步骤。以下是如何在 Docker 中将 PostgreSQL 的数据文件映射到宿主机的详细步骤。
 
-### 1. 创建 Docker 卷（可选）
+本节使用官方镜像 `postgres:17` 和 Docker 命名卷演示本地部署。大版本必须与数据目录格式一致；需要严格复现时进一步固定补丁版本或镜像摘要。不要用 `latest` 隐式跨大版本复用旧数据目录。
 
-如果你希望使用 Docker 卷来管理数据，可以使用以下命令创建一个卷：
+### 1. 按版本选择数据目录
+
+| 官方镜像版本 | 默认 PGDATA | 建议卷挂载目标 |
+| --- | --- | --- |
+| 17 及以前 | `/var/lib/postgresql/data` | `/var/lib/postgresql/data` |
+| 18 | `/var/lib/postgresql/18/docker` | `/var/lib/postgresql` |
+| 18 以后 | 按大版本组织的目录，核对对应镜像说明 | `/var/lib/postgresql` |
+
+18 起的目录变化来自官方镜像约定。更改镜像标签和挂载路径不能完成数据库大版本升级；已有数据需要按升级方案使用 `pg_upgrade` 或逻辑导出／导入，并先验证备份恢复。[官方镜像 PGDATA 说明](https://github.com/docker-library/docs/blob/master/postgres/README.md#pgdata)
+
+### 2. 使用独立命名卷启动 PostgreSQL 17
+
+以下是本地教学命令，需要先在当前 shell 设置非空的 `POSTGRES_PASSWORD`；端口仅绑定本机。卷名和容器名应与现有环境区分。
 
 ```bash
-docker volume create pgdata
-```
-
-### 2. 启动 PostgreSQL 容器并映射数据目录
-
-使用 `-v` 选项将宿主机的目录映射到 PostgreSQL 容器的数据目录。以下是使用宿主机目录的示例：
-
-```bash
-docker run --name my_postgres \
+docker volume create learning_pg17_data
+docker run --name learning_pg17 \
   -e POSTGRES_DB=mydb \
   -e POSTGRES_USER=myuser \
-  -e POSTGRES_PASSWORD=mypassword \
-  -p 5432:5432 \
-  -v /path/to/your/host/directory:/var/lib/postgresql/data \
-  -d postgres:latest
+  -e POSTGRES_PASSWORD="${POSTGRES_PASSWORD:?请先设置本地数据库密码}" \
+  -p 127.0.0.1:5432:5432 \
+  -v learning_pg17_data:/var/lib/postgresql/data \
+  -d postgres:17
 ```
 
-- `--name my_postgres`：指定容器名称。
-- `-e POSTGRES_DB=mydb`：设置要创建的数据库名称。
-- `-e POSTGRES_USER=myuser`：设置数据库用户。
-- `-e POSTGRES_PASSWORD=mypassword`：设置用户密码。
-- `-p 5432:5432`：将宿主机的 5432 端口映射到容器的 5432 端口。
-- `-v /path/to/your/host/directory:/var/lib/postgresql/data`：将宿主机目录映射到容器的 PostgreSQL 数据目录。确保将 `/path/to/your/host/directory` 替换为实际的宿主机路径。
+`POSTGRES_DB`、`POSTGRES_USER` 和 `POSTGRES_PASSWORD` 用于空数据目录的首次初始化；复用已有数据库时，修改这些环境变量不会自动修改已有用户、密码或数据库。
 
-### 3. 确保宿主机目录权限
+如果改为新建 PostgreSQL 18 实验，应使用独立空卷（如 `learning_pg18_data`）、`postgres:18` 和 `/var/lib/postgresql` 挂载目标，不复用上述 17 卷。
 
-确保宿主机的目录具有正确的权限，以便 PostgreSQL 可以读写数据。可以使用以下命令设置权限（根据需要调整路径）：
+### 3. 宿主机目录挂载的替代方式
+
+需要直接访问宿主机目录时，可将命名卷替换为绑定挂载；PostgreSQL 17 的目标仍是 `/var/lib/postgresql/data`，18 起按上表选择。宿主机目录权限应根据所选镜像及运行用户确认，不能把 `70:70` 当作所有镜像通用的 UID/GID。这里优先使用命名卷，避免复制递归修改宿主机目录所有者的命令。
+
+### 4. 连接与持久化验证
 
 ```bash
-sudo chown -R 70:70 /path/to/your/host/directory
+docker exec -it learning_pg17 psql -U myuser -d mydb
 ```
 
-### 4. 连接到 PostgreSQL
+在独立实验库写入一条可识别记录并提交，通过 `SHOW data_directory` 检查实际数据目录，再通过 `docker inspect learning_pg17` 检查卷挂载。需要验证容器重建时，在确认是可删除的实验容器后，移除该容器但保留命名卷，再用相同版本、卷名和启动参数创建容器，查询该记录应仍存在。仅重启原容器不能充分验证卷复用是否正确。
 
-可以使用 `psql` 或任何 SQL 客户端连接到 PostgreSQL 数据库：
-
-```bash
-docker exec -it my_postgres psql -U myuser -d mydb
-```
-
-### 5. 数据持久化的验证
-
-在容器内创建一些数据后，停止并删除容器，然后重新启动新的 PostgreSQL 容器，确保数据仍然存在。
-
-```bash
-docker stop my_postgres
-docker rm my_postgres
-```
-
-然后再次启动 PostgreSQL 容器，使用相同的映射命令。
-
-### 总结
-
-通过将 PostgreSQL 数据文件映射到宿主机，可以确保数据在容器重启或删除后仍然持久化。使用卷或直接映射宿主机目录都可以实现这种持久化。确保设置正确的权限，以便 PostgreSQL 可以正常工作。
+命名卷持久化不等于备份；删除卷仍会丢失其中的数据。本轮仅核对官方镜像文档和命令结构，未启动或重建容器。
