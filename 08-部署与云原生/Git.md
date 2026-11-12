@@ -2,7 +2,7 @@
 
 [TOC]
 
-- [一、分支模型 & 工作流设计](#1-分支模型工作流设计)
+- [[#1. 分支模型 & 工作流设计|一、分支模型 & 工作流设计]]
 - [二、rebase / merge / reset / revert 深水区](#2-rebase--merge--reset--revert-深水区)
 - [三、历史管理 & 提交规范](#3-历史管理--提交规范)
 - [四、高级工具：worktree、submodule 等](#4-高级工具worktreesubmodule-等)

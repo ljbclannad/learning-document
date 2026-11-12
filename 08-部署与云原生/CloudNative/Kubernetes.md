@@ -27,7 +27,18 @@
 10. Docker项目通过使用Cgroups来限制当前进程的资源。
     1. linux服务器Cgroup配置文件路径为/sys/fs/cgroup
 
-![image-20221229103650389](/typoraImage/image-20221229103650389.png)
+以下为根据正文重绘的示意图，非原截图。
+
+```mermaid
+flowchart TD
+    K["宿主机 Linux 内核"] --> C["cgroups：按进程组进行资源统计与限制"]
+    C --> A["容器 A 的进程组：CPU、内存、I/O 约束"]
+    C --> B["容器 B 的进程组：CPU、内存、I/O 约束"]
+    K --> N["Namespaces：隔离进程看到的系统资源视图"]
+    N -.-> A
+    N -.-> B
+```
+
 10. 使用容器后，正常的top命令和/proc是针对于整个宿主机的系统状态监控，不能做到监控当前容器。解决方案：
     1. top 是从 /prof/stats 目录下获取数据，所以道理上来讲，容器不挂载宿主机的该目录就可以了。lxcfs就是来实现这个功能的，做法是把宿主机的 /var/lib/lxcfs/proc/memoinfo 文件挂载到Docker容器的/proc/meminfo位置后。容器中进程读取相应文件内容时，LXCFS的FUSE实现会从容器对应的Cgroup中读取正确的内存限制。从而使得应用获得正确的资源约束设定。kubernetes环境下，也能用，以ds 方式运行 lxcfs ，自动给容器注入争取的 proc 信息。
 11. DockerFile：用一些标准的原语描述我们所要构建的Docker镜像，每个原语执行后，都会生成一个对应的镜像层。

@@ -87,7 +87,7 @@ spring:
 
 **Sentinel 网关层：路由/URL/IP/参数限流**
 
-* GatewayFlowRule 支持按 route 或自定义 API 分组做流控，并支持按请求属性（header、IP、param）限流。([GitHub][3])
+* GatewayFlowRule 支持按 route 或自定义 API 分组做流控，并支持按请求属性（header、IP、param）限流。([Sentinel 官方文档][3])
 
 **建议：**
 
@@ -219,7 +219,7 @@ public class SentinelBlockAdvice {
 
 # 规则动态化（Nacos）怎么接
 
-Sentinel 动态数据源会用到 `rule-type`、`data-type` 等配置项（Nacos 的 dataId 存 JSON）。([GitHub][1])
+Sentinel 动态数据源会用到 `rule-type`、`data-type` 等配置项（Nacos 的 dataId 存 JSON）。([Spring Cloud Alibaba][1])
 你可以按服务名拆 dataId：`{app}-flow-rules`、`{app}-degrade-rules`、`{app}-param-rules`……
 
 （不同 SCA 版本配置 key 可能有差异；原则是不变：**ReadableDataSource 绑定到对应 RuleManager**。）
@@ -243,3 +243,7 @@ Sentinel 动态数据源会用到 `rule-type`、`data-type` 等配置项（Nacos
 3. 热点参数规则上线（skuId/userId）
 4. 观察：被限流数、RT/P99、线程池队列、DB wait 是否回落
 5. 回补：改 SQL/补索引/加缓存/异步化 → 逐步放量
+
+[1]: https://sca.aliyun.com/docs/2023/user-guide/sentinel/advanced-guide/#动态数据源支持 "Spring Cloud Alibaba 2023.0.x：动态数据源支持"
+[2]: https://sca.aliyun.com/docs/2023/user-guide/sentinel/advanced-guide/#更多配置项 "Spring Cloud Alibaba 2023.0.x：Gateway fallback 配置"
+[3]: https://sentinelguard.io/zh-cn/docs/api-gateway-flow-control.html "Sentinel：网关流量控制"
