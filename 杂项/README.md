@@ -6,6 +6,7 @@
 
 - [[杂项/Cloudflare入门|Cloudflare 入门]]：从 Nginx 前面的边缘代理，认识 CDN、安全防护、Workers 和 Tunnel。
 - [[杂项/DeepSeek Super-agent入门|DeepSeek Super-agent 入门]]：认识事件驱动 Agent 的授权、工单、并发调度、持久化与恢复边界。
+- [[杂项/Pi入门|Pi 入门]]：认识可定制的 Agent 运行框架、任务循环、多模型接入和应用场景。
 
 ## 维护方式
 
